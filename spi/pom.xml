@@ -20,5 +20,40 @@
     isolated worlds and defeat the isolation.
   </description>
 
-  <!-- Deliberately no dependencies. See above. Enforced by CheckSpiHasNoDependenciesTest. -->
+  <!-- Deliberately no dependencies. See above; enforced below rather than by convention. -->
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-enforcer-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>spi-must-stay-dependency-free</id>
+            <phase>validate</phase>
+            <goals><goal>enforce</goal></goals>
+            <configuration>
+              <rules>
+                <banTransitiveDependencies>
+                  <message>
+                    The SPI module must have no compile or runtime dependencies. Its classes are
+                    loaded by the shared parent ClassLoader, so anything added here is forced on
+                    both the Cassandra and the OpenSearch isolated loaders and breaks isolation.
+                  </message>
+                </banTransitiveDependencies>
+                <bannedDependencies>
+                  <searchTransitive>true</searchTransitive>
+                  <excludes><exclude>*:*:*:*:compile</exclude><exclude>*:*:*:*:runtime</exclude></excludes>
+                  <message>
+                    No compile/runtime dependency may be added to the SPI module. Test-scoped
+                    dependencies are fine: they never reach the isolated loaders.
+                  </message>
+                </bannedDependencies>
+              </rules>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
 </project>
