@@ -27,9 +27,10 @@ libraries, which are test artifacts and shade their dependencies.
                     │            System ClassLoader           │
                     │  supervisor, SPI, snakeyaml, slf4j-api  │
                     └────────────────┬────────────────────────┘
-                     delegation ONLY for java.*, javax.*,
-                     jdk.*, sun.*, org.slf4j.* and
-                     io.cassandraopensearch.spi.*
+                     Each child's *parent* is the platform
+                     loader (JDK only). The application
+                     classpath is reached for exactly one
+                     package: io.cassandraopensearch.spi.*
               ┌──────────────┴──────────────┐
               ▼                             ▼
   ┌───────────────────────┐     ┌────────────────────────┐
@@ -46,7 +47,12 @@ libraries, which are test artifacts and shade their dependencies.
 Everything crossing the boundary goes through `cassandra-opensearch-spi`, which has **zero
 dependencies** by design. If the SPI gained a dependency, that dependency would be loaded by the
 parent loader and forced on both isolated worlds — exactly the coupling the isolation exists to
-prevent. `SpiHasNoDependenciesTest` enforces this.
+prevent. The `spi-must-stay-dependency-free` enforcer rule in `spi/pom.xml` fails the build if
+anyone adds one.
+
+Note that `org.slf4j` is deliberately **not** shared. Cassandra binds slf4j to logback and
+OpenSearch binds it to log4j2; sharing the API would force a single binding on both and collapse
+their logging into one confused configuration. Each loader carries its own API and binding.
 
 ### What isolation does *not* solve
 
