@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>io.cassandraopensearch</groupId>
+    <artifactId>cassandra-opensearch-parent</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>cassandra-opensearch-spi</artifactId>
+  <name>Cassandra + OpenSearch :: SPI</name>
+  <description>
+    The bridge contract shared between the supervisor and the isolated service runtimes.
+    This module MUST have zero dependencies: every type declared here is loaded by the shared
+    parent ClassLoader and is therefore visible inside both the Cassandra and the OpenSearch
+    isolated ClassLoaders. Adding a dependency here would leak that dependency into both
+    isolated worlds and defeat the isolation.
+  </description>
+
+  <!-- Deliberately no dependencies. See above. Enforced by CheckSpiHasNoDependenciesTest. -->
+</project>

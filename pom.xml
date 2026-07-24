@@ -1,0 +1,228 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>io.cassandraopensearch</groupId>
+  <artifactId>cassandra-opensearch-parent</artifactId>
+  <version>1.0.0-SNAPSHOT</version>
+  <packaging>pom</packaging>
+
+  <name>Cassandra + OpenSearch :: Parent</name>
+  <description>
+    Runs an Apache Cassandra node and an OpenSearch node inside a single JVM, each in its
+    own isolated ClassLoader, under a common supervisor with a coupled lifecycle.
+  </description>
+
+  <modules>
+    <module>spi</module>
+    <module>bootstrap</module>
+    <module>runtime-cassandra</module>
+    <module>runtime-opensearch</module>
+    <module>server</module>
+    <module>cli</module>
+    <module>dist</module>
+    <module>integration-tests</module>
+  </modules>
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+
+    <!-- The whole stack builds and runs on JDK 21.
+         Rationale: OpenSearch 3.x jars are Java 21 bytecode (class file major 65) and simply
+         cannot be loaded by a JDK 17 JVM. Cassandra is consumed as class-61 jars, which load
+         fine on 21. See docs/JDK.md. -->
+    <maven.compiler.release>21</maven.compiler.release>
+    <jdk.version>21</jdk.version>
+
+    <cassandra.groupId>com.datastax.dse</cassandra.groupId>
+    <cassandra.artifactId>dse-db-all</cassandra.artifactId>
+    <cassandra.version>5.0.7.0-SNAPSHOT</cassandra.version>
+
+    <opensearch.version>3.7.0</opensearch.version>
+
+    <slf4j.version>1.7.36</slf4j.version>
+    <jackson.version>2.17.2</jackson.version>
+    <snakeyaml.version>2.2</snakeyaml.version>
+    <picocli.version>4.7.6</picocli.version>
+
+    <junit.version>5.10.2</junit.version>
+    <assertj.version>3.25.3</assertj.version>
+    <awaitility.version>4.2.1</awaitility.version>
+
+    <maven.compiler.plugin.version>3.13.0</maven.compiler.plugin.version>
+    <surefire.version>3.2.5</surefire.version>
+    <failsafe.version>3.2.5</failsafe.version>
+    <assembly.version>3.7.1</assembly.version>
+    <dependency.plugin.version>3.6.1</dependency.plugin.version>
+    <shade.version>3.5.3</shade.version>
+    <enforcer.version>3.4.1</enforcer.version>
+    <exec.plugin.version>3.2.0</exec.plugin.version>
+
+    <!-- Integration tests are skipped by default; the `it` profile / -DskipITs=false enables them -->
+    <skipITs>false</skipITs>
+  </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>io.cassandraopensearch</groupId>
+        <artifactId>cassandra-opensearch-spi</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>io.cassandraopensearch</groupId>
+        <artifactId>cassandra-opensearch-bootstrap</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>io.cassandraopensearch</groupId>
+        <artifactId>cassandra-opensearch-runtime-cassandra</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>io.cassandraopensearch</groupId>
+        <artifactId>cassandra-opensearch-runtime-opensearch</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>io.cassandraopensearch</groupId>
+        <artifactId>cassandra-opensearch-server</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>io.cassandraopensearch</groupId>
+        <artifactId>cassandra-opensearch-cli</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+
+      <dependency>
+        <groupId>org.slf4j</groupId>
+        <artifactId>slf4j-api</artifactId>
+        <version>${slf4j.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.yaml</groupId>
+        <artifactId>snakeyaml</artifactId>
+        <version>${snakeyaml.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>info.picocli</groupId>
+        <artifactId>picocli</artifactId>
+        <version>${picocli.version}</version>
+      </dependency>
+
+      <dependency>
+        <groupId>org.junit</groupId>
+        <artifactId>junit-bom</artifactId>
+        <version>${junit.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>org.assertj</groupId>
+        <artifactId>assertj-core</artifactId>
+        <version>${assertj.version}</version>
+        <scope>test</scope>
+      </dependency>
+      <dependency>
+        <groupId>org.awaitility</groupId>
+        <artifactId>awaitility</artifactId>
+        <version>${awaitility.version}</version>
+        <scope>test</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.assertj</groupId>
+      <artifactId>assertj-core</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <pluginManagement>
+      <plugins>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-compiler-plugin</artifactId>
+          <version>${maven.compiler.plugin.version}</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-surefire-plugin</artifactId>
+          <version>${surefire.version}</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-failsafe-plugin</artifactId>
+          <version>${failsafe.version}</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-assembly-plugin</artifactId>
+          <version>${assembly.version}</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-dependency-plugin</artifactId>
+          <version>${dependency.plugin.version}</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-shade-plugin</artifactId>
+          <version>${shade.version}</version>
+        </plugin>
+        <plugin>
+          <groupId>org.codehaus.mojo</groupId>
+          <artifactId>exec-maven-plugin</artifactId>
+          <version>${exec.plugin.version}</version>
+        </plugin>
+      </plugins>
+    </pluginManagement>
+
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-enforcer-plugin</artifactId>
+        <version>${enforcer.version}</version>
+        <executions>
+          <execution>
+            <id>enforce-jdk21</id>
+            <goals><goal>enforce</goal></goals>
+            <configuration>
+              <rules>
+                <requireJavaVersion>
+                  <version>[21,22)</version>
+                  <message>
+                    This project must be built with JDK 21. OpenSearch 3.x requires Java 21+
+                    bytecode support, and the Cassandra fork does not support JDK 22+ at runtime
+                    without extra flags. Use JAVA_HOME=~/.sdkman/candidates/java/21.0.11-tem
+                  </message>
+                </requireJavaVersion>
+              </rules>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <configuration>
+          <redirectTestOutputToFile>true</redirectTestOutputToFile>
+          <trimStackTrace>false</trimStackTrace>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>
