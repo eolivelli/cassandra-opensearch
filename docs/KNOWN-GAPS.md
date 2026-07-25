@@ -3,17 +3,38 @@
 Things that are not finished, not safe, or not what the rest of the documentation implies. Kept
 in one place so nobody has to discover them by being surprised in production.
 
-## 1. `watch_external_decommission` is inert
+## 1. `watch_external_decommission` narrows the unsupervised path; it does not make it safe
 
-`conf/cassandra-opensearch.yaml` accepts it and the Cassandra runtime does emit
-`ring.state.changed`, but the supervisor only logs the event. A bare `nodetool decommission`
-therefore gets no OpenSearch shard relocation, and shards on this node can be lost when the
-process exits.
+**What it does now.** The Cassandra runtime polls `StorageService.getOperationMode()` once a
+second on a daemon thread and reports `ring.state.changed` whenever it moves. When that says the
+node is leaving the ring — `LEAVING`, which a bare `nodetool decommission` produces, or
+`DECOMMISSIONED` — and the supervisor is not running a decommission of its own, it logs a WARN
+naming the situation and calls `prepareDecommission` on OpenSearch, which excludes this node from
+shard allocation so the cluster starts relocating. The setting turns that off.
 
-Making it work is more than wiring: the supervisor-driven path emits the same event while already
-`DECOMMISSIONING`, so the handler must distinguish the two, and even then the catch-up is racing a
-ring transition that has already started. Until then, `bin/cassandra-opensearch decommission` is
-the only ordering-safe way to retire a node.
+**What it still cannot do.** By the time Cassandra reports `LEAVING` the ring transition has
+already begun, so this is a catch-up that may lose the race, and on a node holding real index data
+it will. The supported path excludes OpenSearch *before* Cassandra is touched at all and then
+blocks until the last shard has moved; this one starts the relocation and has no way to hold
+anything up while it finishes — `nodetool` is not waiting for it, and the supervisor has no say in
+when the operator stops the process.
+
+There is more grace than the shape of the problem suggests, and it is worth knowing: Cassandra's
+`decommission()` sets `LEAVING` and then sleeps `RING_DELAY_MILLIS` (30 s) before it streams
+anything, and when it finishes it leaves the process running — "let op be responsible for killing
+the process". So the node keeps serving search while the shards move. **The exposure is the
+window between the operator's `nodetool decommission` returning and the operator stopping the
+process**, and nothing in this product controls it. Watch `_cat/shards` and let the node empty
+before stopping it.
+
+The supervisor deliberately stops at the exclusion. It does not wait for relocation and then stop
+OpenSearch itself: the wait would run for up to `shard_relocation_timeout` on a background thread
+while `bin/cassandra-opensearch decommission`, the shutdown hook and `stop` all remain able to
+drive the same service, which is the concurrent lifecycle the SPI forbids — and stopping
+OpenSearch early would destroy exactly the shards the exclusion exists to save, while stopping it
+after relocation has finished achieves nothing a still-running node does not.
+
+`bin/cassandra-opensearch decommission` remains the only ordering-safe way to retire a node.
 
 ## 2. Three Cassandra settings are documentation, not configuration
 

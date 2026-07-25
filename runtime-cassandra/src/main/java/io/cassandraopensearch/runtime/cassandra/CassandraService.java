@@ -86,6 +86,7 @@ public final class CassandraService implements EmbeddedService {
     private volatile NodeJmxServer jmx;
     private volatile InterceptingKiller killer;
     private volatile DelegatingUncaughtExceptionHandler uncaughtExceptionHandler;
+    private volatile RingStateWatcher ringStateWatcher;
 
     @Override
     public String name() {
@@ -136,6 +137,11 @@ public final class CassandraService implements EmbeddedService {
             context.reportEvent("INFO", "cassandra.started",
                     "node " + StorageService.instance.getLocalHostId() + " is NORMAL in cluster "
                             + StorageService.instance.getClusterName());
+
+            // Started only now that the node is NORMAL, so the watcher's baseline is a settled
+            // ring rather than the JOINING churn of a bootstrap.
+            ringStateWatcher = RingStateWatcher.start(
+                    context, () -> StorageService.instance.getOperationMode());
         } catch (Throwable t) {
             status = ServiceStatus.FAILED;
             throw new ServiceException(NAME, "Cassandra node failed to start", t);
@@ -310,7 +316,10 @@ public final class CassandraService implements EmbeddedService {
         }
         status = ServiceStatus.DECOMMISSIONED;
         request.reportProgress(100, "left the ring");
-        context.reportEvent("INFO", "ring.state.changed", "this node has been decommissioned");
+        // Not ring.state.changed: that event now belongs to RingStateWatcher, which has already
+        // reported this very transition off its own poll. This one says something the mode alone
+        // does not — that the node left because the supervisor asked it to.
+        context.reportEvent("INFO", "cassandra.decommissioned", "this node has left the ring");
     }
 
     /**
@@ -357,6 +366,11 @@ public final class CassandraService implements EmbeddedService {
     public void stop() {
         if (!stopped.compareAndSet(false, true)) {
             return;
+        }
+        // First, and before drain(): every mode this teardown is about to walk through is one the
+        // supervisor asked for, and reporting DRAINING as a ring event would be noise at best.
+        if (ringStateWatcher != null) {
+            step("ring state watcher", () -> ringStateWatcher.stop());
         }
         if (daemon == null) {
             // start() failed before the daemon existed; only JMX can be holding anything.

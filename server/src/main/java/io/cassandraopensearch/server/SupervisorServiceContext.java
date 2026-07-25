@@ -31,22 +31,31 @@ import java.util.function.BiConsumer;
  * <p>Both callbacks are deliberately unable to throw. A service calling {@code reportEvent} from
  * inside its own startup path must not be handed an exception from the supervisor's logging: it
  * would surface as a startup failure whose stack trace points at the wrong subsystem entirely.
+ * The same applies, and applies harder, to the {@link EventListener} the supervisor installs:
+ * that one runs supervisor code on a thread belonging to the service, and a bug in it must be a
+ * supervisor problem rather than a service failure.
  */
 final class SupervisorServiceContext implements ServiceContext {
 
     private static final Logger LOG = LoggerFactory.getLogger(SupervisorServiceContext.class);
 
+    /**
+     * Receives every event a service reports, tagged with which service reported it.
+     *
+     * <p>Called on whatever thread the service happened to be on — frequently a Cassandra one —
+     * so an implementation must be cheap and must not block. Anything that waits belongs on a
+     * thread of the supervisor's own.
+     */
+    @FunctionalInterface
+    interface EventListener {
+        void onEvent(String serviceName, String level, String type, String message);
+    }
+
     private final Path homeDirectory;
     private final ServiceConfiguration configuration;
     private final Map<String, String> settings;
+    private final EventListener eventListener;
     private final BiConsumer<String, Throwable> fatalErrorHandler;
-
-    SupervisorServiceContext(
-            Path homeDirectory,
-            ServiceConfiguration configuration,
-            BiConsumer<String, Throwable> fatalErrorHandler) {
-        this(homeDirectory, configuration, Map.of(), fatalErrorHandler);
-    }
 
     /**
      * @param derivedSettings settings the supervisor can only compute once the process is
@@ -59,12 +68,14 @@ final class SupervisorServiceContext implements ServiceContext {
             Path homeDirectory,
             ServiceConfiguration configuration,
             Map<String, String> derivedSettings,
+            EventListener eventListener,
             BiConsumer<String, Throwable> fatalErrorHandler) {
         this.homeDirectory = homeDirectory;
         this.configuration = configuration;
         Map<String, String> merged = new LinkedHashMap<>(configuration.settings());
         merged.putAll(derivedSettings);
         this.settings = Map.copyOf(merged);
+        this.eventListener = eventListener;
         this.fatalErrorHandler = fatalErrorHandler;
         createDirectories();
     }
@@ -127,6 +138,14 @@ final class SupervisorServiceContext implements ServiceContext {
         } catch (RuntimeException e) {
             // Swallowed on purpose: see the class comment. A logging problem must not be able to
             // fail a service's startup.
+        }
+        try {
+            eventListener.onEvent(service, level, type, message);
+        } catch (RuntimeException e) {
+            // Logged rather than swallowed, unlike the logging failure above: this one is a defect
+            // in the supervisor, and it is invisible from anywhere else. It still may not reach
+            // the caller, which is inside the service and cannot act on it.
+            LOG.error("Supervisor event listener failed for [{}] {}", service, type, e);
         }
     }
 

@@ -17,6 +17,8 @@ import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -53,6 +55,13 @@ final class RecordingService implements EmbeddedService, AutoCloseable {
     volatile boolean handsOffCleanly = true;
     /** When false, {@code awaitDecommissionReady} burns its whole deadline before giving up. */
     volatile boolean waitsForItsDeadline;
+    /** When set, {@code prepareDecommission} blocks on it until a test opens it. */
+    volatile CountDownLatch prepareGate;
+    /**
+     * When set, {@code awaitDecommissionReady} blocks on it. Holds a decommission open in the
+     * phase it spends nearly all its time in, so a test can observe what happens meanwhile.
+     */
+    volatile CountDownLatch relocationGate;
     /** The deadline the coordinator handed each phase, latest last. */
     final Map<String, Duration> phaseTimeouts = new LinkedHashMap<>();
     /** What {@code abortDecommission} saw on its context, for the cancelled-decommission case. */
@@ -66,6 +75,13 @@ final class RecordingService implements EmbeddedService, AutoCloseable {
     private void record(String call) {
         synchronized (calls) {
             calls.add(name + '.' + call);
+        }
+    }
+
+    /** Bounded, so a test that forgets to open a gate fails rather than hanging the build. */
+    private static void awaitGate(CountDownLatch gate) throws InterruptedException {
+        if (gate != null) {
+            gate.await(1, TimeUnit.MINUTES);
         }
     }
 
@@ -104,6 +120,7 @@ final class RecordingService implements EmbeddedService, AutoCloseable {
     public void prepareDecommission(DecommissionContext decommission) throws Exception {
         record("prepareDecommission");
         phaseTimeouts.put("prepareDecommission", decommission.timeout());
+        awaitGate(prepareGate);
         status = ServiceStatus.DECOMMISSIONING;
         if (prepareFailure != null) {
             throw prepareFailure;
@@ -127,6 +144,7 @@ final class RecordingService implements EmbeddedService, AutoCloseable {
     public boolean awaitDecommissionReady(DecommissionContext decommission) throws Exception {
         record("awaitDecommissionReady");
         phaseTimeouts.put("awaitDecommissionReady", decommission.timeout());
+        awaitGate(relocationGate);
         if (waitsForItsDeadline) {
             // What the real OpenSearch runtime does when shards will not move: poll until the
             // deadline in the context expires, then report that it gave up.

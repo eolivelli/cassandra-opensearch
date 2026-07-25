@@ -137,20 +137,55 @@ well, before Cassandra's. That is where the shard count is re-checked, `--force`
 recorded, and the node moves to `DECOMMISSIONED` rather than merely `STOPPED`. It runs first
 because Cassandra's is the irreversible one.
 
-### The unsupervised path is not yet handled
+### The unsupervised path is watched, not made safe
 
 A plain `nodetool decommission` bypasses the supervisor and talks straight to Cassandra's
-`StorageService` MBean. That path still works — it is Cassandra's own — but it does **not** order
+`StorageService` MBean. That path works — it is Cassandra's own — but it does **not** order
 OpenSearch's relocation first, so shards resident on this node can be lost when the process exits.
 
-The Cassandra runtime does report `ring.state.changed`, and `conf/cassandra-opensearch.yaml`
-carries a `watch_external_decommission` key, but **the supervisor does not yet act on that
-event** — today it only logs it. The setting is therefore inert. Making it work is not merely
-wiring: the supervisor-driven path emits the same event while already `DECOMMISSIONING`, so the
-handler has to distinguish the two, and even then it is a race the catch-up may lose.
+The supervisor now watches for it. The Cassandra runtime runs a `RingStateWatcher`: a daemon
+thread that polls `StorageService.getOperationMode()` once a second and reports
+`ring.state.changed` whenever the mode moves, saying which mode and whether it means this node is
+leaving the ring. Polling rather than a JMX `NotificationListener` because there is nothing to
+listen to — `StorageService` extends `NotificationBroadcasterSupport`, but `setMode`, the one
+method every transition in the class goes through, writes a field and logs, and the only
+notifications that class emits come from its `JMXProgressSupport`, wired to bootstrap-resume and
+repair.
 
-Until it is implemented, `bin/cassandra-opensearch decommission` is the only ordering-safe way to
-retire a node. This is tracked in `docs/KNOWN-GAPS.md`.
+```
+  operator: bin/nodetool decommission
+        │
+        ├── StorageService.decommission()  → mode LEAVING, then sleeps RING_DELAY (30 s)
+        │
+   RingStateWatcher (1 s poll)
+        └─→ ring.state.changed  state=LEAVING leaving=true
+              │
+        Supervisor.onNodeLeavingTheRing
+              ├── watch_external_decommission false?          → nothing
+              ├── DECOMMISSIONING, or a coordinator in flight? → nothing; this is ours
+              └── otherwise → WARN, then prepareDecommission(opensearch) on its own thread
+```
+
+Two things about that handler are load-bearing. It **must not fire during the supported path**,
+which drives Cassandra into the identical modes; it tells them apart by the supervisor's own
+state, not by inspecting the event, because a coordinated decommission is always
+`DECOMMISSIONING` by the time Cassandra begins to leave. And it **hands the work to another
+thread**: `reportEvent` is called from inside the service, frequently on a Cassandra thread, and
+the SPI says it never blocks.
+
+The message grammar is `io.cassandraopensearch.spi.RingStateEvent`, in the SPI rather than agreed
+by convention between two modules that share no other code. The service reports the verdict
+(`leaving=true`) as well as the mode, so the supervisor does not have to carry a table of
+Cassandra's operation-mode names — that vocabulary belongs to the runtime that owns it.
+
+**This reduces harm; it does not make the path safe.** By the time Cassandra reports `LEAVING` the
+ring transition has already started, so the exclusion is a catch-up racing it, and the supervisor
+has no way to hold anything up while the shards move — `nodetool` is not waiting for it and
+nothing stops the operator killing the process. It also stops at the exclusion: it does not wait
+for relocation and then stop OpenSearch, because that wait would keep a second driver on the
+service's lifecycle for up to `shard_relocation_timeout`. `bin/cassandra-opensearch decommission`
+is still the only ordering-safe way to retire a node. See `docs/KNOWN-GAPS.md` §1 for the
+remaining exposure and how to work around it.
 
 ## Distribution layout
 

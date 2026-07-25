@@ -11,6 +11,7 @@ import java.lang.management.ManagementFactory;
 import java.lang.management.MemoryMXBean;
 import java.lang.management.RuntimeMXBean;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -28,6 +29,7 @@ import com.datastax.oss.driver.api.core.CqlSession;
 import com.datastax.oss.driver.api.core.cql.Row;
 
 import io.cassandraopensearch.spi.DecommissionContext;
+import io.cassandraopensearch.spi.RingStateEvent;
 import io.cassandraopensearch.spi.ServiceException;
 import io.cassandraopensearch.spi.ServiceStatus;
 
@@ -248,7 +250,71 @@ class CassandraServiceLifecycleTest {
         assertThat(cqlRoundTrip("after_rejected_decommission").getInt("n")).isEqualTo(42);
     }
 
+    /**
+     * The other half of {@link RingStateWatcherTest}: that what the watcher polls is a real node's
+     * real operation mode, and that a change nobody asked the supervisor for is reported.
+     *
+     * <p>The mode is moved by calling {@code StorageService.setMode} — the one method every
+     * transition in that class goes through — rather than by decommissioning, because a one-node
+     * ring cannot be decommissioned and the alternatives that do move the mode ({@code drain},
+     * {@code move}) destroy the node this class shares between its tests. It is restored
+     * afterwards for the same reason.
+     */
+    @Test
+    void theWatcherReportsAModeChangeMadeBehindTheSupervisorsBack() throws Exception {
+        int before = ringEvents().size();
+        setOperationMode("LEAVING");
+        try {
+            RingStateEvent leaving = awaitRingEvent(before);
+            assertThat(leaving.state()).isEqualTo("LEAVING");
+            assertThat(leaving.leaving()).isTrue();
+            assertThat(leaving.detail()).contains("NORMAL -> LEAVING");
+            assertThat(node.details()).containsEntry("operationMode", "LEAVING");
+        } finally {
+            setOperationMode("NORMAL");
+        }
+
+        RingStateEvent back = awaitRingEvent(before + 1);
+        assertThat(back.state()).isEqualTo("NORMAL");
+        assertThat(back.leaving()).isFalse();
+        assertThat(node.service().status()).isEqualTo(ServiceStatus.RUNNING);
+    }
+
     // --- helpers ---------------------------------------------------------------------------
+
+    /**
+     * Sets the node's operation mode the way Cassandra sets it internally. {@code setMode} is
+     * private, so this is reflective; it assigns a field and logs, and has no other effect.
+     */
+    private static void setOperationMode(String mode) throws Exception {
+        ClassLoader loader = node.isolatedLoader();
+        Class<?> storageService =
+                Class.forName("org.apache.cassandra.service.StorageService", true, loader);
+        Class<?> modeEnum =
+                Class.forName("org.apache.cassandra.service.StorageService$Mode", true, loader);
+        Method setMode = storageService.getDeclaredMethod("setMode", modeEnum, boolean.class);
+        setMode.setAccessible(true);
+        setMode.invoke(storageService.getField("instance").get(null),
+                modeEnum.getMethod("valueOf", String.class).invoke(null, mode), true);
+    }
+
+    private static List<RecordingServiceContext.Event> ringEvents() {
+        return node.context().events().stream()
+                .filter(event -> RingStateEvent.TYPE.equals(event.type()))
+                .toList();
+    }
+
+    /** @param index which ring event to wait for, counting from the first one ever reported */
+    private static RingStateEvent awaitRingEvent(int index) throws InterruptedException {
+        long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
+        while (ringEvents().size() <= index) {
+            if (System.nanoTime() - deadline > 0) {
+                throw new AssertionError("no ring event at index " + index + "; saw " + ringEvents());
+            }
+            Thread.sleep(100);
+        }
+        return RingStateEvent.parse(ringEvents().get(index).message());
+    }
 
     private static Row cqlRoundTrip(String keyspace) {
         try (CqlSession session = CqlSession.builder()

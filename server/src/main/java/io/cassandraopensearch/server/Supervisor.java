@@ -9,7 +9,9 @@ package io.cassandraopensearch.server;
 
 import io.cassandraopensearch.server.config.NodeConfiguration;
 import io.cassandraopensearch.server.config.ServiceConfiguration;
+import io.cassandraopensearch.spi.DecommissionContext;
 import io.cassandraopensearch.spi.EmbeddedService;
+import io.cassandraopensearch.spi.RingStateEvent;
 import io.cassandraopensearch.spi.ServiceContext;
 import io.cassandraopensearch.spi.ServiceStatus;
 
@@ -93,6 +95,7 @@ public final class Supervisor implements AutoCloseable {
 
     private final AtomicBoolean shuttingDown = new AtomicBoolean();
     private final AtomicBoolean fatal = new AtomicBoolean();
+    private final AtomicBoolean externalDecommissionSeen = new AtomicBoolean();
     private final AtomicInteger exitCode = new AtomicInteger();
     private final CountDownLatch terminated = new CountDownLatch(1);
 
@@ -164,7 +167,8 @@ public final class Supervisor implements AutoCloseable {
         started.put(service.name(), instance);
 
         ServiceContext context = new SupervisorServiceContext(
-                configuration.homeDirectory(), service, derivedSettings(service.name()), this::onFatalError);
+                configuration.homeDirectory(), service, derivedSettings(service.name()),
+                this::onServiceEvent, this::onFatalError);
         try {
             TimeLimited.run(service.name() + " startup",
                     service.startupTimeout().plus(STARTUP_GRACE), () -> instance.start(context));
@@ -476,6 +480,120 @@ public final class Supervisor implements AutoCloseable {
         }, "supervisor-decommission-exit");
         thread.setDaemon(true);
         thread.start();
+    }
+
+    // --- decommission started outside the supervisor ------------------------------------------
+
+    /**
+     * Every event a service reports, on the service's own thread.
+     *
+     * <p>Must stay cheap: the SPI promises {@code reportEvent} neither blocks nor throws, and the
+     * caller is frequently a Cassandra thread in the middle of something. Everything here is a
+     * parse and a few volatile reads; the one thing that can wait is handed to a thread of our
+     * own in {@link #onNodeLeavingTheRing}.
+     */
+    private void onServiceEvent(String serviceName, String level, String type, String message) {
+        if (!RingStateEvent.TYPE.equals(type)) {
+            return;
+        }
+        RingStateEvent event = RingStateEvent.parse(message);
+        if (event != null && event.leaving()) {
+            onNodeLeavingTheRing(serviceName, event);
+        }
+    }
+
+    /**
+     * A service has reported that this node is leaving its cluster. Works out whether the
+     * supervisor asked for that, and reacts only if it did not.
+     *
+     * <h2>Telling the two apart</h2>
+     *
+     * The supported path drives Cassandra into exactly the same operation modes, so the event
+     * alone cannot distinguish {@code bin/cassandra-opensearch decommission} from {@code
+     * bin/nodetool decommission}. The supervisor's own state can: a coordinated decommission is
+     * always {@link SupervisorState#DECOMMISSIONING} (or, for the instant between the coordinator
+     * being installed and the state moving, has a coordinator in flight) by the time Cassandra has
+     * begun to leave. Reacting during that window would run a second, uncoordinated exclusion
+     * against the OpenSearch node the coordinator is already driving.
+     *
+     * <h2>What this can and cannot achieve</h2>
+     *
+     * It reduces harm; it does not make the unsupervised path safe. By the time Cassandra reports
+     * {@code LEAVING} the ring transition has already begun, and nothing here can put that back or
+     * slow it down. All the supervisor can still do is start OpenSearch's shard relocation — which
+     * the supported path starts <i>before</i> Cassandra is touched at all — and hope it finishes
+     * first. On a node holding a lot of index data it will not. The exclusion is a catch-up that
+     * may lose the race, and the operator is told so.
+     */
+    private void onNodeLeavingTheRing(String serviceName, RingStateEvent event) {
+        if (!configuration.decommission().watchExternalDecommission()) {
+            return;
+        }
+        if (decommissionInFlight != null || state != SupervisorState.RUNNING) {
+            LOG.debug("Service '{}' reports {}; the supervisor is {} and is driving this itself",
+                    serviceName, event.state(), state);
+            return;
+        }
+        if (!externalDecommissionSeen.compareAndSet(false, true)) {
+            return;
+        }
+        // Off the reporting thread: the exclusion is a round trip into OpenSearch's cluster state,
+        // and the caller is a service thread that the SPI forbids us to block.
+        Thread thread = new Thread(() -> excludeAfterExternalDecommission(serviceName, event),
+                "supervisor-external-decommission");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    private void excludeAfterExternalDecommission(String serviceName, RingStateEvent event) {
+        EmbeddedService opensearch = started.get("opensearch");
+        LOG.warn("Service '{}' is {}: Cassandra is leaving the ring but was not asked through the"
+                        + " supervisor; OpenSearch shard relocation may not complete before this"
+                        + " process exits — use `bin/cassandra-opensearch decommission`, which"
+                        + " relocates the shards before Cassandra gives its ranges back.",
+                serviceName, event.state());
+        if (opensearch == null) {
+            return;
+        }
+        LOG.warn("Excluding this node from OpenSearch shard allocation as a best-effort catch-up."
+                + " It is a catch-up and it may lose the race: watch `_cat/shards` and let this"
+                + " node empty before the process is stopped, or any shard with no other copy is"
+                + " lost with it.");
+        Duration timeout = configuration.decommission().shardRelocationTimeout();
+        try {
+            opensearch.prepareDecommission(new ExternalCatchUp(timeout));
+        } catch (Exception e) {
+            LOG.error("Could not exclude this node from OpenSearch shard allocation after a"
+                    + " decommission started outside the supervisor. Its shards will not relocate"
+                    + " on their own; exclude the node by hand with a transient"
+                    + " cluster.routing.allocation.exclude._name update.", e);
+        }
+    }
+
+    /**
+     * The phase context for the catch-up exclusion.
+     *
+     * <p>Never forced and never cancelled, because there is nothing here to force or to cancel:
+     * this makes one call, {@code prepareDecommission}, which neither waits for a hand-off nor
+     * decides whether data may be abandoned. The decision that {@code force} would answer was
+     * taken by whoever ran {@code nodetool decommission}.
+     */
+    private record ExternalCatchUp(Duration timeout) implements DecommissionContext {
+
+        @Override
+        public boolean force() {
+            return false;
+        }
+
+        @Override
+        public void reportProgress(int percentComplete, String message) {
+            LOG.info("[external-decommission] {}", message);
+        }
+
+        @Override
+        public boolean isCancelled() {
+            return false;
+        }
     }
 
     // --- observation -------------------------------------------------------------------------
