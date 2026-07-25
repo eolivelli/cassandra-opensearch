@@ -10,7 +10,99 @@
   </parent>
   <artifactId>cassandra-opensearch-runtime-opensearch</artifactId>
   <name>Cassandra + OpenSearch :: OpenSearch Runtime</name>
+
+  <description>
+    EmbeddedService over org.opensearch.node.Node. This jar ships in lib/opensearch/ and is only
+    ever loaded by the OpenSearch child ClassLoader, so it must never appear on the supervisor's
+    classpath and must not reference the server or bootstrap modules.
+  </description>
+
   <dependencies>
-    <dependency><groupId>io.cassandraopensearch</groupId><artifactId>cassandra-opensearch-spi</artifactId></dependency>
+    <dependency>
+      <groupId>io.cassandraopensearch</groupId>
+      <artifactId>cassandra-opensearch-spi</artifactId>
+    </dependency>
+
+    <!--
+      OpenSearch is 'provided': the dist module resolves this same closure into lib/opensearch/,
+      where the child ClassLoader picks it up. Bundling it here would put a second copy of every
+      OpenSearch class in front of the loader.
+
+      Ship the whole resolved closure apart from the two exclusions below - a spike that tried to
+      trim it produced a "minimal set" that fails at runtime (jackson-dataformat-cbor is needed to
+      serialise search responses), and the paths no spike exercises are the ones that break.
+    -->
+    <dependency>
+      <groupId>org.opensearch</groupId>
+      <artifactId>opensearch</artifactId>
+      <scope>provided</scope>
+      <exclusions>
+        <!--
+          JNA is reached from Node.<init> (MonitorService -> ProcessProbe -> Natives) but only as
+          a probe that degrades to isMemoryLocked()=false. Two JNA copies in two child loaders do
+          coexist, so this is prudence rather than necessity: it removes any chance of Cassandra's
+          JNA and ours resolving the same libjnidispatch file.
+        -->
+        <exclusion>
+          <groupId>net.java.dev.jna</groupId>
+          <artifactId>jna</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+    <!-- HTTP/REST lives in the transport-netty4 module; without it the node has no REST API. -->
+    <dependency>
+      <groupId>org.opensearch.plugin</groupId>
+      <artifactId>transport-netty4-client</artifactId>
+      <scope>provided</scope>
+      <exclusions>
+        <!--
+          Real JNI natives, used only for HTTP/3, which is off by default. Unlike pure-Java Netty
+          classes, a native library cannot be loaded twice in one JVM - so this one jar would turn
+          the harmless duplication of Netty across the two child loaders into a genuine clash with
+          Cassandra's.
+        -->
+        <exclusion>
+          <groupId>io.netty</groupId>
+          <artifactId>netty-codec-native-quic</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+    <!-- Optional in the OpenSearch POM, so not inherited, but Node.<init> needs Configurator. -->
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-core</artifactId>
+      <scope>provided</scope>
+    </dependency>
   </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <configuration>
+          <!--
+            IsolatedClassLoaderRestApiTest builds a child ClassLoader out of java.class.path, so
+            the fork needs a real classpath rather than surefire's manifest-only booter jar.
+          -->
+          <useManifestOnlyJar>false</useManifestOnlyJar>
+          <!--
+            The tests start a real node, so they run under the same flags the distribution's
+            jvm21-server.options gives the product. None are strictly required; running with them
+            is what makes the tests representative.
+          -->
+          <argLine>
+            -Xmx1g
+            --add-modules=jdk.incubator.vector
+            --add-opens=java.base/java.nio=ALL-UNNAMED
+            --enable-native-access=ALL-UNNAMED
+            -Dopensearch.set.netty.runtime.available.processors=false
+            -Dlog4j.shutdownHookEnabled=false
+            -Dlog4j2.disable.jmx=true
+            -Djava.awt.headless=true
+          </argLine>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
 </project>

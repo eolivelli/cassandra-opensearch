@@ -1,0 +1,82 @@
+###########################################################################
+#                         jvm21-server.options                            #
+#                                                                         #
+# Proposed by the de-risking spike. Derived from conf/jvm17-server.options #
+# plus the JPMS entries that conf/jvm22-server.options adds and that JDK21 #
+# already needs, minus everything that is 22-only.                        #
+###########################################################################
+
+-XX:ThreadPriorityPolicy=1
+-XX:+UseThreadPriorities
+
+#################
+#  GC SETTINGS  #
+#################
+
+### G1 Settings
+-XX:+UseG1GC
+-XX:+ParallelRefProcEnabled
+-XX:MaxTenuringThreshold=2
+-XX:G1HeapRegionSize=16m
+
+# Floor the young generation size to 50% of the heap size
+-XX:+UnlockExperimentalVMOptions
+-XX:G1NewSizePercent=50
+
+-XX:G1RSetUpdatingPauseTimePercent=5
+-XX:MaxGCPauseMillis=500
+-XX:InitiatingHeapOccupancyPercent=70
+#-XX:ParallelGCThreads=16
+#-XX:ConcGCThreads=16
+
+### JPMS
+
+-Djdk.attach.allowAttachSelf=true
+-Djava.security.manager=allow
+
+--add-exports java.base/jdk.internal.misc=ALL-UNNAMED
+--add-exports java.base/jdk.internal.ref=ALL-UNNAMED
+--add-exports java.base/java.lang.ref=ALL-UNNAMED
+--add-exports java.base/sun.nio.ch=ALL-UNNAMED
+--add-exports java.management.rmi/com.sun.jmx.remote.internal.rmi=ALL-UNNAMED
+--add-exports java.management/com.sun.jmx.remote.security=ALL-UNNAMED
+--add-exports java.rmi/sun.rmi.registry=ALL-UNNAMED
+--add-exports java.rmi/sun.rmi.server=ALL-UNNAMED
+--add-exports java.sql/java.sql=ALL-UNNAMED
+--add-exports jdk.unsupported/sun.misc=ALL-UNNAMED
+--add-exports jdk.compiler/com.sun.tools.javac.file=ALL-UNNAMED
+
+--add-opens java.base/java.io=ALL-UNNAMED
+--add-opens java.base/java.lang=ALL-UNNAMED
+--add-opens java.base/java.lang.module=ALL-UNNAMED
+--add-opens java.base/java.lang.reflect=ALL-UNNAMED
+--add-opens java.base/java.net=ALL-UNNAMED
+--add-opens java.base/java.nio=ALL-UNNAMED
+--add-opens java.base/java.nio.charset=ALL-UNNAMED
+--add-opens java.base/java.nio.file.attribute=ALL-UNNAMED
+--add-opens java.base/java.nio.file.spi=ALL-UNNAMED
+--add-opens java.base/java.util=ALL-UNNAMED
+--add-opens java.base/java.util.concurrent=ALL-UNNAMED
+--add-opens java.base/java.util.concurrent.atomic=ALL-UNNAMED
+--add-opens java.base/java.util.concurrent.locks=ALL-UNNAMED
+--add-opens java.base/jdk.internal.loader=ALL-UNNAMED
+--add-opens java.base/jdk.internal.math=ALL-UNNAMED
+--add-opens java.base/jdk.internal.module=ALL-UNNAMED
+--add-opens java.base/jdk.internal.ref=ALL-UNNAMED
+--add-opens java.base/jdk.internal.reflect=ALL-UNNAMED
+# jvm17-server.options has --add-opens java.base/jdk.internal.util.jar=ALL-UNNAMED.
+# That package NO LONGER EXISTS in java.base on JDK 21 (it was removed after 17); keeping it
+# makes every JVM start print "WARNING: package jdk.internal.util.jar not in java.base".
+# Dropped on purpose.
+--add-opens java.base/sun.nio.ch=ALL-UNNAMED
+--add-opens jdk.compiler/com.sun.tools.javac=ALL-UNNAMED
+--add-opens jdk.management/com.sun.management.internal=ALL-UNNAMED
+
+### Netty Options
+-Dio.netty.tryReflectionSetAccessible=true
+-Dio.netty.allocator.useCacheForAllThreads=true
+-Dio.netty.allocator.maxOrder=11
+
+### SIMD (jvector / lucene)
+--add-modules jdk.incubator.vector
+--enable-native-access=ALL-UNNAMED

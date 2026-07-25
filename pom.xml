@@ -42,6 +42,8 @@
     <cassandra.version>5.0.7.0-SNAPSHOT</cassandra.version>
 
     <opensearch.version>3.7.0</opensearch.version>
+    <!-- log4j-core is <optional> in the OpenSearch POM, so its version is not managed for us -->
+    <log4j.version>2.25.4</log4j.version>
 
     <slf4j.version>1.7.36</slf4j.version>
     <jackson.version>2.17.2</jackson.version>
@@ -96,6 +98,23 @@
         <groupId>io.cassandraopensearch</groupId>
         <artifactId>cassandra-opensearch-cli</artifactId>
         <version>${project.version}</version>
+      </dependency>
+
+      <!-- OpenSearch, consumed by runtime-opensearch and assembled into lib/opensearch by dist -->
+      <dependency>
+        <groupId>org.opensearch</groupId>
+        <artifactId>opensearch</artifactId>
+        <version>${opensearch.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.opensearch.plugin</groupId>
+        <artifactId>transport-netty4-client</artifactId>
+        <version>${opensearch.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.logging.log4j</groupId>
+        <artifactId>log4j-core</artifactId>
+        <version>${log4j.version}</version>
       </dependency>
 
       <dependency>

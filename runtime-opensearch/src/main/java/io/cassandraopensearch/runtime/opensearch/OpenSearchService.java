@@ -62,6 +62,13 @@ import java.util.concurrent.atomic.AtomicReference;
  * JVM, and {@code io.netty.noUnsafe=true} in particular measurably slows Cassandra's native
  * transport.
  *
+ * <h2>Restarting</h2>
+ *
+ * {@link #start} may be called again after {@link #stop}, and that is the only supported way to
+ * restart: the isolated ClassLoader does not become collectable once a node has closed, so
+ * discarding it and building a new one leaks a server's worth of metaspace, while a fresh
+ * {@link Node} inside the existing loader comes up in a fraction of a cold start.
+ *
  * <h2>Threading</h2>
  *
  * The supervisor drives the lifecycle from one thread; {@link #status()} and {@link #details()}
@@ -97,6 +104,9 @@ public final class OpenSearchService implements EmbeddedService {
 
     /** Cluster-wide allocation filter; setting it to our node name drains this node's shards. */
     private static final String ALLOCATION_EXCLUDE_NAME = "cluster.routing.allocation.exclude._name";
+
+    /** Installs a JVM-wide deserialization filter; see {@link #buildSettings}. */
+    private static final String BOOTSTRAP_SERIAL_FILTER = "bootstrap.serial_filter";
 
     private final AtomicReference<ServiceStatus> status = new AtomicReference<>(ServiceStatus.NEW);
 
@@ -181,6 +191,17 @@ public final class OpenSearchService implements EmbeddedService {
         put(builder, "http.port", supervisor.get(SETTING_HTTP_PORT));
         put(builder, "transport.port", supervisor.get(SETTING_TRANSPORT_PORT));
         put(builder, "network.host", supervisor.get(SETTING_NETWORK_HOST));
+
+        // bootstrap.serial_filter is not OpenSearch's to enable here: where it exists, Node.<init>
+        // turns it into a process-wide ObjectInputFilter that rejects every Java deserialization,
+        // which would break Cassandra's in the same JVM. Dropped rather than set to false, since
+        // 3.7.0 does not know the setting at all and rejects unknown ones; this keeps the hazard
+        // neutralised across an upgrade to a version that does.
+        if (builder.remove(BOOTSTRAP_SERIAL_FILTER) != null) {
+            serviceContext.reportEvent("WARN", "opensearch.setting.ignored",
+                    BOOTSTRAP_SERIAL_FILTER + " installs a JVM-wide deserialization filter that would"
+                            + " break Cassandra in this process; the setting has been dropped");
+        }
 
         return builder
                 .put("path.home", serviceContext.homeDirectory().toAbsolutePath().toString())
