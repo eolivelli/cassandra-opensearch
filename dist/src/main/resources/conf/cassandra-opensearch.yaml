@@ -1,0 +1,59 @@
+# Supervisor configuration.
+#
+# This file governs only what the supervisor decides: which services run, where their files
+# live, which ports they get, and how long each lifecycle phase may take.
+#
+# It deliberately does not duplicate Cassandra's or OpenSearch's own settings. Those stay in
+# conf/cassandra.yaml and conf/opensearch.yml in their stock formats, parsed by the servers
+# themselves, so existing tooling and operational knowledge keep working unchanged.
+#
+# Unknown keys are rejected at startup rather than ignored — a typo here stops the process
+# instead of silently leaving a limit unset.
+
+cluster_name: cassandra-opensearch
+
+directories:
+  # Relative to the installation root. Each service gets a subdirectory under data/.
+  data: data
+  logs: logs
+
+services:
+  # Startup order is fixed — Cassandra, then OpenSearch — regardless of the order here.
+  cassandra:
+    enabled: true
+    config: cassandra.yaml
+    listen_address: 127.0.0.1
+    storage_port: 7000
+    native_transport_port: 9042    # cqlsh and the drivers connect here
+    jmx_port: 7199                 # bin/nodetool connects here
+    startup_timeout: 5m
+    shutdown_timeout: 2m
+
+  opensearch:
+    enabled: true
+    config: opensearch.yml
+    network_host: 127.0.0.1
+    http_port: 9200                # the REST API
+    transport_port: 9300
+    startup_timeout: 5m
+    shutdown_timeout: 2m
+
+decommission:
+  # How long to wait for OpenSearch to relocate every shard off this node before Cassandra is
+  # allowed to leave the ring. Bounded by how much index data this node holds and how fast the
+  # cluster can move it, so it is generous by default.
+  shard_relocation_timeout: 30m
+
+  # How long to wait for Cassandra to stream its ranges away.
+  ring_streaming_timeout: 1h
+
+  # Watch for a decommission started outside the supervisor — a plain `nodetool decommission`
+  # straight to Cassandra's JMX — and exclude the OpenSearch node as a best-effort catch-up.
+  #
+  # That path cannot be made fully safe: by the time Cassandra reports LEAVING, the ring
+  # transition is already under way and OpenSearch may not finish relocating before the process
+  # exits. Use `bin/cassandra-opensearch decommission`, which orders the two correctly.
+  watch_external_decommission: true
+
+supervisor:
+  health_check_interval: 10s
