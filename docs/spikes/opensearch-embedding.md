@@ -76,9 +76,22 @@ org.apache.logging.log4j:log4j-core:2.25.4
 not inherited, but `Node.<init>` needs it and fails at line 1039 with
 `NoClassDefFoundError: org/apache/logging/log4j/core/config/Configurator`.
 
-A greedy per-jar removal sweep found 24 of 74 jars droppable for a create/index/search path, but
-that list is not safe to act on — geo, aggregations, ingest and snapshots will re-require several
-of them. Declare the three and take the closure.
+Two exclusions are recommended for the co-hosted case:
+
+```xml
+<exclusion> net.java.dev.jna:jna </exclusion>              <!-- see the JNA note below -->
+<exclusion> io.netty:netty-codec-native-quic </exclusion>  <!-- real JNI, HTTP/3 only, off by default -->
+```
+
+**Ship the rest of the resolved closure; do not trim it.** A greedy per-jar removal sweep
+suggested 24 of the 74 jars were droppable, and that result is unsound — validating its "minimal
+set" as an actual classpath fails: `jackson-dataformat-cbor` is marked droppable but indexing and
+search then die during response serialisation with `NoClassDefFoundError:
+tools/jackson/dataformat/cbor/CBORConstants`. The greedy one-at-a-time method masks failures on
+code paths the probe reaches only later, and it also produced obvious false positives (marking
+the macOS and Windows quic natives *required* on Linux). Since one latent failure already slipped
+through, others almost certainly lurk on paths no spike exercised — percolation, aggregations,
+geo, ingest. Trimming buys ~40 MB and risks production-only `NoClassDefFoundError`s.
 
 ## JVM flags
 
@@ -113,16 +126,36 @@ Cassandra's native transport. OpenSearch's own Netty tuning must not be copied i
 
 ## Co-hosting notes
 
-- **JNA is never loaded.** Every `Native.register`/`loadLibrary` call sits behind `Bootstrap`,
-  which embedding skips. Verified: `/proc/self/maps` shows zero `libjnidispatch` mappings after a
-  full start/index/search/close cycle. The classic "native library already loaded in another
-  classloader" clash with Cassandra's JNA cannot happen.
+- **JNA: two copies in two child loaders coexist safely — but it *is* reached on the `Node`
+  path.** An earlier reading of this concluded JNA was unreachable when embedding, based on
+  `/proc/self/maps` showing zero `libjnidispatch` mappings. That evidence was misleading: JNA
+  extracts a private copy of the library per ClassLoader and unlinks it after mmap, so the
+  mapping shows as `(deleted)` and the naive probe reports nothing. The real chain is
+
+  ```
+  Node.<init>(Node.java:1110) → MonitorService → ProcessService
+    → ProcessProbe.processInfo → BootstrapInfo.isMemoryLocked
+    → Natives.<clinit>(Natives.java:60) → Class.forName("com.sun.jna.Native")
+  ```
+
+  It is a probe that degrades gracefully, and a direct two-loader experiment (each with its own
+  `jna-5.16.0.jar`, each making a real native downcall) succeeded in both loaders. The clash
+  would only appear if either side loaded jnidispatch from a *shared file path* — that is, with
+  `-Djna.boot.library.path` set, or `jna.nosys=false` resolving a system-installed
+  `libjnidispatch.so` in both loaders. So: never set `jna.boot.library.path`, and keep JNA
+  bundled in its jar. Simplest of all — **exclude JNA from the OpenSearch loader entirely**
+  (verified working; costs only a `JNA not found` warning and `isMemoryLocked() == false`).
 - **Netty's `availableProcessors` is a write-once global.** Harmless while Netty is duplicated
   inside each child loader (which the platform-parent design guarantees); the
   `opensearch.set.netty.runtime.available.processors=false` escape hatch covers the rest.
-- **Do not call `LogConfigurator`.** It is optional, and it sets four global system properties
-  including `java.util.logging.manager`, hijacking JUL process-wide and pulling Cassandra's JUL
-  output into OpenSearch's log4j2 configuration.
+- **Do not call `LogConfigurator`.** It is optional, and besides setting four global system
+  properties — including `java.util.logging.manager`, which hijacks JUL process-wide — it also
+  calls `System.setOut` and `System.setErr`, redirecting them into OpenSearch's log4j. In a
+  shared JVM that swallows Cassandra's stdout and stderr into OpenSearch's logger.
+- **Leave `bootstrap.serial_filter` at its default of `false`.** `Node.<init>` (line 582) reaches
+  `BootstrapSettings.initializeSerialFilter()`, which installs a **process-wide**
+  `ObjectInputFilter` rejecting all Java serialization. Enabling it would break Cassandra's
+  serialization across the whole JVM.
 - **Never populate `modules/` or `plugins/` on disk.** `PluginsService` runs a jar-hell check
   against `System.getProperty("java.class.path")` for each bundle found there — which in an
   isolated setup is *Cassandra's* classpath, producing both missed conflicts and spurious
@@ -150,3 +183,16 @@ and does not block JVM exit. No shutdown hooks, no `System.exit`, and no
 `setDefaultUncaughtExceptionHandler` (all of those live in `Bootstrap`). Three full
 construct/start/close cycles in one JVM released and rebound the ports each time, with thread
 count returning to baseline.
+
+**The child ClassLoader is not garbage-collectable after `close()`.** Checked with a
+`WeakReference` and 40 forced GC cycles across four configurations — with and without
+`LogConfigurator`, with and without JNA, and with the whole lifecycle run on a thread that had
+since terminated. The loader survived every time. No shutdown hook, live thread, TCCL or
+`ThreadLocal` referenced it; the retaining root was not identified and is most likely a static in
+a `java.base` class (JUL logger registration from Lucene's `PosixNativeAccess`, a
+`java.lang.foreign` downcall-handle cache, or `MethodType` interning).
+
+Practical impact is low: this project loads OpenSearch once per process lifetime. It matters only
+if the loader is ever recreated — so **restart the `Node` in place within the existing loader**
+(verified clean, ~200 ms) rather than rebuilding the loader, and treat repeated loader creation
+as a metaspace leak.
