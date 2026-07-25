@@ -48,8 +48,8 @@ class NodeConfigurationTest {
         assertThat(cassandra.enabled()).isTrue();
         assertThat(cassandra.configFile()).isEqualTo(home.resolve("conf/cassandra.yaml"));
         assertThat(cassandra.libDirectory()).isEqualTo(home.resolve("lib/cassandra"));
-        assertThat(cassandra.settings()).containsEntry("jmx_port", "7199")
-                .containsEntry("native_transport_port", "9042");
+        // Key names are the runtimes', not the YAML's; ServiceSettingsTest pins the full set.
+        assertThat(cassandra.settings()).containsEntry("jmx.port", "7199");
 
         ServiceConfiguration opensearch = configuration.service("opensearch");
         assertThat(opensearch.configFile()).isEqualTo(home.resolve("conf/opensearch.yml"));
@@ -88,7 +88,7 @@ class NodeConfigurationTest {
                 """);
 
         assertThat(configuration.clusterName()).isEqualTo("prod-eu");
-        assertThat(configuration.service("cassandra").settings()).containsEntry("jmx_port", "17199");
+        assertThat(configuration.service("cassandra").settings()).containsEntry("jmx.port", "17199");
         assertThat(configuration.service("cassandra").startupTimeout()).isEqualTo(Duration.ofSeconds(90));
         assertThat(configuration.service("opensearch").startupTimeout()).isEqualTo(Duration.ofMinutes(3));
         assertThat(configuration.decommission().shardRelocationTimeout()).isEqualTo(Duration.ofMinutes(45));

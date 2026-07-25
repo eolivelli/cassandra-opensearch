@@ -1,0 +1,189 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>io.cassandraopensearch</groupId>
+    <artifactId>cassandra-opensearch-parent</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <relativePath>../../pom.xml</relativePath>
+  </parent>
+  <artifactId>cassandra-opensearch-tarball</artifactId>
+  <packaging>pom</packaging>
+  <name>Cassandra + OpenSearch :: Tarball and Docker image</name>
+
+  <description>
+    Produces cassandra-opensearch-${project.version}-bin.tar.gz and, under -Pdocker, the image.
+
+    Its own dependencies are exactly lib/boot: the JVM's -cp and nothing more. Adding a
+    dependency here puts a class in front of both isolated loaders, so the list is deliberately
+    short and VerifyDistributionLayout fails the build if a Cassandra or OpenSearch jar ever
+    appears in it.
+  </description>
+
+  <properties>
+    <!--
+      conf/ lives in the aggregator rather than here because server's ShippedConfigurationTest
+      parses ../dist/src/main/resources/conf/cassandra-opensearch.yaml directly: the supervisor
+      is tested against the file the distribution really ships, not a copy of it.
+    -->
+    <dist.conf.directory>${project.basedir}/../src/main/resources/conf</dist.conf.directory>
+    <!-- bin/ belongs to the cli module; see docs/ARCHITECTURE.md. -->
+    <dist.bin.directory>${project.basedir}/../../cli/src/main/bin</dist.bin.directory>
+    <lib.cassandra.directory>${project.basedir}/../lib-cassandra/target/lib</lib.cassandra.directory>
+    <lib.opensearch.directory>${project.basedir}/../lib-opensearch/target/lib</lib.opensearch.directory>
+
+    <dist.finalName>cassandra-opensearch-${project.version}</dist.finalName>
+    <dist.archive>${project.build.directory}/${dist.finalName}-bin.tar.gz</dist.archive>
+    <docker.image>cassandra-opensearch:${project.version}</docker.image>
+  </properties>
+
+  <dependencies>
+    <!-- lib/boot, in full. The supervisor, the isolation machinery, the bridge contract and the
+         CLI, plus the three libraries they need: a logging API with a binding, and the YAML
+         parser for conf/cassandra-opensearch.yaml. -->
+    <dependency>
+      <groupId>io.cassandraopensearch</groupId>
+      <artifactId>cassandra-opensearch-spi</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.cassandraopensearch</groupId>
+      <artifactId>cassandra-opensearch-bootstrap</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.cassandraopensearch</groupId>
+      <artifactId>cassandra-opensearch-server</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.cassandraopensearch</groupId>
+      <artifactId>cassandra-opensearch-cli</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+    </dependency>
+    <!--
+      slf4j-simple, not logback and not log4j: those two are the bindings the isolated loaders
+      use, and a copy of either on the system classpath is the one thing that could make a child
+      loader's logging resolve against the parent. slf4j-simple has no dependencies of its own
+      and writes where the launcher points it.
+    -->
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-simple</artifactId>
+      <version>${slf4j.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.yaml</groupId>
+      <artifactId>snakeyaml</artifactId>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <finalName>${dist.finalName}</finalName>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-dependency-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>collect-boot-jars</id>
+            <phase>prepare-package</phase>
+            <goals><goal>copy-dependencies</goal></goals>
+            <configuration>
+              <outputDirectory>${project.build.directory}/boot-lib</outputDirectory>
+              <includeScope>runtime</includeScope>
+              <overWriteIfNewer>true</overWriteIfNewer>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-assembly-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>tarball</id>
+            <phase>package</phase>
+            <goals><goal>single</goal></goals>
+            <configuration>
+              <descriptors>
+                <descriptor>src/main/assembly/bin.xml</descriptor>
+              </descriptors>
+              <tarLongFileMode>posix</tarLongFileMode>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <!--
+        Unpacks the archive that was just built and checks it against docs/ARCHITECTURE.md: an
+        assembly that runs to completion says nothing about whether a Cassandra jar ended up on
+        the supervisor's classpath. Bound to `verify` so `mvn verify` is the gate.
+      -->
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>verify-layout</id>
+            <phase>verify</phase>
+            <goals><goal>exec</goal></goals>
+            <configuration>
+              <executable>${project.basedir}/src/test/scripts/verify-layout.sh</executable>
+              <arguments>
+                <argument>${dist.archive}</argument>
+                <argument>${project.build.directory}/layout-check</argument>
+              </arguments>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+
+  <profiles>
+    <!--
+      Off by default: a Docker daemon is not part of the build contract, and `mvn verify` has to
+      work without one. `mvn verify -Pdocker` builds the image from the tarball produced above.
+    -->
+    <profile>
+      <id>docker</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>exec-maven-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>docker-build</id>
+                <phase>verify</phase>
+                <goals><goal>exec</goal></goals>
+                <configuration>
+                  <executable>docker</executable>
+                  <workingDirectory>${project.basedir}</workingDirectory>
+                  <arguments>
+                    <argument>build</argument>
+                    <argument>--file</argument>
+                    <argument>${project.basedir}/src/main/docker/Dockerfile</argument>
+                    <argument>--build-arg</argument>
+                    <argument>DIST_ARCHIVE=${dist.finalName}-bin.tar.gz</argument>
+                    <argument>--build-arg</argument>
+                    <argument>DIST_NAME=${dist.finalName}</argument>
+                    <argument>--tag</argument>
+                    <argument>${docker.image}</argument>
+                    <!-- The build context is target/, so the COPY finds the tarball without a
+                         copy step and without shipping the whole source tree to the daemon. -->
+                    <argument>${project.build.directory}</argument>
+                  </arguments>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
+</project>

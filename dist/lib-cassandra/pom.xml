@@ -1,0 +1,127 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>io.cassandraopensearch</groupId>
+    <artifactId>cassandra-opensearch-parent</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <relativePath>../../pom.xml</relativePath>
+  </parent>
+  <artifactId>cassandra-opensearch-lib-cassandra</artifactId>
+  <packaging>pom</packaging>
+  <name>Cassandra + OpenSearch :: lib/cassandra</name>
+
+  <description>
+    Resolves the contents of the distribution's lib/cassandra/ directory into target/lib.
+
+    The dependencies below are `provided` for the same reason they are `provided` in
+    runtime-cassandra: nothing must inherit a second copy of Cassandra from this module. What
+    matters here is that the resolution happens in a POM that knows nothing about OpenSearch, so
+    Cassandra's Lucene 9.8, Netty 4.1 and Jackson 2.21.4 survive intact.
+  </description>
+
+  <dependencyManagement>
+    <dependencies>
+      <!--
+        The parent manages these for the supervisor, which is a different world. Restored here to
+        whatever Cassandra's own tree resolves, because a version chosen for lib/boot has no
+        business reaching the isolated node: snakeyaml parses cassandra.yaml, and downgrading
+        slf4j-api below 2.x would leave logback 1.5 undiscovered and the node on the NOP logger,
+        writing no log at all. Both are verified by VerifyDistributionLayout.
+      -->
+      <dependency>
+        <groupId>org.yaml</groupId>
+        <artifactId>snakeyaml</artifactId>
+        <version>2.4</version>
+      </dependency>
+      <dependency>
+        <groupId>org.slf4j</groupId>
+        <artifactId>slf4j-api</artifactId>
+        <version>2.0.17</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <dependencies>
+    <dependency>
+      <groupId>${cassandra.groupId}</groupId>
+      <artifactId>${cassandra.artifactId}</artifactId>
+      <version>${cassandra.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <!-- The EmbeddedService implementation the cassandra child loader instantiates. -->
+    <dependency>
+      <groupId>io.cassandraopensearch</groupId>
+      <artifactId>cassandra-opensearch-runtime-cassandra</artifactId>
+      <scope>provided</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-dependency-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>collect-cassandra-jars</id>
+            <phase>prepare-package</phase>
+            <goals><goal>copy-dependencies</goal></goals>
+            <configuration>
+              <outputDirectory>${project.build.directory}/lib</outputDirectory>
+              <includeScope>provided</includeScope>
+              <!--
+                The SPI is loaded by the parent and delegated to; a copy in here would be loaded
+                by the child instead, and every object crossing the boundary would then be an
+                instance of a class the supervisor cannot cast. See IsolatedClassLoader.
+              -->
+              <excludeArtifactIds>cassandra-opensearch-spi</excludeArtifactIds>
+              <overWriteIfNewer>true</overWriteIfNewer>
+              <!-- Directory listing order decides which duplicate class wins; keep names stable. -->
+              <stripVersion>false</stripVersion>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <!--
+        conf/ has to be on this loader's classpath: that is where logback looks for logback.xml,
+        and the alternative, -Dlogback.configurationFile, is a JVM global that would apply to
+        every logback in the process rather than just this node's.
+
+        ClasspathResolver builds the child classpath by listing lib/cassandra/*.jar, so the
+        directory itself is the only place the layout can express this. A jar whose manifest
+        carries `Class-Path: ../../conf/` does it: URLClassLoader follows Class-Path entries
+        relative to the jar's own URL, so <home>/lib/cassandra/000-conf-classpath.jar puts
+        <home>/conf/ on the classpath and nothing else changes. The name sorts first so conf/
+        precedes every jar, and the jar holds nothing but its manifest.
+
+        The supervisor is free to add conf/ as an extra classpath URL as well - the runtime
+        module's tests do exactly that - and a duplicate entry is harmless.
+      -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-antrun-plugin</artifactId>
+        <version>3.1.0</version>
+        <executions>
+          <execution>
+            <id>conf-on-the-classpath</id>
+            <phase>prepare-package</phase>
+            <goals><goal>run</goal></goals>
+            <configuration>
+              <target>
+                <jar destfile="${project.build.directory}/lib/000-conf-classpath.jar">
+                  <manifest>
+                    <attribute name="Class-Path" value="../../conf/"/>
+                  </manifest>
+                </jar>
+              </target>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

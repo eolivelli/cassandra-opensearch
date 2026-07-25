@@ -58,11 +58,13 @@ curl localhost:9200/_cluster/health?pretty
 bin/cassandra-opensearch decommission [--timeout 30m] [--force]
 ```
 
-This is the supported path, and the ordering matters: OpenSearch relocates its shards off this
-node **before** Cassandra streams its ranges away and leaves the ring. Running `nodetool
-decommission` directly still works — it is Cassandra's own operation — but it does not order the
-OpenSearch relocation first, so shards resident on this node can be lost when the process exits.
-The supervisor detects that path and excludes the OpenSearch node as a best-effort catch-up.
+This is the **only ordering-safe path**, and the ordering is the point: OpenSearch relocates its
+shards off this node before Cassandra streams its ranges away and leaves the ring.
+
+Running `nodetool decommission` directly still works — it is Cassandra's own operation — but it
+does **not** order the OpenSearch relocation first, so shards resident on this node can be lost
+when the process exits. The supervisor does not yet catch that case; see
+[docs/KNOWN-GAPS.md](docs/KNOWN-GAPS.md) §1.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full lifecycle.
 
@@ -70,4 +72,5 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full lifecycle.
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — isolation design, module map, lifecycle
 - [docs/JDK.md](docs/JDK.md) — the JDK 17 / OpenSearch 3.x conflict and how it was resolved
-- [docs/GLOBAL-STATE.md](docs/GLOBAL-STATE.md) — what ClassLoader isolation does *not* separate
+- [docs/KNOWN-GAPS.md](docs/KNOWN-GAPS.md) — **what is not finished or not safe. Read this.**
+- [docs/spikes/](docs/spikes/) — the de-risking spikes: how each server is embedded, and why

@@ -10,8 +10,20 @@
   </parent>
   <artifactId>cassandra-opensearch-cli</artifactId>
   <name>Cassandra + OpenSearch :: CLI</name>
+
+  <description>
+    bin/* and the JMX client behind `cassandra-opensearch status|stop|decommission`.
+
+    This jar ships in lib/boot, which is the JVM's -cp and therefore visible to both isolated
+    ClassLoaders through their parent. It has no dependencies for that reason - not even an
+    argument-parsing library. Four subcommands and three options do not justify putting another
+    jar in front of Cassandra and OpenSearch.
+  </description>
+
   <dependencies>
-    <dependency><groupId>io.cassandraopensearch</groupId><artifactId>cassandra-opensearch-spi</artifactId></dependency>
-    <dependency><groupId>info.picocli</groupId><artifactId>picocli</artifactId></dependency>
+    <dependency>
+      <groupId>io.cassandraopensearch</groupId>
+      <artifactId>cassandra-opensearch-spi</artifactId>
+    </dependency>
   </dependencies>
 </project>

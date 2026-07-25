@@ -1,0 +1,57 @@
+#!/bin/sh
+#
+# cqlsh against the embedded Cassandra node.
+#
+# Unlike nodetool this cannot be self-contained: cqlsh is a Python program, and it needs
+# bin/cqlsh.py plus the cqlshlib package from pylib/ - source files, not jars, so they are not
+# in this distribution's dependency tree and there is nothing sensible to ship in their place.
+# So this is a passthrough: point CASSANDRA_TOOLS_HOME at a Cassandra installation or source
+# tree of the matching version and this runs its cqlsh, with CASSANDRA_INCLUDE set so the fork's
+# broken JDK version check does not reject Java 21.
+
+set -e
+
+CO_INCLUDE=$(dirname "$0")/cassandra-opensearch.in.sh
+[ -r "$CO_INCLUDE" ] || { echo "cqlsh: missing $CO_INCLUDE" >&2; exit 1; }
+# shellcheck source=cassandra-opensearch.in.sh
+. "$CO_INCLUDE"
+
+# The one native_transport_port: in conf/cassandra-opensearch.yaml is Cassandra's.
+CQL_PORT=$(sed -n 's/^[[:space:]]*native_transport_port:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+    "$CO_CONF/cassandra-opensearch.yaml" 2> /dev/null | head -1)
+CQL_PORT="${CQL_PORT:-9042}"
+CQL_HOST=$(sed -n 's/^[[:space:]]*listen_address:[[:space:]]*\([^ #]*\).*/\1/p' \
+    "$CO_CONF/cassandra-opensearch.yaml" 2> /dev/null | head -1)
+CQL_HOST="${CQL_HOST:-127.0.0.1}"
+
+if [ -z "$CASSANDRA_TOOLS_HOME" ] || [ ! -x "$CASSANDRA_TOOLS_HOME/bin/cqlsh" ]; then
+    cat >&2 <<EOF
+cqlsh: not available in this distribution.
+
+cqlsh is Python, not Java: it needs bin/cqlsh.py and the cqlshlib package from a Cassandra
+installation, neither of which is a jar and neither of which this tarball carries.
+
+Set CASSANDRA_TOOLS_HOME to a Cassandra installation or source tree of a matching version and
+run this again, or connect with any CQL client:
+
+    <installation>/bin/cqlsh $CQL_HOST $CQL_PORT
+EOF
+    exit 1
+fi
+
+CQLSH_PYTHON="${CQLSH_PYTHON:-$(command -v python3 2> /dev/null)}"
+if [ -z "$CQLSH_PYTHON" ]; then
+    echo "cqlsh: no python3 on PATH. Install Python 3.8 or newer, or set CQLSH_PYTHON." >&2
+    exit 1
+fi
+export CQLSH_PYTHON
+
+export CO_HOME
+CASSANDRA_INCLUDE="$CO_BIN/cassandra.in.sh"
+export CASSANDRA_INCLUDE
+
+# Host and port last so an explicit host/port from the operator overrides these defaults.
+if [ $# -eq 0 ]; then
+    exec "$CASSANDRA_TOOLS_HOME/bin/cqlsh" "$CQL_HOST" "$CQL_PORT"
+fi
+exec "$CASSANDRA_TOOLS_HOME/bin/cqlsh" "$@"

@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>io.cassandraopensearch</groupId>
+    <artifactId>cassandra-opensearch-parent</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <relativePath>../../pom.xml</relativePath>
+  </parent>
+  <artifactId>cassandra-opensearch-lib-opensearch</artifactId>
+  <packaging>pom</packaging>
+  <name>Cassandra + OpenSearch :: lib/opensearch</name>
+
+  <description>
+    Resolves the contents of the distribution's lib/opensearch/ directory into target/lib.
+
+    The declarations mirror runtime-opensearch exactly, exclusions included, so that the jars the
+    child loader gets are the ones the runtime module was compiled and tested against. The whole
+    resolved closure ships: a spike that trimmed it produced a "minimal set" that fails at
+    runtime, and the paths no spike exercises are the ones that break.
+  </description>
+
+  <dependencyManagement>
+    <dependencies>
+      <!--
+        The parent pins snakeyaml for the supervisor's own config parsing. OpenSearch's tree wants
+        a newer one, and the version chosen for lib/boot must not reach an isolated loader.
+      -->
+      <dependency>
+        <groupId>org.yaml</groupId>
+        <artifactId>snakeyaml</artifactId>
+        <version>2.6</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.opensearch</groupId>
+      <artifactId>opensearch</artifactId>
+      <scope>provided</scope>
+      <exclusions>
+        <!-- Excluded in runtime-opensearch too: keeps Cassandra's JNA and this one from ever
+             resolving the same libjnidispatch file. Costs a warning and isMemoryLocked()=false. -->
+        <exclusion>
+          <groupId>net.java.dev.jna</groupId>
+          <artifactId>jna</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+    <dependency>
+      <groupId>org.opensearch.plugin</groupId>
+      <artifactId>transport-netty4-client</artifactId>
+      <scope>provided</scope>
+      <exclusions>
+        <!-- Real JNI natives for HTTP/3, which is off by default; a genuine two-loader clash with
+             Cassandra's Netty if it shipped. -->
+        <exclusion>
+          <groupId>io.netty</groupId>
+          <artifactId>netty-codec-native-quic</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+    <!-- Optional in the OpenSearch POM, so not inherited, but Node.<init> needs Configurator. -->
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-core</artifactId>
+      <scope>provided</scope>
+    </dependency>
+    <!-- The EmbeddedService implementation the opensearch child loader instantiates. -->
+    <dependency>
+      <groupId>io.cassandraopensearch</groupId>
+      <artifactId>cassandra-opensearch-runtime-opensearch</artifactId>
+      <scope>provided</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-dependency-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>collect-opensearch-jars</id>
+            <phase>prepare-package</phase>
+            <goals><goal>copy-dependencies</goal></goals>
+            <configuration>
+              <outputDirectory>${project.build.directory}/lib</outputDirectory>
+              <includeScope>provided</includeScope>
+              <!-- Parent-loaded and delegated to; see lib-cassandra/pom.xml. -->
+              <excludeArtifactIds>cassandra-opensearch-spi</excludeArtifactIds>
+              <overWriteIfNewer>true</overWriteIfNewer>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <!--
+        conf/ on this loader's classpath, so log4j2 finds conf/log4j2.properties there. Same
+        mechanism and same reasoning as lib-cassandra: a jar carrying nothing but
+        `Class-Path: ../../conf/` in its manifest, which URLClassLoader resolves relative to the
+        jar's own URL. The alternative, -Dlog4j.configurationFile, is a JVM global.
+
+        OpenSearch normally configures log4j2 through LogConfigurator, which this project never
+        calls - it hijacks JUL for the whole JVM and redirects System.out and System.err into
+        log4j2 - so without this the node would fall back to log4j2's built-in ERROR-to-console
+        default and write no log file at all.
+      -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-antrun-plugin</artifactId>
+        <version>3.1.0</version>
+        <executions>
+          <execution>
+            <id>conf-on-the-classpath</id>
+            <phase>prepare-package</phase>
+            <goals><goal>run</goal></goals>
+            <configuration>
+              <target>
+                <jar destfile="${project.build.directory}/lib/000-conf-classpath.jar">
+                  <manifest>
+                    <attribute name="Class-Path" value="../../conf/"/>
+                  </manifest>
+                </jar>
+              </target>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

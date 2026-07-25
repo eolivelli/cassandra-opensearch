@@ -42,10 +42,11 @@ class ShippedConfigurationTest {
 
         NodeConfiguration configuration = NodeConfiguration.load(home);
 
-        // The ports the README and the CLI wrappers tell users to connect to.
+        // The ports the README and the CLI wrappers tell users to connect to. Cassandra's native
+        // transport port is not among them: it is declared here for the operator's benefit but
+        // Cassandra reads it from conf/cassandra.yaml, so it never reaches the runtime.
         assertThat(configuration.service("cassandra").settings())
-                .containsEntry("native_transport_port", "9042")
-                .containsEntry("jmx_port", "7199");
+                .containsEntry("jmx.port", "7199");
         assertThat(configuration.service("opensearch").settings())
                 .containsEntry("http_port", "9200");
         assertThat(configuration.service("cassandra").enabled()).isTrue();

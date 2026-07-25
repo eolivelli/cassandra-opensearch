@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The layout in docs/ARCHITECTURE.md, "Distribution layout".
+
+  The three lib directories are the point of the whole assembly:
+
+    lib/boot        the JVM's -cp. Only what the supervisor itself needs; anything here is
+                    visible to both isolated loaders through the parent, which is exactly what
+                    the isolation exists to prevent.
+    lib/cassandra   the cassandra child loader's classpath, resolved by ../lib-cassandra.
+    lib/opensearch  the opensearch child loader's classpath, resolved by ../lib-opensearch.
+
+  The two child directories come in as fileSets rather than as unpacked dependencies because
+  their contents are two independently-resolved dependency trees; pulling them through this
+  POM's own graph would let Maven mediate Cassandra's Lucene 9.8 against OpenSearch's 10.4.
+  The aggregator builds those modules before this one.
+-->
+<assembly xmlns="http://maven.apache.org/ASSEMBLY/2.1.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/ASSEMBLY/2.1.0 http://maven.apache.org/xsd/assembly-2.1.0.xsd">
+  <id>bin</id>
+  <formats>
+    <format>tar.gz</format>
+  </formats>
+  <includeBaseDirectory>true</includeBaseDirectory>
+  <baseDirectory>${dist.finalName}</baseDirectory>
+
+  <fileSets>
+    <fileSet>
+      <directory>${dist.bin.directory}</directory>
+      <outputDirectory>bin</outputDirectory>
+      <fileMode>0755</fileMode>
+      <directoryMode>0755</directoryMode>
+      <lineEnding>unix</lineEnding>
+    </fileSet>
+
+    <fileSet>
+      <directory>${dist.conf.directory}</directory>
+      <outputDirectory>conf</outputDirectory>
+      <fileMode>0644</fileMode>
+      <directoryMode>0755</directoryMode>
+      <lineEnding>unix</lineEnding>
+    </fileSet>
+
+    <fileSet>
+      <directory>${lib.cassandra.directory}</directory>
+      <outputDirectory>lib/cassandra</outputDirectory>
+      <includes>
+        <include>*.jar</include>
+      </includes>
+      <fileMode>0644</fileMode>
+    </fileSet>
+
+    <fileSet>
+      <directory>${lib.opensearch.directory}</directory>
+      <outputDirectory>lib/opensearch</outputDirectory>
+      <includes>
+        <include>*.jar</include>
+      </includes>
+      <fileMode>0644</fileMode>
+    </fileSet>
+
+    <fileSet>
+      <directory>${project.build.directory}/boot-lib</directory>
+      <outputDirectory>lib/boot</outputDirectory>
+      <includes>
+        <include>*.jar</include>
+      </includes>
+      <fileMode>0644</fileMode>
+    </fileSet>
+
+    <!-- Shipped so that an unpacked distribution is immediately runnable and the layout is
+         self-describing. The launcher creates them too, for the case where the operator has
+         pointed the configuration somewhere else. -->
+    <fileSet>
+      <directory>${project.basedir}/src/main/dist</directory>
+      <outputDirectory>.</outputDirectory>
+      <directoryMode>0755</directoryMode>
+      <fileMode>0644</fileMode>
+    </fileSet>
+  </fileSets>
+</assembly>

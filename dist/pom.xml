@@ -9,8 +9,28 @@
     <version>1.0.0-SNAPSHOT</version>
   </parent>
   <artifactId>cassandra-opensearch-dist</artifactId>
-  <name>Cassandra + OpenSearch :: Distribution (tarball + docker)</name>
-  <dependencies>
-    <dependency><groupId>io.cassandraopensearch</groupId><artifactId>cassandra-opensearch-spi</artifactId></dependency>
-  </dependencies>
+  <packaging>pom</packaging>
+  <name>Cassandra + OpenSearch :: Distribution</name>
+
+  <description>
+    Assembles the tarball and the Docker image.
+
+    This is an aggregator rather than a single module for one reason: Maven mediates version
+    conflicts across the whole dependency graph of a project, and Cassandra's tree and
+    OpenSearch's tree conflict badly — Lucene 9.8 against 10.4, Netty 4.1 against 4.2, two
+    Jackson lines, two zstd-jni. Resolving both in one POM would hand both isolated ClassLoaders
+    the same mediated version and silently break at least one of them. Each lib directory is therefore resolved by its own module, in isolation, exactly as the runtime
+    module that compiles against it does.
+
+      lib-cassandra   -> the dse-db-all closure     -> lib/cassandra/
+      lib-opensearch  -> the OpenSearch closure     -> lib/opensearch/
+
+      tarball         -> lib/boot, conf, bin, data, logs, and the Docker image
+  </description>
+
+  <modules>
+    <module>lib-cassandra</module>
+    <module>lib-opensearch</module>
+    <module>tarball</module>
+  </modules>
 </project>

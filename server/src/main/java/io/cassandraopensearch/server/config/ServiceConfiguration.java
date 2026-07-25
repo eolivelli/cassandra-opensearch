@@ -7,13 +7,28 @@
  */
 package io.cassandraopensearch.server.config;
 
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-/** Supervisor-level configuration for one embedded service. */
+/**
+ * Supervisor-level configuration for one embedded service.
+ *
+ * <p>The distinction that matters here is between the <b>keys an operator writes</b> in {@code
+ * conf/cassandra-opensearch.yaml} and the <b>keys a runtime reads</b> from {@link #settings()}.
+ * They are not the same vocabulary and were never meant to be: the YAML is written for a human
+ * and groups everything about a service together, while {@code settings()} is a wire format
+ * consumed by an implementation inside an isolated ClassLoader, which looks up exactly the
+ * handful of names it needs and silently ignores anything else.
+ *
+ * <p>"Silently ignores" is why {@code ServiceSettingsTest} pins the emitted key set per service.
+ * A renamed or misspelled key here does not fail anything — it just means the runtime falls back
+ * to its own default, and the operator's setting quietly stops having an effect.
+ */
 public final class ServiceConfiguration {
 
     /**
@@ -62,28 +77,38 @@ public final class ServiceConfiguration {
     }
 
     static ServiceConfiguration fromYaml(String name, YamlReader yaml, NodeConfiguration.Builder node) {
-        Map<String, String> settings = new LinkedHashMap<>();
-        List<String> known;
-
-        if ("cassandra".equals(name)) {
-            settings.put("jmx_port", String.valueOf(yaml.port("jmx_port", 7199)));
-            settings.put("native_transport_port", String.valueOf(yaml.port("native_transport_port", 9042)));
-            settings.put("storage_port", String.valueOf(yaml.port("storage_port", 7000)));
-            settings.put("listen_address", yaml.string("listen_address", "127.0.0.1"));
-            known = List.of("enabled", "config", "jmx_port", "native_transport_port",
-                    "storage_port", "listen_address", "startup_timeout", "shutdown_timeout");
-        } else {
-            settings.put("http_port", String.valueOf(yaml.port("http_port", 9200)));
-            settings.put("transport_port", String.valueOf(yaml.port("transport_port", 9300)));
-            settings.put("network_host", yaml.string("network_host", "127.0.0.1"));
-            known = List.of("enabled", "config", "http_port", "transport_port",
-                    "network_host", "startup_timeout", "shutdown_timeout");
-        }
-
         boolean enabled = yaml.bool("enabled", true);
         String configFileName = yaml.string("config", DEFAULT_CONFIG_FILES.get(name));
         Duration startupTimeout = yaml.duration("startup_timeout", Duration.ofMinutes(5));
         Duration shutdownTimeout = yaml.duration("shutdown_timeout", Duration.ofMinutes(2));
+
+        Map<String, String> settings = new LinkedHashMap<>();
+        List<String> known;
+
+        if ("cassandra".equals(name)) {
+            // Three keys, because CassandraService looks up exactly three. Its ports, listen
+            // address and cluster name all come from conf/cassandra.yaml, which Cassandra parses
+            // itself — the supervisor does not get to re-specify them, and emitting them here
+            // would produce settings that look authoritative and change nothing.
+            settings.put("jmx.address", yaml.string("jmx_address", "127.0.0.1"));
+            settings.put("jmx.port", String.valueOf(yaml.port("jmx_port", 7199)));
+            settings.put("startup.timeout.seconds", String.valueOf(startupTimeout.toSeconds()));
+            known = List.of("enabled", "config", "jmx_address", "jmx_port", "native_transport_port",
+                    "storage_port", "listen_address", "startup_timeout", "shutdown_timeout");
+        } else {
+            // OpenSearch, by contrast, is configured entirely from here: the supervisor owns port
+            // allocation and node identity for the whole process, so these values are layered on
+            // top of opensearch.yml rather than the other way round.
+            settings.put("cluster_name", node.clusterName);
+            settings.put("node_name", yaml.string("node_name", defaultNodeName()));
+            settings.put("http_port", String.valueOf(yaml.port("http_port", 9200)));
+            settings.put("transport_port", String.valueOf(yaml.port("transport_port", 9300)));
+            settings.put("network_host", yaml.string("network_host", "127.0.0.1"));
+            settings.put("start_timeout_seconds", String.valueOf(startupTimeout.toSeconds()));
+            known = List.of("enabled", "config", "node_name", "http_port", "transport_port",
+                    "network_host", "startup_timeout", "shutdown_timeout");
+        }
+
         yaml.rejectUnknownKeys(known);
 
         return new ServiceConfiguration(
@@ -142,8 +167,34 @@ public final class ServiceConfiguration {
         return shutdownTimeout;
     }
 
-    /** Supervisor-level settings handed to the service through {@code ServiceContext}. */
+    /**
+     * Supervisor-level settings handed to the service through {@code ServiceContext}, keyed
+     * exactly as the corresponding runtime looks them up.
+     *
+     * <p>For {@code cassandra}: {@code jmx.address}, {@code jmx.port} and {@code
+     * startup.timeout.seconds}. For {@code opensearch}: {@code cluster_name}, {@code node_name},
+     * {@code http_port}, {@code transport_port}, {@code network_host} and {@code
+     * start_timeout_seconds}.
+     *
+     * <p>{@code node_name} is a placeholder at this point. The supervisor replaces it with the
+     * Cassandra node's host id once Cassandra is up — see {@code Supervisor} — because that is
+     * the identity a decommission's shard exclusion keys on, and it must be stable across
+     * restarts and unique among nodes that may share a hostname.
+     */
     public Map<String, String> settings() {
         return settings;
+    }
+
+    /**
+     * Node name to use when Cassandra has not (yet) supplied one — a disabled Cassandra service,
+     * or a configuration read outside a running process. Matches the fallback OpenSearch would
+     * pick for itself, so the value is never a surprise.
+     */
+    private static String defaultNodeName() {
+        try {
+            return InetAddress.getLocalHost().getHostName();
+        } catch (UnknownHostException e) {
+            return "opensearch-node";
+        }
     }
 }

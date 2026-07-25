@@ -1,0 +1,3 @@
+# Data directories for the embedded services are created here at startup:
+#   data/cassandra   commitlog, sstables and saved caches
+#   data/opensearch  the OpenSearch node's path.data

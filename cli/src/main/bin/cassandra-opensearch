@@ -1,0 +1,226 @@
+#!/bin/sh
+#
+# start | stop | status | decommission for one cassandra-opensearch node.
+#
+# `start` is the only command handled here rather than in the CLI jar, because starting means
+# choosing a JVM, assembling conf/jvm21-server.options and calling exec - none of which a
+# process can do for itself. The other three connect to the supervisor's JMX MBean; see
+# io.cassandraopensearch.cli.CassandraOpenSearchCli.
+
+set -e
+
+CO_INCLUDE=$(dirname "$0")/cassandra-opensearch.in.sh
+[ -r "$CO_INCLUDE" ] || { echo "cassandra-opensearch: missing $CO_INCLUDE" >&2; exit 1; }
+# shellcheck source=cassandra-opensearch.in.sh
+. "$CO_INCLUDE"
+
+MAIN_CLASS=io.cassandraopensearch.server.CassandraOpenSearchServer
+CLI_CLASS=io.cassandraopensearch.cli.CassandraOpenSearchCli
+BOOT_CLASSPATH="$CO_HOME/lib/boot/*"
+
+DEFAULT_HEAP=2g
+DEFAULT_DIRECT=2g
+PIDFILE="$CO_HOME/cassandra-opensearch.pid"
+DAEMON=no
+STARTUP_TIMEOUT="${CASSANDRA_OPENSEARCH_STARTUP_TIMEOUT:-300}"
+STOP_TIMEOUT="${CASSANDRA_OPENSEARCH_STOP_TIMEOUT:-300}"
+
+usage() {
+    cat >&2 <<EOF
+usage: $(basename "$0") <command> [options]
+
+  start [-d] [-p <pidfile>]   run the node; -d detaches and returns once it is up
+  stop [-p <pidfile>]         shut both services down in order and exit
+  status                      what the supervisor reports about the running process
+  decommission [--timeout <90s|30m>] [--force]
+                              relocate every OpenSearch shard off this node, then hand
+                              Cassandra's ranges back to the ring, then exit
+
+environment:
+  JAVA_HOME                       a JDK 21 installation (required)
+  MAX_HEAP_SIZE                   default $DEFAULT_HEAP
+  MAX_DIRECT_MEMORY_SIZE          default $DEFAULT_DIRECT; the two Netty copies draw on this
+                                  one budget independently, so size it for the sum
+  CASSANDRA_OPENSEARCH_JMX_HOST   default 127.0.0.1
+  CASSANDRA_OPENSEARCH_JMX_PORT   default 7299
+  CASSANDRA_OPENSEARCH_CONF       default <home>/conf
+  CASSANDRA_OPENSEARCH_LOGS       default <home>/logs
+  JVM_EXTRA_OPTS                  appended to the JVM command line
+EOF
+}
+
+[ $# -ge 1 ] || { usage; exit 2; }
+COMMAND="$1"
+shift
+
+# -d and -p are ours; everything else goes through to the CLI jar, which owns --timeout,
+# --force and the JMX options.
+CLI_ARGS=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -d|--daemon) DAEMON=yes ;;
+        -p|--pidfile) shift; [ $# -gt 0 ] || co_die "-p needs a file"; PIDFILE="$1" ;;
+        -h|--help) usage; exit 0 ;;
+        *) CLI_ARGS="$CLI_ARGS $1" ;;
+    esac
+    shift
+done
+
+# Properties that are JVM-global and therefore have to be decided once for both servers. None
+# of them contains a space, so the caller expands this unquoted and gets one argv entry each.
+#
+# Deliberately absent: io.netty.noUnsafe, io.netty.noKeySetOptimization and
+# io.netty.allocator.numDirectArenas. OpenSearch's own launcher sets all three, but Cassandra's
+# Netty reads them out of the same JVM and noUnsafe=true measurably slows its native transport.
+# The io.netty.* properties that ARE set live in conf/jvm21-server.options, so that the whole
+# reconciled set can be read in one place.
+shared_properties() {
+    cat <<'EOF'
+-Djava.awt.headless=true
+-Djava.locale.providers=SPI,CLDR
+-Djna.nosys=true
+-Dopensearch.set.netty.runtime.available.processors=false
+-Dlog4j.shutdownHookEnabled=false
+-Dlog4j2.disable.jmx=true
+-Dorg.slf4j.simpleLogger.showDateTime=true
+-Dorg.slf4j.simpleLogger.dateTimeFormat=yyyy-MM-dd'T'HH:mm:ss,SSS
+EOF
+}
+
+# Builds the full JVM command line into the positional parameters. Paths go in as separate
+# quoted entries so that an installation directory with a space in it still works.
+set_java_arguments() {
+    # shellcheck disable=SC2046  # word splitting is the point; see co_jvm_options
+    set -- $(co_jvm_options) $(shared_properties)
+
+    set -- "$@" \
+        "-Dcassandra-opensearch.home=$CO_HOME" \
+        "-Dcassandra-opensearch.config=$CO_CONF/cassandra-opensearch.yaml" \
+        "-Dcassandra-opensearch.logs=$CO_LOGS" \
+        "-Dorg.slf4j.simpleLogger.defaultLogLevel=${CASSANDRA_OPENSEARCH_LOG_LEVEL:-info}"
+
+    # The JDK's own management agent, on the platform MBean server, which is where the
+    # supervisor registers io.cassandraopensearch:type=Supervisor. Bound to CO_JMX_HOST -
+    # 127.0.0.1 by default - because it is unauthenticated: this is a local control channel, not
+    # a monitoring endpoint. Put a JMX password file behind it before moving it off loopback.
+    #
+    # java.rmi.server.hostname is pinned to the same address on purpose. RMI reads it once and
+    # caches it in TCPEndpoint.localEndpoints, and the embedded Cassandra node exports a second
+    # RMI server later in startup; two RMI servers in one JVM cannot advertise different names.
+    set -- "$@" \
+        -Dcom.sun.management.jmxremote \
+        "-Dcom.sun.management.jmxremote.port=$CO_JMX_PORT" \
+        "-Dcom.sun.management.jmxremote.rmi.port=$CO_JMX_PORT" \
+        "-Dcom.sun.management.jmxremote.host=$CO_JMX_HOST" \
+        -Dcom.sun.management.jmxremote.authenticate=false \
+        -Dcom.sun.management.jmxremote.ssl=false \
+        "-Djava.rmi.server.hostname=$CO_JMX_HOST"
+
+    set -- "$@" \
+        "-Xmx${MAX_HEAP_SIZE:-$DEFAULT_HEAP}" \
+        "-XX:MaxDirectMemorySize=${MAX_DIRECT_MEMORY_SIZE:-$DEFAULT_DIRECT}"
+
+    # shellcheck disable=SC2086
+    set -- "$@" $JVM_EXTRA_OPTS -cp "$BOOT_CLASSPATH" "$MAIN_CLASS"
+
+    JAVA_ARGUMENTS_COUNT=$#
+    # POSIX sh has no arrays; re-quote each entry so the caller can eval it back intact.
+    JAVA_ARGUMENTS=""
+    for _co_arg in "$@"; do
+        JAVA_ARGUMENTS="$JAVA_ARGUMENTS '$(printf '%s' "$_co_arg" | sed "s/'/'\\\\''/g")'"
+    done
+}
+
+# `status --quiet` exits 0 only once the supervisor MBean answers, which is what "up" means.
+supervisor_answers() {
+    "$JAVA" -cp "$BOOT_CLASSPATH" "$CLI_CLASS" status --quiet \
+        --jmx-host "$CO_JMX_HOST" --jmx-port "$CO_JMX_PORT" > /dev/null 2>&1
+}
+
+run_cli() {
+    co_require_java_21
+    _co_command="$1"
+    # CLI_ARGS unquoted on purpose: it is a list of arguments, not one argument.
+    # shellcheck disable=SC2086
+    exec "$JAVA" -cp "$BOOT_CLASSPATH" "$CLI_CLASS" "$_co_command" \
+        --jmx-host "$CO_JMX_HOST" --jmx-port "$CO_JMX_PORT" $CLI_ARGS
+}
+
+start() {
+    co_require_java_21
+    mkdir -p "$CO_LOGS"
+    # cd so that a relative path in the configuration resolves against the installation and not
+    # against wherever the operator happened to be standing.
+    cd "$CO_HOME"
+    set_java_arguments
+
+    if [ "$DAEMON" = no ]; then
+        eval "exec \"\$JAVA\" $JAVA_ARGUMENTS"
+    fi
+
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2> /dev/null; then
+        co_die "already running as pid $(cat "$PIDFILE") (from $PIDFILE)"
+    fi
+
+    _log="$CO_LOGS/cassandra-opensearch.log"
+    eval "nohup \"\$JAVA\" $JAVA_ARGUMENTS >> \"\$_log\" 2>&1 &"
+    _pid=$!
+    echo "$_pid" > "$PIDFILE"
+    echo "started pid $_pid, logging to $_log"
+
+    # Waiting for the MBean rather than just for the process to survive: a node that is still
+    # bootstrapping is not one an operator can hand to a client, and the point of -d is to be
+    # able to run the next command straight afterwards.
+    _waited=0
+    while [ "$_waited" -lt "$STARTUP_TIMEOUT" ]; do
+        if ! kill -0 "$_pid" 2> /dev/null; then
+            rm -f "$PIDFILE"
+            co_die "the process exited during startup; see $_log"
+        fi
+        if supervisor_answers; then
+            echo "up; supervisor JMX on $CO_JMX_HOST:$CO_JMX_PORT"
+            return 0
+        fi
+        sleep 2
+        _waited=$((_waited + 2))
+    done
+    co_die "no answer on $CO_JMX_HOST:$CO_JMX_PORT after ${STARTUP_TIMEOUT}s. The process is
+  still running as pid $_pid and may still be starting; see $_log."
+}
+
+stop() {
+    co_require_java_21
+    _pid=""
+    if [ -f "$PIDFILE" ]; then
+        _pid=$(cat "$PIDFILE")
+    fi
+
+    # shellcheck disable=SC2086
+    "$JAVA" -cp "$BOOT_CLASSPATH" "$CLI_CLASS" stop \
+        --jmx-host "$CO_JMX_HOST" --jmx-port "$CO_JMX_PORT" $CLI_ARGS
+
+    # The MBean call only asks. The shutdown itself drains Cassandra and closes the OpenSearch
+    # node, which takes as long as it takes; waiting here is what makes `stop && start` safe.
+    if [ -n "$_pid" ]; then
+        _waited=0
+        while kill -0 "$_pid" 2> /dev/null; do
+            if [ "$_waited" -ge "$STOP_TIMEOUT" ]; then
+                co_die "pid $_pid is still alive after ${_waited}s. Not killing it: a half-drained
+  Cassandra node replays its commit log on the next start. See the log."
+            fi
+            sleep 2
+            _waited=$((_waited + 2))
+        done
+        rm -f "$PIDFILE"
+        echo "stopped"
+    fi
+}
+
+case "$COMMAND" in
+    start) start ;;
+    stop) stop ;;
+    status) run_cli status ;;
+    decommission) run_cli decommission ;;
+    help|-h|--help) usage; exit 0 ;;
+    *) echo "cassandra-opensearch: unknown command '$COMMAND'" >&2; usage; exit 2 ;;
+esac

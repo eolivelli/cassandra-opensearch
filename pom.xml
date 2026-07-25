@@ -126,6 +126,15 @@
         <artifactId>slf4j-api</artifactId>
         <version>${slf4j.version}</version>
       </dependency>
+      <!-- Test-only binding for the supervisor's own tests. The supervisor ships with slf4j-api
+           alone in lib/boot: the two runtimes bring their own bindings inside their loaders, and
+           a binding on the parent classpath would be found by neither. -->
+      <dependency>
+        <groupId>org.slf4j</groupId>
+        <artifactId>slf4j-simple</artifactId>
+        <version>${slf4j.version}</version>
+        <scope>test</scope>
+      </dependency>
       <dependency>
         <groupId>org.yaml</groupId>
         <artifactId>snakeyaml</artifactId>

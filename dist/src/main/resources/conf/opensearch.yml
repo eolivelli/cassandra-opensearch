@@ -1,0 +1,33 @@
+# OpenSearch's own configuration, in its stock format, parsed by OpenSearch itself.
+#
+# The supervisor layers conf/cassandra-opensearch.yaml on top of this file, not the other way
+# round: cluster.name, node.name, network.host, http.port, transport.port and every path.* are
+# taken from there and overwrite whatever is set here. That is deliberate - port allocation and
+# node identity belong to the process, and an operator editing this file must not be able to
+# move OpenSearch onto the port the supervisor handed to Cassandra.
+#
+# So what belongs here is everything the supervisor has no opinion about.
+
+# REQUIRED. Without it the node runs the full discovery and cluster-manager election path,
+# never forms a cluster on its own, and start() fails on the cluster-health timeout with a node
+# that looks healthy but has no cluster manager. This distribution runs exactly one OpenSearch
+# node per process and pairs it with one Cassandra node, so single-node is the truth, not a
+# convenience.
+discovery.type: single-node
+
+# Defaults, kept visible because they are the ones an operator is most likely to want to change.
+# The supervisor overwrites both from conf/cassandra-opensearch.yaml.
+cluster.name: cassandra-opensearch
+network.host: 127.0.0.1
+
+# Left off on purpose. Memory locking goes through JNA, which is excluded from lib/opensearch so
+# that it can never resolve the same libjnidispatch file as Cassandra's copy; with JNA absent
+# this setting cannot be honoured and enabling it only produces a warning.
+bootstrap.memory_lock: false
+
+# Never set `bootstrap.serial_filter: true` here. Node.<init> turns it into a process-wide
+# ObjectInputFilter that rejects all Java deserialization, which would break Cassandra in this
+# same JVM. OpenSearchService drops the key if it finds it and logs a warning.
+
+# path.home, path.data and path.logs are not settable here - the supervisor always overwrites
+# them from `directories` in conf/cassandra-opensearch.yaml.

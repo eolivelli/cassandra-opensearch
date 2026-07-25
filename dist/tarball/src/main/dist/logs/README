@@ -1,0 +1,3 @@
+# system.log and debug.log (Cassandra, via conf/logback.xml)
+# <cluster>.log and <cluster>_server.json (OpenSearch, via conf/log4j2.properties)
+# cassandra-opensearch.log (the supervisor, when started with -d)

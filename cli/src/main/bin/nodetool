@@ -1,0 +1,55 @@
+#!/bin/sh
+#
+# nodetool against the embedded Cassandra node.
+#
+# The node's JMX connector is the one CassandraService starts (NodeJmxServer), serving a
+# federated MBean server: java.*, javax.*, jdk.* and com.sun.management come from the JVM
+# platform server, everything else from the node's private one. That is what makes stock
+# nodetool work at all - NodeProbe.connect() fetches the platform MemoryMXBean before it does
+# anything else, and a bare private server has none.
+#
+# It is NOT the supervisor's connector: `cassandra-opensearch status|stop|decommission` speak to
+# io.cassandraopensearch:type=Supervisor on a different port. A plain `nodetool decommission`
+# reaches straight into StorageService and does not order OpenSearch's shard relocation first;
+# use `cassandra-opensearch decommission` instead. See docs/ARCHITECTURE.md.
+
+set -e
+
+CO_INCLUDE=$(dirname "$0")/cassandra-opensearch.in.sh
+[ -r "$CO_INCLUDE" ] || { echo "nodetool: missing $CO_INCLUDE" >&2; exit 1; }
+# shellcheck source=cassandra-opensearch.in.sh
+. "$CO_INCLUDE"
+
+co_require_java_21
+
+# The one jmx_port: in conf/cassandra-opensearch.yaml is Cassandra's. Passed as the first -p so
+# that an explicit -p from the operator, which the fork's script reads last, still wins.
+JMX_PORT=$(sed -n 's/^[[:space:]]*jmx_port:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+    "$CO_CONF/cassandra-opensearch.yaml" 2> /dev/null | head -1)
+JMX_PORT="${JMX_PORT:-7199}"
+
+export CO_HOME
+CASSANDRA_INCLUDE="$CO_BIN/cassandra.in.sh"
+export CASSANDRA_INCLUDE
+
+# If a Cassandra installation is available, run its own nodetool - same version, same options,
+# no surprises - with our include in front of it, which is what defeats the fork's broken JDK
+# version check. Otherwise run NodeTool out of lib/cassandra directly, so that this tarball is
+# self-contained: it carries the whole Cassandra dependency tree already.
+if [ -n "$CASSANDRA_TOOLS_HOME" ] && [ -x "$CASSANDRA_TOOLS_HOME/bin/nodetool" ]; then
+    exec "$CASSANDRA_TOOLS_HOME/bin/nodetool" -p "$JMX_PORT" "$@"
+fi
+
+# shellcheck source=cassandra.in.sh
+. "$CASSANDRA_INCLUDE"
+
+# -Xmx128m and ParallelGCThreads=1 as the fork's nodetool uses: this is a short-lived client.
+# logback-tools.xml is found on CLASSPATH, which starts with conf/.
+# shellcheck disable=SC2086
+exec "$JAVA" -ea -cp "$CLASSPATH" $JVM_OPTS \
+    -Xmx128m \
+    -XX:ParallelGCThreads=1 \
+    "-Dcassandra.storagedir=$cassandra_storagedir" \
+    "-Dcassandra.logdir=$CO_LOGS" \
+    -Dlogback.configurationFile=logback-tools.xml \
+    org.apache.cassandra.tools.NodeTool -p "$JMX_PORT" "$@"

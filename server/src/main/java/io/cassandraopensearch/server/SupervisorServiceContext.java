@@ -17,6 +17,7 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.function.BiConsumer;
 
@@ -37,14 +38,33 @@ final class SupervisorServiceContext implements ServiceContext {
 
     private final Path homeDirectory;
     private final ServiceConfiguration configuration;
+    private final Map<String, String> settings;
     private final BiConsumer<String, Throwable> fatalErrorHandler;
 
     SupervisorServiceContext(
             Path homeDirectory,
             ServiceConfiguration configuration,
             BiConsumer<String, Throwable> fatalErrorHandler) {
+        this(homeDirectory, configuration, Map.of(), fatalErrorHandler);
+    }
+
+    /**
+     * @param derivedSettings settings the supervisor can only compute once the process is
+     *                        running, layered over the configured ones. Today this is
+     *                        OpenSearch's {@code node_name}, which is taken from the Cassandra
+     *                        node's host id and therefore does not exist until Cassandra has
+     *                        started.
+     */
+    SupervisorServiceContext(
+            Path homeDirectory,
+            ServiceConfiguration configuration,
+            Map<String, String> derivedSettings,
+            BiConsumer<String, Throwable> fatalErrorHandler) {
         this.homeDirectory = homeDirectory;
         this.configuration = configuration;
+        Map<String, String> merged = new LinkedHashMap<>(configuration.settings());
+        merged.putAll(derivedSettings);
+        this.settings = Map.copyOf(merged);
         this.fatalErrorHandler = fatalErrorHandler;
         createDirectories();
     }
@@ -92,7 +112,7 @@ final class SupervisorServiceContext implements ServiceContext {
 
     @Override
     public Map<String, String> settings() {
-        return configuration.settings();
+        return settings;
     }
 
     @Override

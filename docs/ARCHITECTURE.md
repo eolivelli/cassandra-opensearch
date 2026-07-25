@@ -64,7 +64,7 @@ explicitly rather than hopefully:
 | System properties | Both servers read and write them | Namespaces are disjoint in practice (`cassandra.*` vs `opensearch.*`); the audited exceptions are listed in `docs/GLOBAL-STATE.md` |
 | Shutdown hooks | Either server calling `System.exit`, or registering a hook, affects the whole process | Both runtimes are forbidden from calling `System.exit`; the supervisor owns the single shutdown hook |
 | Native libraries | JNA / Netty native transports load once per JVM per loader | Documented per service; verified by the spikes |
-| JMX platform MBean server | One per JVM; both servers register MBeans | Distinct domains (`org.apache.cassandra.*` vs the supervisor's `io.cassandraopensearch:*`); JMX RMI connector is owned by the supervisor |
+| JMX platform MBean server | One per JVM; both servers register MBeans | Cassandra registers into a **private** MBeanServer that federates reads with the platform one, so nothing of its own lands in the platform namespace. The supervisor's `io.cassandraopensearch:type=Supervisor` goes on the platform server, reached through the launcher's standard `com.sun.management.jmxremote.*` agent — **not** through a connector the supervisor starts itself. Cassandra's own port (7199) will not reach the supervisor MBean, because its federated server routes every non-JDK domain to the private server. |
 | Ports | Obvious collision | All ports are supervisor-assigned in `cassandra-opensearch.yaml` |
 | Logging | Cassandra uses **logback**, OpenSearch uses **log4j2** | Different frameworks in different loaders, so no `LogManager` fight; each writes its own file under `logs/` |
 
@@ -124,12 +124,25 @@ Cassandra has left, the process is on its way out.
 
 `--force` proceeds past step 3 with shards outstanding; `--timeout` bounds each waiting phase.
 
+The coordinator runs one more step than the four above: `decommission` is called on OpenSearch as
+well, before Cassandra's. That is where the shard count is re-checked, `--force` is enforced and
+recorded, and the node moves to `DECOMMISSIONED` rather than merely `STOPPED`. It runs first
+because Cassandra's is the irreversible one.
+
+### The unsupervised path is not yet handled
+
 A plain `nodetool decommission` bypasses the supervisor and talks straight to Cassandra's
-`StorageService` MBean. That path still works — it is Cassandra's own — but it does **not**
-order OpenSearch's relocation first. The Cassandra runtime therefore watches its own operation
-mode and reports `ring.state.changed` back to the supervisor, which reacts by excluding the
-OpenSearch node as a best-effort catch-up. The supervisor-driven path is the supported one and
-is what `bin/cassandra-opensearch decommission` invokes; this is called out in the README.
+`StorageService` MBean. That path still works — it is Cassandra's own — but it does **not** order
+OpenSearch's relocation first, so shards resident on this node can be lost when the process exits.
+
+The Cassandra runtime does report `ring.state.changed`, and `conf/cassandra-opensearch.yaml`
+carries a `watch_external_decommission` key, but **the supervisor does not yet act on that
+event** — today it only logs it. The setting is therefore inert. Making it work is not merely
+wiring: the supervisor-driven path emits the same event while already `DECOMMISSIONING`, so the
+handler has to distinguish the two, and even then it is a race the catch-up may lose.
+
+Until it is implemented, `bin/cassandra-opensearch decommission` is the only ordering-safe way to
+retire a node. This is tracked in `docs/KNOWN-GAPS.md`.
 
 ## Distribution layout
 
