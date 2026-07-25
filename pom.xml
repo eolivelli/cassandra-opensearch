@@ -24,6 +24,7 @@
     <module>cli</module>
     <module>dist</module>
     <module>integration-tests</module>
+    <module>examples</module>
   </modules>
 
   <properties>
