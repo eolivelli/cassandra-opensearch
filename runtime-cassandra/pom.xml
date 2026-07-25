@@ -10,7 +10,169 @@
   </parent>
   <artifactId>cassandra-opensearch-runtime-cassandra</artifactId>
   <name>Cassandra + OpenSearch :: Cassandra Runtime</name>
+
+  <properties>
+    <!-- CQL client, used by the tests only: it must run OUTSIDE the isolated loader so the round
+         trip goes over a real socket and exercises two independent Netty copies. -->
+    <cassandra.driver.version>4.18.1</cassandra.driver.version>
+
+    <!-- The version Cassandra's own tree resolves. Pinned here as well as in the parent so that
+         managing the supervisor's slf4j down to a 1.7.x line can never silently reach this
+         module: logback 1.5.x binds through slf4j 2's ServiceLoader and has no 1.7-era
+         StaticLoggerBinder, so the node would fall back to the NOP logger and write no log at
+         all — a failure that looks like "logging is misconfigured", not "wrong slf4j".
+         Anything assembling lib/cassandra/ has to take the same care. -->
+    <cassandra.slf4j.version>2.0.17</cassandra.slf4j.version>
+
+    <!-- Ports for the tests. The defaults (9042, 7199) are deliberately avoided: they collide with
+         whatever the developer already has running, and a container bound to 0.0.0.0 blocks every
+         loopback alias too. -->
+    <test.cassandra.storagePort>17000</test.cassandra.storagePort>
+    <test.cassandra.nativePort>19042</test.cassandra.nativePort>
+    <test.cassandra.jmxPort>17199</test.cassandra.jmxPort>
+  </properties>
+
   <dependencies>
-    <dependency><groupId>io.cassandraopensearch</groupId><artifactId>cassandra-opensearch-spi</artifactId></dependency>
+    <dependency>
+      <groupId>io.cassandraopensearch</groupId>
+      <artifactId>cassandra-opensearch-spi</artifactId>
+    </dependency>
+
+    <!-- Cassandra is `provided`: this jar ships in lib/cassandra/ alongside the server jars, which
+         the child ClassLoader already owns. Anything else would put a second copy of Cassandra on
+         the classpath of whoever depends on this module. -->
+    <dependency>
+      <groupId>${cassandra.groupId}</groupId>
+      <artifactId>${cassandra.artifactId}</artifactId>
+      <version>${cassandra.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+      <version>${cassandra.slf4j.version}</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <!-- Test-only. The tests drive this service through the real bootstrap loader rather than a
+         private copy of it, so what they prove is what the supervisor will actually do. -->
+    <dependency>
+      <groupId>io.cassandraopensearch</groupId>
+      <artifactId>cassandra-opensearch-bootstrap</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.cassandra</groupId>
+      <artifactId>java-driver-core</artifactId>
+      <version>${cassandra.driver.version}</version>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
+
+  <build>
+    <plugins>
+      <!-- Cassandra's JmxRegistry extends sun.rmi.registry.RegistryImpl, so compiling against it
+           needs the same package export the node needs at runtime. javac refuses to export a
+           system package under `release`, hence source/target here instead. Same JDK, same
+           bytecode. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <configuration>
+          <release combine.self="override"/>
+          <source>${jdk.version}</source>
+          <target>${jdk.version}</target>
+          <compilerArgs>
+            <arg>--add-exports</arg>
+            <arg>java.rmi/sun.rmi.registry=ALL-UNNAMED</arg>
+          </compilerArgs>
+        </configuration>
+      </plugin>
+
+      <!-- The isolated ClassLoader needs the whole Cassandra dependency tree as a list of jars. In
+           the distribution that list is the contents of lib/cassandra/; here it is whatever Maven
+           resolved for the `provided` dependency above, written out for the tests to read. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-dependency-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>cassandra-classpath</id>
+            <phase>generate-test-resources</phase>
+            <goals><goal>build-classpath</goal></goals>
+            <configuration>
+              <includeScope>provided</includeScope>
+              <outputFile>${project.build.directory}/cassandra-classpath.txt</outputFile>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <configuration>
+          <!-- Keep the server jar off the test classpath, so `org.apache.cassandra.*` really is
+               unreachable from the application ClassLoader and the tests cannot pass by accidentally
+               talking to a second, non-isolated copy. Its third-party dependencies are left alone:
+               excluding those would take the CQL driver's Netty with them, and sharing a library
+               with the child loader is exactly what the child loader is designed to tolerate.
+               (`classpathDependencyScopeExclude` cannot express this: Maven's ScopeArtifactFilter
+               has no `provided` threshold, so that setting silently does nothing.) -->
+          <classpathDependencyExcludes>
+            <classpathDependencyExclude>${cassandra.groupId}:${cassandra.artifactId}</classpathDependencyExclude>
+          </classpathDependencyExcludes>
+          <systemPropertyVariables>
+            <cassandra.classpath.file>${project.build.directory}/cassandra-classpath.txt</cassandra.classpath.file>
+            <test.cassandra.storagePort>${test.cassandra.storagePort}</test.cassandra.storagePort>
+            <test.cassandra.nativePort>${test.cassandra.nativePort}</test.cassandra.nativePort>
+            <test.cassandra.jmxPort>${test.cassandra.jmxPort}</test.cassandra.jmxPort>
+          </systemPropertyVariables>
+          <!-- The JPMS set from docs/spikes/cassandra-embedding.md. Each entry is here because the
+               node fails without it; conf/jvm21-server.options in the distribution must carry the
+               same list. Opening java.base/java.lang is additionally needed by the test that reads
+               the JVM's registered shutdown hooks. -->
+          <argLine>
+            -Xms512m -Xmx2g -XX:MaxDirectMemorySize=1g
+            -Djava.security.manager=allow
+            -Djdk.attach.allowAttachSelf=true
+            --add-exports java.base/jdk.internal.misc=ALL-UNNAMED
+            --add-exports java.base/jdk.internal.ref=ALL-UNNAMED
+            --add-exports java.base/java.lang.ref=ALL-UNNAMED
+            --add-exports java.base/sun.nio.ch=ALL-UNNAMED
+            --add-exports java.management.rmi/com.sun.jmx.remote.internal.rmi=ALL-UNNAMED
+            --add-exports java.management/com.sun.jmx.remote.security=ALL-UNNAMED
+            --add-exports java.rmi/sun.rmi.registry=ALL-UNNAMED
+            --add-exports java.rmi/sun.rmi.server=ALL-UNNAMED
+            --add-exports java.sql/java.sql=ALL-UNNAMED
+            --add-exports jdk.unsupported/sun.misc=ALL-UNNAMED
+            --add-exports jdk.compiler/com.sun.tools.javac.file=ALL-UNNAMED
+            --add-opens java.base/java.io=ALL-UNNAMED
+            --add-opens java.base/java.lang=ALL-UNNAMED
+            --add-opens java.base/java.lang.module=ALL-UNNAMED
+            --add-opens java.base/java.lang.reflect=ALL-UNNAMED
+            --add-opens java.base/java.net=ALL-UNNAMED
+            --add-opens java.base/java.nio=ALL-UNNAMED
+            --add-opens java.base/java.nio.charset=ALL-UNNAMED
+            --add-opens java.base/java.nio.file.attribute=ALL-UNNAMED
+            --add-opens java.base/java.nio.file.spi=ALL-UNNAMED
+            --add-opens java.base/java.util=ALL-UNNAMED
+            --add-opens java.base/java.util.concurrent=ALL-UNNAMED
+            --add-opens java.base/java.util.concurrent.atomic=ALL-UNNAMED
+            --add-opens java.base/java.util.concurrent.locks=ALL-UNNAMED
+            --add-opens java.base/jdk.internal.loader=ALL-UNNAMED
+            --add-opens java.base/jdk.internal.math=ALL-UNNAMED
+            --add-opens java.base/jdk.internal.module=ALL-UNNAMED
+            --add-opens java.base/jdk.internal.ref=ALL-UNNAMED
+            --add-opens java.base/jdk.internal.reflect=ALL-UNNAMED
+            --add-opens java.base/sun.nio.ch=ALL-UNNAMED
+            --add-opens jdk.compiler/com.sun.tools.javac=ALL-UNNAMED
+            --add-opens jdk.management/com.sun.management.internal=ALL-UNNAMED
+            --add-modules jdk.incubator.vector
+            --enable-native-access=ALL-UNNAMED
+          </argLine>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
 </project>

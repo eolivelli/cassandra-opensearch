@@ -1,0 +1,33 @@
+# Minimal cassandra.yaml for the runtime-cassandra tests.
+#
+# Deliberately small: everything not named here comes from Cassandra's own defaults, so this file
+# shows exactly what a test node needs and nothing else. The @PLACEHOLDER@ tokens are substituted
+# by TestNode. Directories are omitted on purpose — Cassandra derives them from the
+# `cassandra.storagedir` system property, which the service sets from ServiceContext.dataDirectory().
+cluster_name: '@CLUSTER_NAME@'
+num_tokens: 4
+partitioner: org.apache.cassandra.dht.Murmur3Partitioner
+endpoint_snitch: SimpleSnitch
+
+seed_provider:
+  - class_name: org.apache.cassandra.locator.SimpleSeedProvider
+    parameters:
+      - seeds: "@ADDRESS@:@STORAGE_PORT@"
+
+listen_address: @ADDRESS@
+rpc_address: @ADDRESS@
+storage_port: @STORAGE_PORT@
+ssl_storage_port: @SSL_STORAGE_PORT@
+native_transport_port: @NATIVE_PORT@
+start_native_transport: true
+
+commitlog_sync: periodic
+commitlog_sync_period: 10000ms
+
+# `die` would call JVMStabilityInspector.Killer, which in this process is intercepted rather than
+# obeyed. `stop` is the shipped default and keeps the failure local to Cassandra.
+disk_failure_policy: stop
+commit_failure_policy: stop
+
+auto_snapshot: false
+hinted_handoff_enabled: false

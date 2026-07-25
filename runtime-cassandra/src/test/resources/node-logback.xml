@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Logback configuration for the embedded node. Copied into the test node's conf/ directory, which
+  is placed on the isolated ClassLoader's classpath so that logback finds it there and nowhere
+  else. Setting -Dlogback.configurationFile would work too, but it is a JVM global and would reach
+  any other logback in the process.
+-->
+<configuration>
+  <appender name="FILE" class="ch.qos.logback.core.FileAppender">
+    <file>${cassandra.logdir}/system.log</file>
+    <encoder>
+      <pattern>%date{ISO8601} %-5level [%thread] %logger{36} - %msg%n</pattern>
+    </encoder>
+  </appender>
+  <root level="INFO">
+    <appender-ref ref="FILE"/>
+  </root>
+</configuration>
