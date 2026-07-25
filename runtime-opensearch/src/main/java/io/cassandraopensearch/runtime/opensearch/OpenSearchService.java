@@ -384,13 +384,64 @@ public final class OpenSearchService implements EmbeddedService {
      * back onto a node someone is in the middle of retiring.
      */
     private String exclusionListIncludingThisNode(ClusterState state) {
+        Set<String> names = currentExclusions(state);
+        names.add(nodeName);
+        return String.join(",", names);
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Re-admits this node to shard allocation. Only this node's name is taken out of the
+     * exclusion list, for the same reason {@link #exclusionListIncludingThisNode} adds to it
+     * rather than overwriting: someone else may be retiring another node, and re-admitting
+     * <i>that</i> one would start moving shards back onto a node that is on its way out.
+     *
+     * <p>Clearing the setting outright when nothing else is excluded, rather than writing an
+     * empty value, is what makes {@code _cluster/settings} come back to the shape it had before
+     * the decommission was attempted — an operator reading it must not find the trace of an
+     * exclusion that is no longer in force.
+     */
+    @Override
+    public void abortDecommission(DecommissionContext decommission) throws Exception {
+        ClusterService service = clusterService;
+        if (service == null) {
+            // Nothing was applied: prepareDecommission requires a running node and this is called
+            // for every service the supervisor touched, including ones it never got to.
+            return;
+        }
+        Set<String> remaining = currentExclusions(service.state());
+        if (remaining.remove(nodeName)) {
+            Settings.Builder update = Settings.builder();
+            if (remaining.isEmpty()) {
+                update.putNull(ALLOCATION_EXCLUDE_NAME);
+            } else {
+                update.put(ALLOCATION_EXCLUDE_NAME, String.join(",", remaining));
+            }
+            try {
+                client.admin().cluster().prepareUpdateSettings()
+                        .setTransientSettings(update)
+                        .execute()
+                        .actionGet(TimeValue.timeValueMillis(decommission.timeout().toMillis()));
+            } catch (Throwable failure) {
+                throw new ServiceException(NAME,
+                        "failed to re-admit " + nodeName + " to shard allocation; the node stays"
+                                + " excluded and will not be given a shard until the exclusion is"
+                                + " removed by hand", failure);
+            }
+        }
+        status.compareAndSet(ServiceStatus.DECOMMISSIONING, ServiceStatus.RUNNING);
+        decommission.reportProgress(-1, "re-admitted " + nodeName + " to shard allocation");
+    }
+
+    /** The names in {@code cluster.routing.allocation.exclude._name}, in the order they appear. */
+    private static Set<String> currentExclusions(ClusterState state) {
         Set<String> names = new LinkedHashSet<>();
         String existing = state.metadata().settings().get(ALLOCATION_EXCLUDE_NAME);
         if (existing != null && !existing.isBlank()) {
             Arrays.stream(existing.split(",")).map(String::trim).filter(s -> !s.isEmpty()).forEach(names::add);
         }
-        names.add(nodeName);
-        return String.join(",", names);
+        return names;
     }
 
     @Override

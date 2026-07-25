@@ -166,14 +166,16 @@ final class DistributionNode implements AutoCloseable {
     }
 
     /**
-     * {@code bin/nodetool}, pointed at this node.
+     * {@code bin/nodetool}, pointed at this node by nothing but its configuration.
      *
-     * <p>{@code -h} is passed explicitly because the wrapper reads only {@code jmx_port} out of
-     * {@code conf/cassandra-opensearch.yaml} and leaves the host at nodetool's own default of
-     * 127.0.0.1, which is wrong for any node that does not listen there.
+     * <p>Neither {@code -h} nor {@code -p} is passed, deliberately: the wrapper reads
+     * {@code jmx_address} and {@code jmx_port} out of {@code conf/cassandra-opensearch.yaml},
+     * and that derivation is the thing worth testing — an operator on a node whose JMX is not on
+     * 127.0.0.1 has nothing else to go on. Supplying the host here would exercise the operator's
+     * override and leave the default path, which is the one everybody actually uses, untested.
      */
     Commands.Result nodetool(String... arguments) {
-        List<String> command = new ArrayList<>(List.of("bin/nodetool", "-h", endpoints.host()));
+        List<String> command = new ArrayList<>(List.of("bin/nodetool"));
         command.addAll(List.of(arguments));
         return run(CLI_TIMEOUT, command.toArray(new String[0]));
     }

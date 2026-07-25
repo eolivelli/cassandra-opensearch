@@ -145,6 +145,11 @@ public final class IsolatedService implements EmbeddedService, AutoCloseable {
     }
 
     @Override
+    public void abortDecommission(DecommissionContext context) throws Exception {
+        runWithContextLoader(loader, () -> delegate.abortDecommission(context));
+    }
+
+    @Override
     public void decommission(DecommissionContext context) throws Exception {
         runWithContextLoader(loader, () -> delegate.decommission(context));
     }

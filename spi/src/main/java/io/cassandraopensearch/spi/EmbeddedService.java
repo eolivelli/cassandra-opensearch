@@ -76,6 +76,26 @@ public interface EmbeddedService {
     boolean awaitDecommissionReady(DecommissionContext context) throws Exception;
 
     /**
+     * Undoes {@link #prepareDecommission}: the compensating action for a decommission that
+     * failed, was refused or was cancelled before the point of no return.
+     *
+     * <p>Without it a refusal is not free. OpenSearch's preparation excludes this node from
+     * shard allocation cluster-wide, and a preparation that is never undone leaves a node that
+     * still serves what it holds but will never be given a shard again — on a single-node
+     * cluster, every index created afterwards stays UNASSIGNED forever. The supervisor refuses a
+     * single-node decommission in {@link #prepareDecommission} on Cassandra, which runs
+     * <i>after</i> OpenSearch's, so this is the only thing standing between one mistyped command
+     * and a cluster that looks unrecoverable.
+     *
+     * <p>Must be safe to call when {@link #prepareDecommission} never ran, ran and failed
+     * halfway, or has already been undone: the supervisor calls it for every service it touched,
+     * and it cannot know how far each one got. Restore the status the service reported before
+     * the preparation, and change nothing that {@link #decommission} owns — this runs only while
+     * leaving is still free.
+     */
+    void abortDecommission(DecommissionContext context) throws Exception;
+
+    /**
      * Phase 2: leave the cluster for good. After this returns normally the service must report
      * {@link ServiceStatus#DECOMMISSIONED} and own no data.
      */

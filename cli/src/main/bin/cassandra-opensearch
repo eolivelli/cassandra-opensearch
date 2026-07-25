@@ -231,11 +231,46 @@ stop() {
     fi
 }
 
+# A successful decommission ends with the supervisor retiring the process itself - step 7 of the
+# procedure is `exit 0`, with no stop command - so this cannot exec the CLI the way `status` does:
+# somebody has to outlive it and clear the pid file, exactly as `stop` does. A pid file left
+# behind is harmless only until the kernel recycles that pid, at which point the next `start -d`
+# finds a live process there and refuses to start.
+decommission() {
+    co_require_java_21
+    _pid=""
+    if [ -f "$PIDFILE" ]; then
+        _pid=$(cat "$PIDFILE")
+    fi
+
+    _rc=0
+    # CLI_ARGS unquoted on purpose: it is a list of arguments, not one argument.
+    # shellcheck disable=SC2086
+    "$JAVA" -cp "$BOOT_CLASSPATH" "$CLI_CLASS" decommission \
+        --jmx-host "$CO_JMX_HOST" --jmx-port "$CO_JMX_PORT" $CLI_ARGS || _rc=$?
+    # A refused or failed decommission leaves the node up and serving - that is the whole point of
+    # ordering the phases the way the supervisor does - so the pid file must stay.
+    [ "$_rc" -eq 0 ] || exit "$_rc"
+
+    [ -n "$_pid" ] || return 0
+    _waited=0
+    while kill -0 "$_pid" 2> /dev/null; do
+        if [ "$_waited" -ge "$STOP_TIMEOUT" ]; then
+            co_die "the node left both clusters, but pid $_pid is still alive after ${_waited}s.
+  Not killing it: the ordered shutdown is still running. See $CO_LOGS/cassandra-opensearch.log."
+        fi
+        sleep 2
+        _waited=$((_waited + 2))
+    done
+    rm -f "$PIDFILE"
+    echo "decommissioned; the process has exited"
+}
+
 case "$COMMAND" in
     start) start ;;
     stop) stop ;;
     status) run_cli status ;;
-    decommission) run_cli decommission ;;
+    decommission) decommission ;;
     help|-h|--help) usage; exit 0 ;;
     *) echo "cassandra-opensearch: unknown command '$COMMAND'" >&2; usage; exit 2 ;;
 esac

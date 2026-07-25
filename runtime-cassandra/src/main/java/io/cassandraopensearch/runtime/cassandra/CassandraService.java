@@ -270,6 +270,20 @@ public final class CassandraService implements EmbeddedService {
         return true;
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Nothing to undo, and that is a property of {@link #prepareDecommission} rather than an
+     * omission: it only asks whether this node may leave and reports progress. The ring, the
+     * gossip state and the operation mode are all untouched until {@link #decommission} calls
+     * {@code StorageService.decommission()}, which is past the point of no return and never
+     * compensated. The method exists so the supervisor can compensate uniformly, without having
+     * to know which of its services actually mutated anything.
+     */
+    @Override
+    public void abortDecommission(DecommissionContext request) {
+    }
+
     @Override
     public void decommission(DecommissionContext request) throws Exception {
         requireRunning("decommission");

@@ -32,9 +32,10 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * the operating system's own view of which process owns which socket.
  *
  * <p>One node for the class. A cold start is tens of seconds and none of these tests damages the
- * node for the next one — with one exception, which is why the class is ordered: the refused
- * decommission in {@link #aSingleNodeDecommissionIsRefusedAndTheNodeKeepsServing()} leaves the
- * OpenSearch node excluded from shard allocation, so it runs last.
+ * node for the next one. The class is ordered anyway, so that
+ * {@link #aSingleNodeDecommissionIsRefusedAndTheNodeKeepsServing()} runs last: it is the only
+ * test here that asks the node to retire, and what it asserts — that a refusal leaves nothing
+ * behind — is a claim about the node the tests before it were using.
  */
 @ExtendWith(DumpLogsOnFailure.class)
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
@@ -222,16 +223,15 @@ class SingleNodeServicesIT {
      *
      * <p>Cassandra refuses before it looks at {@code --force} — there is nowhere for the data to
      * go — so the supervisor refuses first, with an explanation. What matters as much as the
-     * refusal is what it leaves behind: everything before step 3 of the procedure is meant to be
-     * reversible and the node is meant to keep serving.
+     * refusal is what it leaves behind: everything before step 3 of the procedure is reversible
+     * and the node is meant to keep serving.
      *
-     * <p><b>It does not fully reverse, and that is a defect this test pins.</b> The coordinator
-     * excludes the OpenSearch node from shard allocation (step 1) before Cassandra gets to refuse
-     * (step 2), and nothing undoes the exclusion when the procedure aborts. The node keeps serving
-     * what it already has, but the cluster will not allocate a new shard to it — on a single-node
-     * cluster that means every index created afterwards is stuck UNASSIGNED. The assertions below
-     * record the behaviour as it is; when the coordinator learns to roll the exclusion back, the
-     * last two will fail and should be deleted.
+     * <p>Reversible only counts if something reverses it. The coordinator excludes the OpenSearch
+     * node from shard allocation (step 1) before Cassandra gets to refuse (step 2), and an
+     * exclusion left in place would outlive the refusal: the node would keep serving what it
+     * already has while the cluster never allocated it another shard, so on a single-node cluster
+     * every index created afterwards would sit UNASSIGNED forever. The last two assertions are
+     * the ones with teeth — the exclusion is gone, and a brand new index goes GREEN.
      */
     @Test
     @Order(6)
@@ -250,17 +250,23 @@ class SingleNodeServicesIT {
         assertThat(session.execute("SELECT v FROM " + KEYSPACE + ".probe WHERE k = 'k'").one()).isNotNull();
         assertThat(node.rest().post('/' + INDEX + "/_search", """
                 {"query":{"match_all":{}}}""").body()).contains("indexed over real HTTP");
+        assertThat(node.pidFile())
+                .as("the node is still running, so the pid file it was started with must stay")
+                .exists();
 
         Rest.Response settings = node.rest().get("/_cluster/settings?flat_settings=true");
         assertThat(settings.body())
-                .as("the shard-allocation exclusion from the aborted decommission is left in place")
-                .contains("cluster.routing.allocation.exclude._name");
+                .as("the refusal must undo the shard-allocation exclusion it set on the way in;"
+                        + " left behind, it survives the failed decommission and quietly stops"
+                        + " this node from ever being given a shard again:%n%s", settings.body())
+                .doesNotContain("cluster.routing.allocation.exclude._name");
 
-        assertThat(node.rest().put("/it-after-refused-decommission?wait_for_active_shards=0", """
+        // The assertion that an operator would care about: the cluster still allocates here.
+        assertThat(node.rest().put("/it-after-refused-decommission", """
                 {"settings":{"number_of_shards":1,"number_of_replicas":0}}""").status()).isEqualTo(200);
-        Await.until("the new index has an unassignable shard", Duration.ofSeconds(30),
+        Await.until("the new index turns green", Duration.ofSeconds(60),
                 () -> node.rest().cat("/_cat/shards/it-after-refused-decommission?h=state"),
                 () -> node.rest().cat("/_cat/shards/it-after-refused-decommission?h=state")
-                        .contains("UNASSIGNED"));
+                        .contains("STARTED"));
     }
 }

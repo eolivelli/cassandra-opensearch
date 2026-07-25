@@ -95,6 +95,13 @@ final class ProbeServiceCompiler {
                 public boolean awaitDecommissionReady(DecommissionContext context) { return true; }
 
                 @Override
+                public void abortDecommission(DecommissionContext context) {
+                    if (status == ServiceStatus.DECOMMISSIONING) {
+                        status = ServiceStatus.RUNNING;
+                    }
+                }
+
+                @Override
                 public void decommission(DecommissionContext context) {
                     status = ServiceStatus.DECOMMISSIONED;
                 }

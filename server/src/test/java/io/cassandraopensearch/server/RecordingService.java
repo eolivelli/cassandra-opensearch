@@ -41,6 +41,12 @@ final class RecordingService implements EmbeddedService, AutoCloseable {
 
     /** When set, {@code start()} throws it instead of coming up. */
     volatile Exception startFailure;
+    /** When set, {@code prepareDecommission()} throws it — what a refused decommission looks like. */
+    volatile Exception prepareFailure;
+    /** When set, {@code decommission()} throws it, past the point where backing out is possible. */
+    volatile Exception decommissionFailure;
+    /** When set, {@code abortDecommission()} throws it: compensation itself can fail. */
+    volatile Exception abortFailure;
     /** Reported as {@code hostId} in {@link #details()}; the supervisor names OpenSearch after it. */
     volatile String hostId;
     /** What {@code awaitDecommissionReady} concludes, standing in for "no shards left here". */
@@ -49,6 +55,8 @@ final class RecordingService implements EmbeddedService, AutoCloseable {
     volatile boolean waitsForItsDeadline;
     /** The deadline the coordinator handed each phase, latest last. */
     final Map<String, Duration> phaseTimeouts = new LinkedHashMap<>();
+    /** What {@code abortDecommission} saw on its context, for the cancelled-decommission case. */
+    volatile boolean cancelledDuringAbort;
 
     RecordingService(String name, List<String> calls) {
         this.name = name;
@@ -93,10 +101,26 @@ final class RecordingService implements EmbeddedService, AutoCloseable {
     }
 
     @Override
-    public void prepareDecommission(DecommissionContext decommission) {
+    public void prepareDecommission(DecommissionContext decommission) throws Exception {
         record("prepareDecommission");
         phaseTimeouts.put("prepareDecommission", decommission.timeout());
         status = ServiceStatus.DECOMMISSIONING;
+        if (prepareFailure != null) {
+            throw prepareFailure;
+        }
+    }
+
+    @Override
+    public void abortDecommission(DecommissionContext decommission) throws Exception {
+        record("abortDecommission");
+        phaseTimeouts.put("abortDecommission", decommission.timeout());
+        cancelledDuringAbort = decommission.isCancelled();
+        if (abortFailure != null) {
+            throw abortFailure;
+        }
+        if (status == ServiceStatus.DECOMMISSIONING) {
+            status = ServiceStatus.RUNNING;
+        }
     }
 
     @Override
@@ -115,6 +139,9 @@ final class RecordingService implements EmbeddedService, AutoCloseable {
     public void decommission(DecommissionContext decommission) throws Exception {
         record("decommission");
         phaseTimeouts.put("decommission", decommission.timeout());
+        if (decommissionFailure != null) {
+            throw decommissionFailure;
+        }
         if (!handsOffCleanly && !decommission.force()) {
             throw new ServiceException(name, "data is still on this node");
         }

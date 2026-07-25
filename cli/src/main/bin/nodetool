@@ -22,8 +22,17 @@ CO_INCLUDE=$(dirname "$0")/cassandra-opensearch.in.sh
 
 co_require_java_21
 
-# The one jmx_port: in conf/cassandra-opensearch.yaml is Cassandra's. Passed as the first -p so
-# that an explicit -p from the operator, which the fork's script reads last, still wins.
+# The one jmx_address: and jmx_port: in conf/cassandra-opensearch.yaml are Cassandra's, and are
+# where CassandraService binds this node's connector. Both are read: a node whose JMX is not on
+# 127.0.0.1 - two nodes on one machine, or any deployment that moved it off loopback - is
+# otherwise unreachable until the operator supplies -h by hand, on a wrapper that exists
+# precisely so they do not have to.
+#
+# Passed as the first -h and -p so that explicit ones from the operator, which the fork's script
+# reads last, still win. tr strips the quotes a YAML scalar is allowed to carry.
+JMX_HOST=$(sed -n 's/^[[:space:]]*jmx_address:[[:space:]]*\([^[:space:]#]*\).*/\1/p' \
+    "$CO_CONF/cassandra-opensearch.yaml" 2> /dev/null | head -1 | tr -d "\"'")
+JMX_HOST="${JMX_HOST:-127.0.0.1}"
 JMX_PORT=$(sed -n 's/^[[:space:]]*jmx_port:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
     "$CO_CONF/cassandra-opensearch.yaml" 2> /dev/null | head -1)
 JMX_PORT="${JMX_PORT:-7199}"
@@ -37,7 +46,7 @@ export CASSANDRA_INCLUDE
 # version check. Otherwise run NodeTool out of lib/cassandra directly, so that this tarball is
 # self-contained: it carries the whole Cassandra dependency tree already.
 if [ -n "$CASSANDRA_TOOLS_HOME" ] && [ -x "$CASSANDRA_TOOLS_HOME/bin/nodetool" ]; then
-    exec "$CASSANDRA_TOOLS_HOME/bin/nodetool" -p "$JMX_PORT" "$@"
+    exec "$CASSANDRA_TOOLS_HOME/bin/nodetool" -h "$JMX_HOST" -p "$JMX_PORT" "$@"
 fi
 
 # shellcheck source=cassandra.in.sh
@@ -52,4 +61,4 @@ exec "$JAVA" -ea -cp "$CLASSPATH" $JVM_OPTS \
     "-Dcassandra.storagedir=$cassandra_storagedir" \
     "-Dcassandra.logdir=$CO_LOGS" \
     -Dlogback.configurationFile=logback-tools.xml \
-    org.apache.cassandra.tools.NodeTool -p "$JMX_PORT" "$@"
+    org.apache.cassandra.tools.NodeTool -h "$JMX_HOST" -p "$JMX_PORT" "$@"

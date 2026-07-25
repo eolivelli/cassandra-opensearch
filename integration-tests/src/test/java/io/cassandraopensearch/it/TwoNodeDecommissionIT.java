@@ -116,6 +116,15 @@ class TwoNodeDecommissionIT {
                 () -> first.rest().cat("/_cat/nodes?h=name,ip"),
                 () -> first.rest().cat("/_cat/nodes?h=name,ip").lines().count() == 2);
 
+        // The second node is the only one in the suite whose Cassandra JMX is not on 127.0.0.1,
+        // so it is the only place `bin/nodetool` with no -h can be shown to read jmx_address out
+        // of conf/cassandra-opensearch.yaml rather than falling back to the loopback default.
+        Commands.Result status = leaving.nodetool("status");
+        assertThat(status.succeeded())
+                .as("nodetool must find this node's JMX from jmx_address alone:%n%s", status.describe())
+                .isTrue();
+        assertThat(upNodes(status.output())).isEqualTo(2);
+
         leavingNodeName = SupervisorStatus.of(leaving.cli("status")).value("node.name");
         assertThat(leavingNodeName).isNotBlank();
         assertThat(SupervisorStatus.of(leaving.cli("status")).value("operationMode")).isEqualTo("NORMAL");
@@ -185,6 +194,10 @@ class TwoNodeDecommissionIT {
         leaving.awaitExit(Duration.ofMinutes(2));
         assertThat(leaving.wasKilled()).isFalse();
         assertThat(leaving.supervisorLog()).contains("Shutdown complete; exit code 0");
+        assertThat(leaving.pidFile())
+                .as("a retired node must not leave its pid file behind: once the kernel recycles"
+                        + " that pid, the next `start -d` finds a live process and refuses")
+                .doesNotExist();
     }
 
     @Test

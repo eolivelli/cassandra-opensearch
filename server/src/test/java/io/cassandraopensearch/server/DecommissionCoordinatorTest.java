@@ -9,6 +9,7 @@ package io.cassandraopensearch.server;
 
 import io.cassandraopensearch.server.config.NodeConfiguration;
 import io.cassandraopensearch.spi.EmbeddedService;
+import io.cassandraopensearch.spi.ServiceException;
 import io.cassandraopensearch.spi.ServiceStatus;
 
 import org.junit.jupiter.api.Test;
@@ -114,11 +115,102 @@ class DecommissionCoordinatorTest {
                 .hasMessageContaining("--force");
 
         // The point of the refusal: Cassandra never leaves, so nothing is lost and the operator
-        // can retry once the cluster has caught up.
+        // can retry once the cluster has caught up — with the node put back as it was, which is
+        // what the two aborts are.
         assertThat(calls).containsExactly(
                 "opensearch.prepareDecommission",
                 "cassandra.prepareDecommission",
-                "opensearch.awaitDecommissionReady");
+                "opensearch.awaitDecommissionReady",
+                "cassandra.abortDecommission",
+                "opensearch.abortDecommission");
+        assertThat(opensearch.status()).isEqualTo(ServiceStatus.RUNNING);
+        assertThat(cassandra.status()).isEqualTo(ServiceStatus.RUNNING);
+    }
+
+    /**
+     * The defect this compensation exists for, in the shape it actually occurs.
+     *
+     * <p>Cassandra is the service that refuses a single-node decommission, and it is prepared
+     * <i>second</i> — by then OpenSearch has already excluded this node from shard allocation
+     * cluster-wide. Left in place that exclusion outlives the refusal, and on a single-node
+     * cluster every index created afterwards stays UNASSIGNED forever: one mistyped command
+     * produces what looks like an unrecoverable cluster. So the refusal must undo it, and it
+     * must undo it in reverse order — the service prepared last is put back first.
+     */
+    @Test
+    void aRefusedPreparationPutsEveryPreparedServiceBack() throws Exception {
+        cassandra.prepareFailure = new ServiceException("cassandra",
+                "this node is the only member of the ring");
+
+        assertThatThrownBy(() -> coordinator().run(null, false))
+                .isInstanceOf(DecommissionException.class)
+                .hasMessageContaining("prepare-cassandra")
+                .hasMessageContaining("only member of the ring");
+
+        assertThat(calls).containsExactly(
+                "opensearch.prepareDecommission",
+                "cassandra.prepareDecommission",
+                // The service whose own preparation threw is compensated too: it may have
+                // applied half of what it does before failing.
+                "cassandra.abortDecommission",
+                "opensearch.abortDecommission");
+        assertThat(opensearch.status()).isEqualTo(ServiceStatus.RUNNING);
+    }
+
+    /** A cancelled decommission is exactly when the preparations most need undoing. */
+    @Test
+    void aCancelledDecommissionIsAlsoBackedOut() throws Exception {
+        DecommissionCoordinator coordinator = coordinator();
+        opensearch.handsOffCleanly = false;
+        coordinator.cancel();
+
+        assertThatThrownBy(() -> coordinator.run(null, false))
+                .isInstanceOf(DecommissionException.class);
+
+        assertThat(calls).endsWith("cassandra.abortDecommission", "opensearch.abortDecommission");
+        assertThat(opensearch.cancelledDuringAbort)
+                .as("the compensating phase must not report itself cancelled, or a service could"
+                        + " stop half way through putting the node back")
+                .isFalse();
+    }
+
+    /**
+     * Compensation is best-effort and must not become the failure the operator reads: the
+     * message that says why the decommission stopped is the one worth having.
+     */
+    @Test
+    void aFailureWhileBackingOutDoesNotMaskTheOriginalFailure() throws Exception {
+        cassandra.prepareFailure = new ServiceException("cassandra", "this node is the only member of the ring");
+        opensearch.abortFailure = new ServiceException("opensearch", "cluster settings update rejected");
+
+        assertThatThrownBy(() -> coordinator().run(null, false))
+                .isInstanceOf(DecommissionException.class)
+                .hasMessageContaining("only member of the ring")
+                .satisfies(thrown -> assertThat(thrown.getSuppressed())
+                        .as("the compensation failure is still reported, as a suppressed exception")
+                        .anySatisfy(suppressed -> assertThat(suppressed)
+                                .hasMessageContaining("cluster settings update rejected")));
+    }
+
+    /**
+     * Past the point of no return there is nothing to put back. Once Cassandra's
+     * {@code decommission()} has begun the ranges are on their way to the rest of the ring, and
+     * re-admitting this node to shard allocation would be a lie about a node that is leaving.
+     */
+    @Test
+    void aFailureAfterCassandraHasBegunLeavingIsNotBackedOut() throws Exception {
+        cassandra.decommissionFailure = new ServiceException("cassandra", "streaming failed");
+
+        assertThatThrownBy(() -> coordinator().run(null, false))
+                .isInstanceOf(DecommissionException.class)
+                .hasMessageContaining("streaming failed");
+
+        assertThat(calls).containsExactly(
+                "opensearch.prepareDecommission",
+                "cassandra.prepareDecommission",
+                "opensearch.awaitDecommissionReady",
+                "opensearch.decommission",
+                "cassandra.decommission");
     }
 
     @Test

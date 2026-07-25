@@ -61,6 +61,63 @@ class OpenSearchDecommissionTest {
         assertThat(rest.get("/_cluster/settings").body()).contains("another-node," + NODE_NAME);
     }
 
+    /**
+     * The compensating action, on the path that makes it compulsory: a decommission refused
+     * after this node was already excluded.
+     *
+     * <p>Removing the exclusion is only half of it. What the operator actually cares about is
+     * that the cluster will allocate to this node again, so the assertion is an index created
+     * <i>after</i> the abort reaching GREEN — with the exclusion still in force it would sit
+     * UNASSIGNED forever, and on a single-node cluster nothing would ever move it.
+     */
+    @Test
+    void abortRemovesTheExclusionAndTheClusterAllocatesHereAgain() throws Exception {
+        TestDecommissionContext decommission = new TestDecommissionContext(Duration.ofSeconds(30), false);
+        service.prepareDecommission(decommission);
+
+        service.abortDecommission(decommission);
+
+        assertThat(service.status()).isEqualTo(ServiceStatus.RUNNING);
+        assertThat(rest.get("/_cluster/settings?flat_settings=true").body())
+                .as("the setting must be gone, not merely emptied: an operator reading the cluster"
+                        + " settings must find no trace of an exclusion that is not in force")
+                .doesNotContain("cluster.routing.allocation.exclude._name");
+
+        assertThat(rest.put("/after-abort", """
+                {"settings":{"number_of_shards":1,"number_of_replicas":0}}""").status()).isEqualTo(200);
+        assertThat(rest.get("/_cluster/health/after-abort?wait_for_status=green&timeout=30s").body())
+                .contains("\"status\":\"green\"");
+    }
+
+    /** Somebody else's retirement must survive ours being called off. */
+    @Test
+    void abortLeavesAnExclusionForAnotherNodeAlone() throws Exception {
+        assertThat(rest.put("/_cluster/settings", """
+                {"transient":{"cluster.routing.allocation.exclude._name":"another-node"}}""").status())
+                .isEqualTo(200);
+        TestDecommissionContext decommission = new TestDecommissionContext(Duration.ofSeconds(30), false);
+        service.prepareDecommission(decommission);
+
+        service.abortDecommission(decommission);
+
+        String settings = rest.get("/_cluster/settings?flat_settings=true").body();
+        assertThat(settings).contains("\"cluster.routing.allocation.exclude._name\":\"another-node\"");
+        assertThat(settings).doesNotContain(NODE_NAME);
+    }
+
+    /**
+     * The supervisor compensates every service it touched, without knowing how far each one got
+     * — including one whose preparation never ran or failed before it applied anything.
+     */
+    @Test
+    void abortIsSafeWithoutAPreparation() throws Exception {
+        service.abortDecommission(new TestDecommissionContext(Duration.ofSeconds(30), false));
+
+        assertThat(service.status()).isEqualTo(ServiceStatus.RUNNING);
+        assertThat(rest.get("/_cluster/settings?flat_settings=true").body())
+                .doesNotContain("cluster.routing.allocation.exclude._name");
+    }
+
     @Test
     void awaitReturnsImmediatelyWhenTheNodeHoldsNoShards() throws Exception {
         TestDecommissionContext decommission = new TestDecommissionContext(Duration.ofSeconds(30), false);

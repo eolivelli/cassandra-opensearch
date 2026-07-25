@@ -124,6 +124,14 @@ Cassandra has left, the process is on its way out.
 
 `--force` proceeds past step 3 with shards outstanding; `--timeout` bounds each waiting phase.
 
+Anything that fails, is refused or is cancelled up to and including step 3 is backed out:
+`abortDecommission` is called on every service already prepared, in reverse order, and OpenSearch
+takes this node back out of `cluster.routing.allocation.exclude._name`. This is not a nicety.
+Cassandra refuses a single-node decommission in step 2, *after* step 1 has excluded the node, and
+an exclusion nobody removes means the cluster never allocates a shard here again — one mistyped
+command would leave every index created afterwards UNASSIGNED. From step 4 on there is nothing to
+back out: the ranges are already streaming.
+
 The coordinator runs one more step than the four above: `decommission` is called on OpenSearch as
 well, before Cassandra's. That is where the shard count is re-checked, `--force` is enforced and
 recorded, and the node moves to `DECOMMISSIONED` rather than merely `STOPPED`. It runs first
