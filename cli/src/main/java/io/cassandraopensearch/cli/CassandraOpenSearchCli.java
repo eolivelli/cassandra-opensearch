@@ -77,7 +77,7 @@ public final class CassandraOpenSearchCli {
             String option = arguments.removeFirst();
             switch (option) {
                 case "--jmx-host" -> host = value(arguments, option);
-                case "--jmx-port" -> port = Integer.parseInt(value(arguments, option));
+                case "--jmx-port" -> port = parsePort(value(arguments, option));
                 case "--jmx-url" -> url = value(arguments, option);
                 case "--timeout" -> timeout = parseDuration(value(arguments, option));
                 case "--force" -> force = true;
@@ -255,7 +255,16 @@ public final class CassandraOpenSearchCli {
         return watcher;
     }
 
-    private static boolean isConnectionLoss(Throwable failure) {
+    /**
+     * The decision that a dropped connection during {@code stop} or {@code decommission} is a
+     * success rather than a failure. Both procedures end with the supervisor tearing down its own
+     * JMX connector on the way out, so the RMI call carrying them very often never returns.
+     *
+     * <p>Package-private so that it can be tested directly: getting this wrong in either
+     * direction is expensive — too narrow and every clean stop is reported as a failure, too wide
+     * and a genuinely broken node is reported as stopped.
+     */
+    static boolean isConnectionLoss(Throwable failure) {
         for (Throwable cause = failure; cause != null && cause != cause.getCause(); cause = cause.getCause()) {
             if (cause instanceof java.io.IOException || cause instanceof java.rmi.RemoteException) {
                 return true;
@@ -295,6 +304,25 @@ public final class CassandraOpenSearchCli {
             throw new CliException(CliException.USAGE, option + " needs a value");
         }
         return arguments.removeFirst();
+    }
+
+    /**
+     * {@code --jmx-port}. A bad value here is a typo, not a bug, and has to come back as usage
+     * (2) with a readable message rather than as a {@link NumberFormatException} stack trace under
+     * the generic handler in {@link #main} — which reports exit code 1, the code the launcher
+     * reads as "the command failed".
+     */
+    static int parsePort(String text) {
+        int port;
+        try {
+            port = Integer.parseInt(text.trim());
+        } catch (NumberFormatException e) {
+            throw new CliException(CliException.USAGE, "--jmx-port is not a number: " + text);
+        }
+        if (port < 1 || port > 65535) {
+            throw new CliException(CliException.USAGE, "--jmx-port is out of range: " + text);
+        }
+        return port;
     }
 
     private static int intEnv(String name, int defaultValue) {

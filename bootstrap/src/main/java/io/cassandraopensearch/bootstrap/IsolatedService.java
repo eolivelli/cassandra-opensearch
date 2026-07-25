@@ -10,11 +10,18 @@ package io.cassandraopensearch.bootstrap;
 import io.cassandraopensearch.spi.DecommissionContext;
 import io.cassandraopensearch.spi.EmbeddedService;
 import io.cassandraopensearch.spi.ServiceContext;
+import io.cassandraopensearch.spi.ServiceException;
 import io.cassandraopensearch.spi.ServiceStatus;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.net.URL;
+import java.util.Collections;
+import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Callable;
 
 /**
@@ -28,10 +35,19 @@ import java.util.concurrent.Callable;
  *       Cassandra and OpenSearch both reach for the TCCL — for {@link java.util.ServiceLoader},
  *       for resource lookups, for reflective config loading — and would find the supervisor's
  *       loader, which cannot see their classes.</li>
- *   <li>Exceptions are translated. A failure inside the service is usually an exception class
- *       the supervisor cannot load, and letting it propagate surfaces as an opaque
- *       {@link NoClassDefFoundError}; {@link io.cassandraopensearch.spi.ServiceException#flatten}
- *       rebuilds the cause chain out of types that exist on both sides.</li>
+ *   <li>Exceptions are translated, on the way out of every call. A failure inside the service is
+ *       frequently of a type only the isolated loader can load, and letting one propagate has two
+ *       consequences: the supervisor sees an opaque {@link NoClassDefFoundError} instead of the
+ *       failure, and anything that retains the exception — a log buffer, a JMX client's stack
+ *       trace, the cause {@code DecommissionCoordinator} puts inside a {@code
+ *       DecommissionException} and throws across an MBean — retains the isolated loader with it,
+ *       and the whole server's worth of classes behind that. So: a {@link ServiceException}
+ *       passes through unchanged, its cause chain already being flattened by construction; a
+ *       throwable whose own type <i>and</i> whose entire cause chain the supervisor's loader can
+ *       resolve passes through unchanged too, because nothing is gained by dressing up an
+ *       {@code IllegalStateException}; everything else is wrapped in a {@code ServiceException},
+ *       whose constructor runs {@link ServiceException#flatten} to rebuild the cause chain out of
+ *       types that exist on both sides.</li>
  * </ol>
  *
  * <p>Not thread-safe with respect to lifecycle calls; the supervisor drives those from a single
@@ -39,9 +55,25 @@ import java.util.concurrent.Callable;
  */
 public final class IsolatedService implements EmbeddedService, AutoCloseable {
 
+    private static final Logger LOG = LoggerFactory.getLogger(IsolatedService.class);
+
+    /** Bound on the cause chain walked when deciding whether a throwable may pass through. */
+    private static final int MAX_CAUSE_DEPTH = 100;
+
     private final String serviceName;
     private final IsolatedClassLoader loader;
     private final EmbeddedService delegate;
+
+    /**
+     * The last status the delegate actually returned, and what {@link #status()} falls back to
+     * when it cannot obtain a new one.
+     *
+     * <p>Not a cache: it is the answer to "what do we report when the question cannot be
+     * answered". Reporting {@link ServiceStatus#FAILED} there would be a lie with teeth — the
+     * supervisor's health check turns {@code FAILED} into a shutdown of the whole JVM, so a
+     * failure to read a status would take both servers down with it.
+     */
+    private volatile ServiceStatus lastObservedStatus = ServiceStatus.NEW;
 
     private IsolatedService(String serviceName, IsolatedClassLoader loader, EmbeddedService delegate) {
         this.serviceName = serviceName;
@@ -115,22 +147,68 @@ public final class IsolatedService implements EmbeddedService, AutoCloseable {
         runWithContextLoader(loader, () -> delegate.start(context));
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Must not block and must not throw: the supervisor polls this for health reporting, and —
+     * the case that bites — {@code Supervisor.stopService} calls it once more <i>after</i>
+     * {@link #close()}, outside any {@code try}. A delegate whose loader has just been closed
+     * answers a call into a not-yet-loaded class with {@link NoClassDefFoundError}, which is not
+     * an {@link Exception}; letting that escape aborts the shutdown before it records the final
+     * state, removes the shutdown hook or counts the process down, and the JVM hangs on exit.
+     * Hence {@link Throwable}.
+     *
+     * @return the delegate's status, or the last one it managed to report. Never
+     *         {@link ServiceStatus#FAILED} merely because the status could not be determined:
+     *         {@code FAILED} means "this service has failed", the supervisor shuts the process
+     *         down on it, and "we could not ask" is not that.
+     */
     @Override
     public ServiceStatus status() {
-        // Must not block and must not throw: the supervisor polls this for health reporting.
         try {
-            return callWithContextLoader(loader, delegate::status);
-        } catch (Exception e) {
-            return ServiceStatus.FAILED;
+            ServiceStatus current = callWithContextLoader(loader, delegate::status);
+            if (current != null) {
+                lastObservedStatus = current;
+            }
+            return lastObservedStatus;
+        } catch (Throwable t) {
+            restoreInterruptIfInterrupted(t);
+            ServiceStatus last = lastObservedStatus;
+            LOG.error("Could not read the status of service '{}'; reporting the last observed"
+                    + " status {} instead", serviceName, last, t);
+            return last;
         }
     }
 
     @Override
     public Map<String, String> details() {
         try {
-            return callWithContextLoader(loader, delegate::details);
-        } catch (Exception e) {
-            return Map.of("error", String.valueOf(e.getMessage()));
+            // Copy inside the boundary. Handing the delegate's own Map instance to the supervisor
+            // hands it an object loaded by the isolated loader, and anything that keeps the
+            // details — a status response, a log line held in a buffer — pins the loader.
+            return callWithContextLoader(loader, () -> {
+                Map<String, String> reported = delegate.details();
+                return reported == null
+                        ? new LinkedHashMap<String, String>()
+                        : new LinkedHashMap<>(reported);
+            });
+        } catch (Throwable t) {
+            // Throwable for the same reason as status(): both are called after close().
+            restoreInterruptIfInterrupted(t);
+            LOG.error("Could not read the details of service '{}'", serviceName, t);
+            return Map.of("error", String.valueOf(t));
+        }
+    }
+
+    /**
+     * Puts back an interrupt that was consumed by catching the {@link InterruptedException} that
+     * cleared it. {@link #status()} and {@link #details()} may run on any thread, including one
+     * the supervisor is in the middle of shutting down, and swallowing its interrupt leaves it
+     * waiting for a stop signal that has already been sent.
+     */
+    private static void restoreInterruptIfInterrupted(Throwable t) {
+        if (t instanceof InterruptedException) {
+            Thread.currentThread().interrupt();
         }
     }
 
@@ -162,11 +240,19 @@ public final class IsolatedService implements EmbeddedService, AutoCloseable {
     /**
      * Stops the service if it is still running, then discards the isolated loader.
      *
-     * <p>After this returns, every class the service loaded becomes eligible for collection —
-     * provided no thread it started is still alive, since a running thread pins its loader.
+     * <p>This releases the loader's jar handles. It does not, in practice, make the loader
+     * collectable: neither runtime's loader can be garbage collected after its service has
+     * stopped, for reasons measured and recorded in {@code docs/KNOWN-GAPS.md} §4. Both halves
+     * still have to happen — a service that is stopped but not closed holds its jars open, and
+     * one that is closed but not stopped holds its threads and sockets.
+     *
+     * <p>Both failures are reported: if {@code stop()} fails and the loader then also fails to
+     * close, the second is attached to the first as a suppressed exception rather than replacing
+     * it.
      */
     @Override
     public void close() throws Exception {
+        Throwable failure = null;
         try {
             // stop() unconditionally, relying on the idempotency the SPI requires. Skipping it
             // for terminal states looks like an optimisation but leaks: DECOMMISSIONED and
@@ -175,9 +261,36 @@ public final class IsolatedService implements EmbeddedService, AutoCloseable {
             // threads and sockets are all still live, and a service that failed during start
             // may hold whatever it managed to allocate first.
             stop();
-        } finally {
-            loader.close();
+        } catch (Throwable t) {
+            failure = t;
         }
+        try {
+            loader.close();
+        } catch (Throwable t) {
+            // Not `finally { loader.close(); }`: a throw from the finally block replaces the
+            // failure from stop() and the reason the service would not shut down is lost —
+            // which is the more interesting of the two, since a loader that will not close is
+            // usually a consequence of it.
+            if (failure == null) {
+                failure = t;
+            } else {
+                failure.addSuppressed(t);
+            }
+        }
+        if (failure != null) {
+            throw rethrowable(serviceName, failure);
+        }
+    }
+
+    /** Re-presents a caught throwable in a form {@code throws Exception} can carry. */
+    private static Exception rethrowable(String serviceName, Throwable failure) throws Error {
+        if (failure instanceof Error error) {
+            throw error;
+        }
+        if (failure instanceof Exception exception) {
+            return exception;
+        }
+        return new ServiceException(serviceName, String.valueOf(failure.getMessage()), failure);
     }
 
     /** Exposed for tests that assert isolation properties. */
@@ -191,21 +304,88 @@ public final class IsolatedService implements EmbeddedService, AutoCloseable {
         void run() throws Exception;
     }
 
-    private static void runWithContextLoader(ClassLoader loader, IsolatedAction action) throws Exception {
+    private static void runWithContextLoader(IsolatedClassLoader loader, IsolatedAction action) throws Exception {
         callWithContextLoader(loader, () -> {
             action.run();
             return null;
         });
     }
 
-    private static <T> T callWithContextLoader(ClassLoader loader, Callable<T> action) throws Exception {
+    /**
+     * Runs {@code action} with the isolated loader installed as the context ClassLoader, and
+     * translates whatever it throws into something the supervisor can hold — see the class
+     * javadoc for why both halves are needed.
+     */
+    private static <T> T callWithContextLoader(IsolatedClassLoader loader, Callable<T> action) throws Exception {
         Thread current = Thread.currentThread();
         ClassLoader previous = current.getContextClassLoader();
         current.setContextClassLoader(loader);
         try {
             return action.call();
+        } catch (Throwable t) {
+            throw translate(loader.serviceName(), t);
         } finally {
             current.setContextClassLoader(previous);
+        }
+    }
+
+    /**
+     * @return the exception to throw at the supervisor, or throws it directly when it is an
+     *         {@link Error} that may pass through. Never returns normally without a value.
+     */
+    private static Exception translate(String serviceName, Throwable thrown) throws Error {
+        if (thrown instanceof ServiceException serviceException) {
+            // Already the reportable form: the constructor flattened its cause chain, and
+            // Throwable forbids overwriting a cause that was set there, so it cannot have
+            // acquired an unloadable one since.
+            return serviceException;
+        }
+        if (isReportableToSupervisor(thrown)) {
+            if (thrown instanceof Error error) {
+                // OutOfMemoryError, StackOverflowError and friends: JVM-level conditions that
+                // the supervisor can already name. Wrapping one in a checked ServiceException
+                // would only invite something to catch it.
+                throw error;
+            }
+            if (thrown instanceof Exception exception) {
+                return exception;
+            }
+        }
+        return new ServiceException(
+                serviceName,
+                "Service '" + serviceName + "' failed with "
+                        + thrown.getClass().getName() + ": " + thrown.getMessage(),
+                thrown);
+    }
+
+    /**
+     * @return true if {@code thrown} and every throwable in its cause chain resolve, by name, to
+     *         the very classes the supervisor's own loader would resolve. Anything else must be
+     *         flattened: the supervisor cannot print it without a {@link NoClassDefFoundError},
+     *         and holding onto it holds the isolated loader alive.
+     */
+    private static boolean isReportableToSupervisor(Throwable thrown) {
+        Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        int depth = 0;
+        for (Throwable current = thrown; current != null; current = current.getCause()) {
+            // The chain may be cyclic and may be arbitrarily long; see ServiceException#flatten.
+            if (!seen.add(current) || ++depth > MAX_CAUSE_DEPTH) {
+                return false;
+            }
+            if (!isLoadableBySupervisor(current.getClass())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean isLoadableBySupervisor(Class<?> type) {
+        try {
+            // Same name is not enough: two loaders can each hold a class of that name, and the
+            // supervisor's copy is a different type from the one in hand.
+            return Class.forName(type.getName(), false, IsolatedService.class.getClassLoader()) == type;
+        } catch (ClassNotFoundException | LinkageError e) {
+            return false;
         }
     }
 }

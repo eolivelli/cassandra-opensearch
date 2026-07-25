@@ -78,11 +78,32 @@ Nothing in this project sets them; the risk is whatever else shares the command 
 
 ## 6. Netty tuning is a shared, unreconciled budget
 
-`io.netty.*` properties are JVM-global and read by both Netty copies. Cassandra's options want
-`allocator.maxOrder=11` and `tryReflectionSetAccessible=true`; the OpenSearch distribution wants
-`noUnsafe=true` and `numDirectArenas=0`. These actively contradict each other — adopting either
-side's tuning degrades the other. This project deliberately sets **none** of them and takes both
-defaults.
+`io.netty.*` properties are JVM-global and read by both Netty copies, and the two servers want
+opposite things: Cassandra's options want `allocator.maxOrder=11` and
+`tryReflectionSetAccessible=true`, while the OpenSearch distribution wants `noUnsafe=true` and
+`numDirectArenas=0`. There is no setting that satisfies both.
+
+**The conflict is resolved in Cassandra's favour, and OpenSearch pays for it.**
+`conf/jvm21-server.options` ships three properties:
+
+```
+-Dio.netty.tryReflectionSetAccessible=true
+-Dio.netty.allocator.useCacheForAllThreads=true
+-Dio.netty.allocator.maxOrder=11
+```
+
+The launcher puts every line of that file on the JVM command line, so all three apply to
+OpenSearch's Netty as well. `maxOrder=11` quadruples Netty's arena chunk size to 16 MiB, which is a
+real footprint change for a server that was not tuned for it. OpenSearch's own preferences are
+deliberately **not** adopted, because `noUnsafe=true` measurably slows Cassandra's native transport.
+
+An earlier version of this section claimed the project set none of them. It was wrong, and the
+error mattered: this is the file an operator sizing direct memory would consult. The Java code in
+both runtimes does set none — the properties come from the shipped options file — which is how the
+two statements drifted apart.
+
+Related: `MaxDirectMemorySize` is one budget that each Netty tracks independently, so the two can
+collectively over-commit it. Size for the sum.
 
 Related: `MaxDirectMemorySize` is one budget that each Netty tracks independently, so the two can
 collectively over-commit it. Size for the sum.
@@ -101,7 +122,38 @@ A `start()` exceeding its bound is interrupted and left behind — nothing in th
 thread outright. The supervisor's thread is a daemon and the ordered shutdown still runs, but a
 runtime that had already spawned non-daemon threads before hanging could hold the JVM open.
 
-## 9. The supervisor MBean is not on Cassandra's JMX port
+## 9. Nothing in the shipped configuration is authenticated
+
+Called out because this file exists so nobody meets a surprise in production, and a reviewer found
+it recorded nowhere:
+
+- The supervisor's JMX connector runs with `authenticate=false` and `ssl=false`.
+- Cassandra's own JMX connector sets no authenticator.
+- The shipped `conf/cassandra.yaml` uses `AllowAllAuthenticator` and `AllowAllAuthorizer`.
+- OpenSearch ships with no security plugin.
+
+Every one of these is the stock upstream default, and every endpoint binds loopback only in the
+shipped configuration, so a default single-node install is not exposed. But the moment an operator
+changes `listen_address`, `rpc_address` or `network_host` to reach the node from another machine —
+which the multi-node instructions require — they are exposing unauthenticated CQL, unauthenticated
+JMX with remote code execution reachable through it, and an unauthenticated OpenSearch REST API.
+
+Nothing in this project hardens any of that, and nothing warns at startup.
+
+## 10. A transient allocation exclusion can shadow a persistent one
+
+`prepareDecommission` merges this node into `cluster.routing.allocation.exclude._name` at the
+**transient** level, and reads the existing list from `transientSettings()`. If an operator has set
+a *persistent* exclusion for a different node, the transient value takes precedence for that key
+while the decommission is in force, so the persistent entry is shadowed until `abortDecommission`
+or the node's departure removes ours.
+
+The alternative — reading the merged view — is worse: it copies persistent entries into the
+transient layer permanently, so dropping the persistent setting later would leave a transient
+shadow keeping that node excluded forever. Both readings are imperfect; a correct one needs a
+compare-and-set the cluster settings API does not offer.
+
+## 11. The supervisor MBean is not on Cassandra's JMX port
 
 `bin/cassandra-opensearch status|decommission` reach `io.cassandraopensearch:type=Supervisor` via
 the launcher's `com.sun.management.jmxremote.*` agent, on its own port. Port 7199 will not serve

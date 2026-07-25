@@ -157,21 +157,91 @@ class DecommissionCoordinatorTest {
         assertThat(opensearch.status()).isEqualTo(ServiceStatus.RUNNING);
     }
 
-    /** A cancelled decommission is exactly when the preparations most need undoing. */
+    /**
+     * A cancelled decommission is exactly when the preparations most need undoing.
+     *
+     * <p>Cancelled <i>inside the shard-relocation wait</i>, which is where a cancellation really
+     * arrives: it is the phase that takes minutes, so it is the phase a SIGTERM lands in. The
+     * service notices through {@code isCancelled()} and reports that it gave up; the coordinator
+     * has to recognise that as a cancellation rather than blaming the cluster for a slow
+     * hand-off, and has to put both services back.
+     */
     @Test
     void aCancelledDecommissionIsAlsoBackedOut() throws Exception {
         DecommissionCoordinator coordinator = coordinator();
-        opensearch.handsOffCleanly = false;
-        coordinator.cancel();
+        opensearch.onAwaitDecommissionReady = coordinator::cancel;
 
         assertThatThrownBy(() -> coordinator.run(null, false))
-                .isInstanceOf(DecommissionException.class);
+                .isInstanceOf(DecommissionException.class)
+                .hasMessageContaining("cancelled")
+                .hasMessageContaining("NOT left either cluster");
 
-        assertThat(calls).endsWith("cassandra.abortDecommission", "opensearch.abortDecommission");
+        assertThat(calls).containsExactly(
+                "opensearch.prepareDecommission",
+                "cassandra.prepareDecommission",
+                "opensearch.awaitDecommissionReady",
+                "cassandra.abortDecommission",
+                "opensearch.abortDecommission");
         assertThat(opensearch.cancelledDuringAbort)
                 .as("the compensating phase must not report itself cancelled, or a service could"
                         + " stop half way through putting the node back")
                 .isFalse();
+    }
+
+    /**
+     * The defect: {@code cancel()} used to set a flag that {@code run()} never read. Only
+     * {@code awaitDecommissionReady} polls it, and {@code prepareDecommission} and
+     * {@code decommission} correctly do not — so a run cancelled anywhere other than inside that
+     * one wait carried straight on through the remaining phases, driving services whose caller
+     * had already begun stopping them.
+     */
+    @Test
+    void aCancellationBetweenPhasesStopsTheRunAtTheNextBoundary() throws Exception {
+        DecommissionCoordinator coordinator = coordinator();
+        // Cancelled while OpenSearch's own preparation is in flight — a phase that never looks at
+        // isCancelled(). The next boundary is where it has to be caught.
+        opensearch.onPrepareDecommission = coordinator::cancel;
+
+        assertThatThrownBy(() -> coordinator.run(null, false))
+                .isInstanceOf(DecommissionException.class)
+                .hasMessageContaining("cancelled");
+
+        assertThat(calls).containsExactly(
+                "opensearch.prepareDecommission",
+                // Not prepare-cassandra, not the relocation wait, and above all not either
+                // decommission() call.
+                "opensearch.abortDecommission");
+        assertThat(calls).doesNotContain("cassandra.decommission", "opensearch.decommission");
+    }
+
+    /**
+     * S4: {@code decommission(opensearch)} belongs inside the compensated block.
+     *
+     * <p>It is the call that re-checks the shard count and refuses when a shard reappeared between
+     * the wait and the re-check, so it genuinely throws — and it throws with this node excluded
+     * from shard allocation and Cassandra still fully in the ring. Left uncompensated that is the
+     * "every index sits UNASSIGNED" outcome the whole compensation exists to prevent.
+     */
+    @Test
+    void aRefusedOpenSearchDepartureIsStillBackedOut() throws Exception {
+        opensearch.decommissionFailure =
+                new ServiceException("opensearch", "a shard was allocated back to this node");
+
+        assertThatThrownBy(() -> coordinator().run(null, false))
+                .isInstanceOf(DecommissionException.class)
+                .hasMessageContaining("decommission-opensearch")
+                .hasMessageContaining("a shard was allocated back to this node");
+
+        assertThat(calls).containsExactly(
+                "opensearch.prepareDecommission",
+                "cassandra.prepareDecommission",
+                "opensearch.awaitDecommissionReady",
+                "opensearch.decommission",
+                // Cassandra never left, so the exclusion must come off again.
+                "cassandra.abortDecommission",
+                "opensearch.abortDecommission");
+        assertThat(calls).doesNotContain("cassandra.decommission");
+        assertThat(cassandra.status()).isEqualTo(ServiceStatus.RUNNING);
     }
 
     /**

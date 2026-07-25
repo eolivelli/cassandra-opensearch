@@ -10,6 +10,9 @@ package io.cassandraopensearch.server.config;
 import org.yaml.snakeyaml.LoaderOptions;
 import org.yaml.snakeyaml.Yaml;
 import org.yaml.snakeyaml.constructor.SafeConstructor;
+import org.yaml.snakeyaml.error.Mark;
+import org.yaml.snakeyaml.error.MarkedYAMLException;
+import org.yaml.snakeyaml.error.YAMLException;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -75,22 +78,43 @@ public final class NodeConfiguration {
                     "Configuration file not found: " + configFile.toAbsolutePath()
                             + ". An installation must provide conf/" + DEFAULT_FILE_NAME + ".");
         }
+        Object parsed;
         try (InputStream in = Files.newInputStream(configFile)) {
             LoaderOptions options = new LoaderOptions();
             options.setAllowDuplicateKeys(false);
-            Object parsed = new Yaml(new SafeConstructor(options)).load(in);
-            if (parsed == null) {
-                throw new ConfigurationException(configFile + " is empty.");
-            }
-            if (!(parsed instanceof Map)) {
-                throw new ConfigurationException(
-                        configFile + " must contain a YAML mapping at the top level, found "
-                                + parsed.getClass().getSimpleName() + ".");
-            }
-            @SuppressWarnings("unchecked")
-            Map<String, Object> root = (Map<String, Object>) parsed;
-            return fromMap(homeDirectory, configFile, root);
+            parsed = new Yaml(new SafeConstructor(options)).load(in);
+        } catch (YAMLException e) {
+            // Malformed YAML and duplicate keys arrive here as snakeyaml's own exceptions. Left
+            // unwrapped they escape past the caller's ConfigurationException handler, and the
+            // operator gets a stack trace through the parser instead of a message naming the
+            // file — for a class of mistake (a stray tab, a repeated key) where the position is
+            // the whole diagnosis. So it is wrapped, and the position is kept.
+            throw new ConfigurationException(describeYamlFailure(configFile, e), e);
         }
+        if (parsed == null) {
+            throw new ConfigurationException(configFile + " is empty.");
+        }
+        if (!(parsed instanceof Map)) {
+            throw new ConfigurationException(
+                    configFile + " must contain a YAML mapping at the top level, found "
+                            + parsed.getClass().getSimpleName() + ".");
+        }
+        @SuppressWarnings("unchecked")
+        Map<String, Object> root = (Map<String, Object>) parsed;
+        return fromMap(homeDirectory, configFile, root);
+    }
+
+    /** Keeps snakeyaml's problem text and its line/column, which is the useful half of it. */
+    private static String describeYamlFailure(Path configFile, YAMLException e) {
+        if (!(e instanceof MarkedYAMLException marked)) {
+            return configFile + " is not valid YAML: " + e.getMessage();
+        }
+        Mark mark = marked.getProblemMark();
+        String where = mark == null
+                ? ""
+                : " at line " + (mark.getLine() + 1) + ", column " + (mark.getColumn() + 1);
+        String context = marked.getContext() == null ? "" : marked.getContext() + ", ";
+        return configFile + " is not valid YAML: " + context + marked.getProblem() + where + ".";
     }
 
     private static NodeConfiguration fromMap(Path home, Path source, Map<String, Object> root) {
@@ -103,6 +127,9 @@ public final class NodeConfiguration {
         YamlReader directories = reader.section("directories", true);
         builder.dataDirectory = home.resolve(directories.string("data", "data"));
         builder.logsDirectory = home.resolve(directories.string("logs", "logs"));
+        // Every other section rejects what it does not know; this one used not to, and a
+        // mistyped 'data' quietly put the node's data under the installation directory.
+        directories.rejectUnknownKeys(List.of("data", "logs"));
 
         YamlReader servicesSection = reader.section("services", false);
         for (String serviceName : List.of("cassandra", "opensearch")) {

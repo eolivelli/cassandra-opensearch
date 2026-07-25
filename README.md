@@ -143,7 +143,7 @@ ClassLoaders partition *classes*, not the JVM. These stay global and are handled
 | Shutdown hooks | Cassandra's JVM-global drain hook is removed; the supervisor owns the process's only hook |
 | Uncaught exception handler | Cassandra sets one process-wide; a delegating handler preserves whatever was installed before |
 | Native libraries | Verified safe: JNA, netty-epoll and tcnative each extract to a per-loader temp file, and the JVM's "already loaded" rule is per *file* |
-| `io.netty.*` properties | JVM-global and read by both Netty copies. Cassandra wants `maxOrder=11`; OpenSearch's distribution wants `noUnsafe=true`. **We set neither** and take both defaults |
+| `io.netty.*` properties | JVM-global, read by both Netty copies, and genuinely unreconcilable. `conf/jvm21-server.options` ships **three, from Cassandra's side**: `tryReflectionSetAccessible=true`, `allocator.useCacheForAllThreads=true`, `allocator.maxOrder=11`. OpenSearch's Netty gets them too — `maxOrder=11` quadruples its arena chunk to 16 MiB. OpenSearch's own preferences (`noUnsafe=true`, `numDirectArenas=0`) are **not** adopted, because they measurably slow Cassandra's native transport. See [docs/KNOWN-GAPS.md](docs/KNOWN-GAPS.md) §6 |
 | JMX | Cassandra registers into a *private* MBeanServer that federates reads with the platform one, so nothing of its lands in the platform namespace |
 | Logging | logback and log4j2, in different loaders, each writing its own file under `logs/` |
 
@@ -200,11 +200,11 @@ cd ~/dev/cassandra && JAVA_HOME=~/.sdkman/candidates/java/17.0.19-tem ant mvn-in
 
 cd ~/dev/cassandra-opensearch
 mvn clean install          # unit tests            (~70 s)
-mvn clean verify           # + integration tests   (~6.5 min)
+mvn clean verify           # + integration tests   (~10.5 min)
 mvn verify -Pdocker        # + builds the Docker image
 ```
 
-The tarball lands in `dist/tarball/target/cassandra-opensearch-1.0.0-SNAPSHOT-bin.tar.gz` (114 MB).
+The tarball lands in `dist/tarball/target/cassandra-opensearch-1.0.0-SNAPSHOT-bin.tar.gz` (113 MB).
 
 ---
 
@@ -214,7 +214,8 @@ The tarball lands in `dist/tarball/target/cassandra-opensearch-1.0.0-SNAPSHOT-bi
 tar xzf dist/tarball/target/cassandra-opensearch-*-bin.tar.gz
 cd cassandra-opensearch-1.0.0-SNAPSHOT
 
-bin/cassandra-opensearch start        # foreground
+bin/cassandra-opensearch start        # foreground (also writes the pid file, so `stop`
+                                      #  works from another terminal)
 bin/cassandra-opensearch start -d     # background
 ```
 
@@ -231,6 +232,10 @@ curl -XPUT 'localhost:9200/my-index/_doc/1' -H 'Content-Type: application/json' 
 ```bash
 bin/cassandra-opensearch stop
 ```
+
+`start` refuses outright if something is already answering on the supervisor's JMX endpoint, rather
+than launching a second JVM that dies on a port conflict while the readiness probe cheerfully
+reports the *first* node as "up".
 
 > **Ports.** The defaults are the stock ones (9042, 9200, 7199, 7000). If you already have
 > Cassandra or OpenSearch running — including in a container published on `0.0.0.0`, which takes
@@ -283,7 +288,8 @@ Other commands:
 ./cluster-control.sh -d /tmp/my-cluster status         # supervisor status, every node
 ./cluster-control.sh -d /tmp/my-cluster stop           # reverse order
 ./cluster-control.sh -d /tmp/my-cluster decommission 2 # retire node 2, coupled
-./cluster-control.sh -d /tmp/my-cluster destroy        # stop and delete
+./cluster-control.sh -d /tmp/my-cluster destroy        # stop and delete (refuses if a
+                                                       #  node would not stop; -f overrides)
 ```
 
 ### What the script has to get right
@@ -416,7 +422,12 @@ mvn verify -Pdocker
 docker run --rm -it cassandra-opensearch:1.0.0-SNAPSHOT
 ```
 
-574 MB, on `eclipse-temurin:21-jre`, non-root, with a `HEALTHCHECK` that waits for both services.
+446 MB, on `eclipse-temurin:21-jre`, non-root, with a `HEALTHCHECK` that waits for both services.
+
+Use **`docker stop`**, not `docker exec ... stop`: the latter does reach SIGTERM, but the exec is
+killed along with PID 1, so its exit code tells you nothing. The ordered shutdown takes about 8
+seconds on an idle single node, uncomfortably close to Docker's 10-second SIGKILL default — raise
+`--stop-timeout` if the node holds real data.
 
 > The shipped config binds **loopback only**, so published ports are not reachable without mounting
 > a modified `conf/`. Cassandra additionally needs `broadcast_address` and `broadcast_rpc_address`
@@ -427,8 +438,8 @@ docker run --rm -it cassandra-opensearch:1.0.0-SNAPSHOT
 ## Testing
 
 ```bash
-mvn test      # 84 unit tests
-mvn verify    # + 16 integration tests   (~6.5 min total)
+mvn test      # 229 unit tests
+mvn verify    # + 22 integration tests   (~10.5 min total)
 ```
 
 Integration tests unpack the tarball and drive it as a **real external process** — the shipped
@@ -465,5 +476,6 @@ isolated loaders the same mediated Netty and Lucene — quietly undoing the isol
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — isolation design, module map, lifecycle
 - [docs/JDK.md](docs/JDK.md) — the JDK 17 / OpenSearch 3.x conflict
 - [docs/KNOWN-GAPS.md](docs/KNOWN-GAPS.md) — **what is not finished or not safe. Read this.**
+- [docs/REMAINING-WORK.md](docs/REMAINING-WORK.md) — the prioritised to-do list, and what was found in review
 - [docs/spikes/](docs/spikes/) — how each server is embedded, and the evidence behind it
 - [examples/README.md](examples/README.md) — multi-node walkthrough

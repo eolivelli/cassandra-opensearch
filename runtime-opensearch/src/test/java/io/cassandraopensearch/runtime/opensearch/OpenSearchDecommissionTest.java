@@ -89,6 +89,41 @@ class OpenSearchDecommissionTest {
                 .contains("\"status\":\"green\"");
     }
 
+    /**
+     * The persistent layer belongs to the operator, and this service never writes it.
+     *
+     * <p>Merging from {@code metadata().settings()} — persistent and transient flattened together
+     * — copies a persistent exclusion into the transient one, where it outlives its source: the
+     * operator removes the persistent entry and the node it named stays excluded, by a setting
+     * nobody wrote and nothing will clear. Reading only the transient layer means the abort below
+     * puts {@code _cluster/settings} back exactly as it was found.
+     */
+    @Test
+    void prepareDoesNotCopyAPersistentExclusionIntoTheTransientLayer() throws Exception {
+        assertThat(rest.put("/_cluster/settings", """
+                {"persistent":{"cluster.routing.allocation.exclude._name":"another-node"}}""").status())
+                .isEqualTo(200);
+        TestDecommissionContext decommission = new TestDecommissionContext(Duration.ofSeconds(30), false);
+
+        service.prepareDecommission(decommission);
+
+        String settings = rest.get("/_cluster/settings?flat_settings=true").body();
+        assertThat(settings)
+                .as("the transient exclusion must name this node and nothing else")
+                .contains("\"transient\":{\"cluster.routing.allocation.exclude._name\":\"" + NODE_NAME + "\"}");
+        assertThat(settings)
+                .contains("\"persistent\":{\"cluster.routing.allocation.exclude._name\":\"another-node\"}");
+
+        service.abortDecommission(decommission);
+
+        String afterAbort = rest.get("/_cluster/settings?flat_settings=true").body();
+        assertThat(afterAbort)
+                .as("nothing this service wrote may be left behind")
+                .contains("\"transient\":{}");
+        assertThat(afterAbort)
+                .contains("\"persistent\":{\"cluster.routing.allocation.exclude._name\":\"another-node\"}");
+    }
+
     /** Somebody else's retirement must survive ours being called off. */
     @Test
     void abortLeavesAnExclusionForAnotherNodeAlone() throws Exception {

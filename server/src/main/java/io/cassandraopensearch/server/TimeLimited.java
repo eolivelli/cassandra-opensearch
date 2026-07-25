@@ -38,6 +38,25 @@ final class TimeLimited {
         void run() throws Exception;
     }
 
+    /**
+     * Thrown when the deadline expired and the call was left running.
+     *
+     * <p>Distinct from a plain {@link SupervisorException} because the two mean opposite things
+     * to the caller. A call that <i>failed</i> is over, and whatever it touched can be cleaned
+     * up. A call that was abandoned is still executing on a thread nothing can stop, still
+     * inside the service's own code, and may yet mutate that service after the supervisor has
+     * given up on it — so the supervisor must not then stop it, close its ClassLoader, or
+     * pretend the process can exit cleanly.
+     */
+    static final class AbandonedException extends SupervisorException {
+
+        private static final long serialVersionUID = 1L;
+
+        AbandonedException(String message) {
+            super(message);
+        }
+    }
+
     static void run(String description, Duration timeout, Action action) throws Exception {
         call(description, timeout, () -> {
             action.run();
@@ -60,7 +79,7 @@ final class TimeLimited {
             throw new SupervisorException(description + " failed: " + cause, cause);
         } catch (TimeoutException e) {
             worker.interrupt();
-            throw new SupervisorException(
+            throw new AbandonedException(
                     description + " did not complete within " + format(timeout)
                             + "; the call has been interrupted and abandoned");
         } catch (InterruptedException e) {
@@ -74,6 +93,14 @@ final class TimeLimited {
     static String format(Duration duration) {
         if (duration.isZero()) {
             return "0s";
+        }
+        if (duration.isNegative()) {
+            return "-" + format(duration.negated());
+        }
+        // Sub-millisecond first: every test below divides toMillis(), which is 0 here, and 0 is
+        // divisible by everything — so a 500µs deadline used to be reported as "0h".
+        if (duration.toMillis() == 0) {
+            return duration.toNanos() + "ns";
         }
         if (duration.toMillis() % 3_600_000 == 0) {
             return duration.toHours() + "h";

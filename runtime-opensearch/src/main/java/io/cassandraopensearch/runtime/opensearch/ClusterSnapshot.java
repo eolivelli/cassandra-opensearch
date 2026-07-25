@@ -20,10 +20,18 @@ import org.opensearch.cluster.routing.ShardRoutingState;
  * {@code _cluster/health} call — does exactly that: it is a cluster-manager-node read that can
  * queue behind cluster state updates. Deriving from the locally applied state instead is a
  * volatile read plus arithmetic. The derivation itself is O(shards), so it is memoised against
- * {@link #version()}: repeated calls between two cluster state updates cost nothing.
+ * {@link #stateUuid()}: repeated calls between two cluster state updates cost nothing.
+ *
+ * <p>The key is the state UUID rather than {@code ClusterState.version()} because the version is
+ * only monotonic within a single cluster-manager term. The state a node applies when it loses the
+ * cluster manager — {@code ClusterState.Builder.blocks(NO_CLUSTER_MANAGER_BLOCK)} in {@code
+ * Coordinator}'s {@code clusterStateWithNoClusterManagerBlock} — carries the <i>same</i> version
+ * as the one before it, so a version-keyed cache would serve the pre-failure snapshot for as long
+ * as the node had no cluster manager: exactly the moment an operator is reading {@code details()}
+ * to find out what happened. The UUID is regenerated on every build.
  */
 record ClusterSnapshot(
-        long version,
+        String stateUuid,
         String clusterName,
         String healthStatus,
         int shards,
@@ -34,7 +42,7 @@ record ClusterSnapshot(
     static ClusterSnapshot of(ClusterState state, String localNodeId) {
         RoutingNode local = state.getRoutingNodes().node(localNodeId);
         return new ClusterSnapshot(
-                state.version(),
+                state.stateUUID(),
                 state.getClusterName().value(),
                 new ClusterStateHealth(state).getStatus().name(),
                 local == null ? 0 : local.size(),

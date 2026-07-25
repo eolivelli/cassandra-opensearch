@@ -52,38 +52,140 @@ final class ProbeServiceCompiler {
                 /** Exists only inside the probe jar, so the supervisor cannot load it. */
                 public static class ProbeFailure extends RuntimeException {
                     public ProbeFailure(String message) { super(message); }
+                    public ProbeFailure(String message, Throwable cause) { super(message, cause); }
                 }
+
+                /** Likewise unloadable by the supervisor, and an Error rather than an Exception. */
+                public static class ProbeError extends Error {
+                    public ProbeError(String message) { super(message); }
+                }
+
+                /**
+                 * Resolved during class initialisation, so details() keeps working after this
+                 * loader has been closed. Resolution failure after close is a real behaviour and
+                 * is exercised deliberately, through probe.detailsMode=lazy, rather than by
+                 * accident here.
+                 */
+                private static final Class<?> DETAILS_TYPE = ProbeDetails.class;
 
                 private volatile ServiceStatus status = ServiceStatus.NEW;
                 private volatile String observedTccl = "<none>";
                 private volatile boolean stopped = false;
+                private volatile ServiceContext context;
 
                 @Override
                 public String name() { return "probe"; }
 
                 @Override
                 public void start(ServiceContext context) throws Exception {
+                    this.context = context;
                     status = ServiceStatus.STARTING;
                     observedTccl = String.valueOf(Thread.currentThread().getContextClassLoader().getName());
-                    if ("true".equals(context.settings().get("probe.failOnStart"))) {
+                    String failure = context.settings().get("probe.failOnStart");
+                    if (failure != null && !failure.isEmpty()) {
                         status = ServiceStatus.FAILED;
-                        throw new ServiceException("probe", "probe was asked to fail",
-                                new ProbeFailure("thrown from inside the isolated loader"));
+                        Throwable thrown = startFailure(failure);
+                        if (thrown instanceof Error) {
+                            throw (Error) thrown;
+                        }
+                        throw (Exception) thrown;
                     }
                     status = ServiceStatus.RUNNING;
                 }
 
+                /**
+                 * The shapes a real runtime fails in, all of which have to reach the supervisor
+                 * as something it can load, print and hold without pinning this loader.
+                 */
+                private Throwable startFailure(String mode) {
+                    switch (mode) {
+                        case "true":
+                            // Already the reportable form.
+                            return new ServiceException("probe", "probe was asked to fail",
+                                    new ProbeFailure("thrown from inside the isolated loader"));
+                        case "raw":
+                            // The bad case: a type that exists only in this jar, thrown bare.
+                            return new ProbeFailure("raw failure from inside the isolated loader");
+                        case "raw-error":
+                            return new ProbeError("raw error from inside the isolated loader");
+                        case "loadable":
+                            // Nothing to translate; must arrive exactly as thrown.
+                            return new IllegalStateException("probe refuses to start");
+                        case "loadable-with-isolated-cause":
+                            // Looks harmless from the outside; the cause is what pins the loader.
+                            return new IllegalStateException("probe refuses to start",
+                                    new ProbeFailure("the real reason, unloadable outside"));
+                        case "cyclic":
+                            // Legal: initCause only rejects self-causation.
+                            ProbeFailure inner = new ProbeFailure("inner");
+                            ProbeFailure outer = new ProbeFailure("outer", inner);
+                            inner.initCause(outer);
+                            return outer;
+                        default:
+                            return new ProbeFailure("unknown failure mode " + mode);
+                    }
+                }
+
                 @Override
-                public ServiceStatus status() { return status; }
+                public ServiceStatus status() {
+                    failIfAsked("probe.statusMode");
+                    return status;
+                }
 
                 @Override
                 public Map<String, String> details() {
-                    Map<String, String> details = new LinkedHashMap<>();
+                    failIfAsked("probe.detailsMode");
+                    // Deliberately a Map type from this jar: handing it out unchanged hands the
+                    // supervisor an object whose class pins this loader.
+                    Map<String, String> details = new ProbeDetails();
                     details.put("name", name());
                     details.put("tccl", observedTccl);
                     details.put("loader", String.valueOf(getClass().getClassLoader().getName()));
                     details.put("stopped", String.valueOf(stopped));
                     return details;
+                }
+
+                /**
+                 * status() and details() are the two calls the supervisor makes after close(),
+                 * so they are the two that have to survive their own loader being gone.
+                 */
+                private void failIfAsked(String key) {
+                    ServiceContext seen = context;
+                    String mode = seen == null ? null : seen.settings().get(key);
+                    if (mode == null || mode.isEmpty()) {
+                        return;
+                    }
+                    if ("isolated".equals(mode)) {
+                        throw new ProbeFailure("asked to fail in " + key);
+                    }
+                    if ("error".equals(mode)) {
+                        throw new ProbeError("asked to fail in " + key);
+                    }
+                    if ("interrupt".equals(mode)) {
+                        // status() cannot declare a checked exception, so the only way one gets
+                        // out is unchecked-ly — which is exactly what Netty's
+                        // PlatformDependent.throwException does, and Netty is inside both of the
+                        // real loaders.
+                        ProbeService.<RuntimeException>sneakyThrow(
+                                new InterruptedException("interrupted inside " + key));
+                    }
+                    if ("lazy".equals(mode)) {
+                        // Exactly what the JVM does when this loader has been closed and the
+                        // class was never loaded: a resolution failure, and an Error, not an
+                        // Exception.
+                        try {
+                            Class.forName("probe.LazyProbe", true, ProbeService.class.getClassLoader());
+                        } catch (ClassNotFoundException e) {
+                            throw new NoClassDefFoundError("probe/LazyProbe");
+                        }
+                        return;
+                    }
+                    throw new IllegalStateException("unknown mode " + mode + " for " + key);
+                }
+
+                @SuppressWarnings("unchecked")
+                private static <T extends Throwable> void sneakyThrow(Throwable t) throws T {
+                    throw (T) t;
                 }
 
                 @Override
@@ -109,6 +211,11 @@ final class ProbeServiceCompiler {
                 @Override
                 public void stop() {
                     stopped = true;
+                    ServiceContext seen = context;
+                    String failure = seen == null ? null : seen.settings().get("probe.failOnStop");
+                    if (failure != null && !failure.isEmpty()) {
+                        throw new ProbeFailure("probe refused to stop: " + failure);
+                    }
                     // Mirrors the real services: a decommissioned node stays DECOMMISSIONED
                     // after stop(), because that is the state the operator asked for.
                     if (status != ServiceStatus.DECOMMISSIONED) {
@@ -128,6 +235,21 @@ final class ProbeServiceCompiler {
             """;
 
     /**
+     * The Map implementation {@code details()} returns. It is a type from this jar, so an
+     * implementation that passed the delegate's own map straight out would hand the supervisor an
+     * object whose class — and therefore whose loader — it keeps alive for as long as it keeps
+     * the map.
+     */
+    private static final String DETAILS_SOURCE = """
+            package probe;
+
+            import java.util.LinkedHashMap;
+
+            public class ProbeDetails extends LinkedHashMap<String, String> {
+            }
+            """;
+
+    /**
      * @param workDir a temp directory; the jar and intermediate class files are written here
      * @return path to the compiled jar
      */
@@ -142,7 +264,8 @@ final class ProbeServiceCompiler {
 
         List<JavaFileObject> sources = List.of(
                 new StringSource("probe.ProbeService", PROBE_SOURCE),
-                new StringSource("probe.LazyProbe", LAZY_SOURCE));
+                new StringSource("probe.LazyProbe", LAZY_SOURCE),
+                new StringSource("probe.ProbeDetails", DETAILS_SOURCE));
 
         // The SPI must be on the compile classpath, and it already is: this test module depends
         // on it, so the running JVM's classpath contains it.

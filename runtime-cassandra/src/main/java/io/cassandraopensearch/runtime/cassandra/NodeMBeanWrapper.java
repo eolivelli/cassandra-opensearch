@@ -7,11 +7,14 @@
  */
 package io.cassandraopensearch.runtime.cassandra;
 
+import java.lang.management.ManagementFactory;
 import java.util.Collections;
 import java.util.Set;
 
+import javax.management.ListenerNotFoundException;
 import javax.management.MBeanServer;
 import javax.management.MBeanServerFactory;
+import javax.management.NotificationListener;
 import javax.management.ObjectName;
 import javax.management.QueryExp;
 
@@ -38,6 +41,9 @@ public final class NodeMBeanWrapper implements MBeanWrapper {
      */
     public static final String DEFAULT_DOMAIN = "cassandra-opensearch";
 
+    /** The one MBean whose registration this class has to remember; see {@link #detachGcInspector}. */
+    private static final String GC_INSPECTOR = "org.apache.cassandra.service:type=GCInspector";
+
     private static volatile NodeMBeanWrapper current;
 
     private final MBeanServer nodeServer;
@@ -50,6 +56,13 @@ public final class NodeMBeanWrapper implements MBeanWrapper {
      * the teardown sequence half way through. The fields stay non-null for the same reason.
      */
     private volatile boolean closed;
+
+    /**
+     * The {@code GCInspector} this node registered, kept because there is no other way to get at
+     * it: an {@link MBeanServer} hands back attribute values, never the object it was given, and
+     * {@code GCInspector.register()} keeps no reference of its own. See {@link #detachGcInspector}.
+     */
+    private volatile Object gcInspector;
 
     public NodeMBeanWrapper() {
         this.nodeServer = MBeanServerFactory.createMBeanServer(DEFAULT_DOMAIN);
@@ -74,6 +87,9 @@ public final class NodeMBeanWrapper implements MBeanWrapper {
         }
         try {
             nodeServer.registerMBean(mbean, name);
+            if (GC_INSPECTOR.equals(name.getCanonicalName())) {
+                gcInspector = mbean;
+            }
         } catch (Exception e) {
             onException.handler.accept(e);
         }
@@ -115,14 +131,16 @@ public final class NodeMBeanWrapper implements MBeanWrapper {
     }
 
     /**
-     * Unregisters everything this node put in its private server and releases the server. Safe to
-     * call more than once; safe to call before the rest of the node has been torn down.
+     * Unregisters everything this node put in its private server, takes its {@code GCInspector}
+     * back off the platform beans, and releases the server. Safe to call more than once; safe to
+     * call before the rest of the node has been torn down.
      */
     void close() {
         if (closed) {
             return;
         }
         closed = true;
+        detachGcInspector();
         for (ObjectName name : nodeServer.queryNames(null, null)) {
             try {
                 if (!name.getCanonicalName().contains("MBeanServerDelegate")) {
@@ -135,6 +153,54 @@ public final class NodeMBeanWrapper implements MBeanWrapper {
         MBeanServerFactory.releaseMBeanServer(nodeServer);
         if (current == this) {
             current = null;
+        }
+    }
+
+    /**
+     * Takes this node's {@code GCInspector} back off the JVM's garbage-collector MXBeans.
+     *
+     * <p>{@code GCInspector.register()} adds the inspector as a notification listener to the
+     * <i>platform</i> {@code java.lang:type=GarbageCollector,*} beans — the private server is used
+     * for the query that builds {@code gcStates}, but not for the subscription — and nothing in
+     * Cassandra ever removes it, because in Cassandra's own process nothing outlives the node.
+     * Here two things do:
+     *
+     * <ul>
+     *   <li>The listener is reachable from a JVM-global object, so it pins the isolated
+     *       ClassLoader for the life of the process, long after the node it belongs to is gone.
+     *       That is the one thing this module exists to prevent.</li>
+     *   <li>It keeps handling every collection. On an old-generation one it calls
+     *       {@code LifecycleTransaction.rescheduleFailedDeletions()}, which submits to executors
+     *       the teardown has already shut down, and throws {@code RejectedExecutionException}. The
+     *       platform beans dispatch to their listeners in a plain loop with no per-listener
+     *       {@code try}, so that exception also stops every listener added after it from ever
+     *       seeing the notification — in a process that starts a second node, the live node's
+     *       {@code GCInspector} silently stops working.</li>
+     * </ul>
+     *
+     * <p>Done here, at the start of the teardown, rather than at the end: from this point on the
+     * node's executors begin going down, which is exactly when a late notification would throw.
+     */
+    private void detachGcInspector() {
+        Object registered = gcInspector;
+        gcInspector = null;
+        if (!(registered instanceof NotificationListener listener)) {
+            return;
+        }
+        try {
+            MBeanServer platform = ManagementFactory.getPlatformMBeanServer();
+            ObjectName garbageCollectors =
+                    new ObjectName(ManagementFactory.GARBAGE_COLLECTOR_MXBEAN_DOMAIN_TYPE + ",*");
+            for (ObjectName name : platform.queryNames(garbageCollectors, null)) {
+                try {
+                    platform.removeNotificationListener(name, listener);
+                } catch (ListenerNotFoundException ignored) {
+                    // Registration is per GC bean and the set can change under a dynamic
+                    // collector; one this inspector never subscribed to is not a problem.
+                }
+            }
+        } catch (Exception ignored) {
+            // Best effort, like the rest of close(): a teardown must not fail on its own cleanup.
         }
     }
 }

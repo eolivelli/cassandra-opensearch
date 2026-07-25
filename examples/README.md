@@ -34,7 +34,7 @@ node is a complete, independent installation — a node is a whole JVM hosting b
 | `ring` | `nodetool status` from node 1 |
 | `health` | OpenSearch cluster health and node list |
 | `decommission n` | retire node `n` through the coupled procedure |
-| `destroy` | stop everything and delete the directory |
+| `destroy` | stop everything and delete the directory — refuses if a node would not stop, unless `-f` |
 
 ### Port plan
 
@@ -167,11 +167,29 @@ Without this, the second node fails with `BindException: Can't assign requested 
 Put data in both clusters. Cassandra, at RF 1 so it genuinely has to stream on decommission:
 
 ```bash
-/tmp/demo/node1/bin/cqlsh 127.0.0.1 21012 -e "
+export CQL="
   CREATE KEYSPACE demo WITH replication = {'class':'SimpleStrategy','replication_factor':1};
   CREATE TABLE demo.t (k int PRIMARY KEY, v text);
   INSERT INTO demo.t (k,v) VALUES (1,'hello');"
 ```
+
+`cqlsh` is a Python program — `bin/cqlsh.py` plus the `cqlshlib` package, source files rather than
+jars — so this distribution does not carry it, and `bin/cqlsh` exits 1 with "not available in this
+distribution" until you tell it where a copy is. Either point it at a Cassandra installation:
+
+```bash
+export CASSANDRA_TOOLS_HOME=/path/to/apache-cassandra-5.0.x   # or a source tree
+/tmp/demo/node1/bin/cqlsh 127.0.0.1 21012 -e "$CQL"
+```
+
+or run one out of a container, which needs no installation at all — `--network host` because the
+node is on a loopback alias:
+
+```bash
+docker run --rm --network host cassandra:5 cqlsh 127.0.0.1 21012 -e "$CQL"
+```
+
+Any CQL driver does just as well; nothing below depends on which of the three you used.
 
 OpenSearch, with more shards than nodes so relocation is real movement:
 
@@ -239,6 +257,9 @@ refused decommission used to leave the OpenSearch allocation exclusion in place.
 an older build, clear it with:
 
 ```bash
-curl -XPUT 'localhost:9200/_cluster/settings' -H 'Content-Type: application/json' \
+curl -XPUT '127.0.0.1:21015/_cluster/settings' -H 'Content-Type: application/json' \
   -d '{"transient":{"cluster.routing.allocation.exclude._name":null}}'
 ```
+
+(21015 is node 1's REST port in this document's port plan. Do not paste `localhost:9200` here —
+on a developer machine that is very often somebody else's OpenSearch.)

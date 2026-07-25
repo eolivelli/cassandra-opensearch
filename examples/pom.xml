@@ -15,8 +15,13 @@
   <name>Cassandra + OpenSearch :: Examples</name>
   <description>
     Documentation and runnable scripts only — no code, no artifact. Packaging is pom so the
-    module joins the reactor (and so a broken script is noticed by the shellcheck below) without
-    producing a jar nobody would consume.
+    module joins the reactor, and so that the `bash -n` parse check below runs on every build,
+    without producing a jar nobody would consume.
+
+    The check is a parse, not a lint: it is `bash -n`, not shellcheck. shellcheck is not part of
+    the build's tool contract (a Maven build has to work on a machine that has only a JDK), and a
+    check that silently does nothing when the tool is absent is worse than one that is honest
+    about its scope.
   </description>
 
   <build>
@@ -28,8 +33,8 @@
         <executions>
           <execution>
             <!-- A shipped script that does not parse is worse than no script: the reader trusts
-                 it. `sh -n` is not a substitute for running them, but it is free and catches the
-                 edit that was never re-run. -->
+                 it. `bash -n` is not a substitute for running them, but it is free and catches
+                 the edit that was never re-run. -->
             <id>syntax-check-example-scripts</id>
             <phase>test</phase>
             <goals><goal>run</goal></goals>

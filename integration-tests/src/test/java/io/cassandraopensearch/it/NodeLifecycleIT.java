@@ -23,6 +23,7 @@ import java.net.ServerSocket;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -127,11 +128,124 @@ class NodeLifecycleIT {
     }
 
     /**
+     * A {@code start} with no {@code conf/jvm21-server.options} must fail before it starts a JVM.
+     *
+     * <p>The guard that says so lives in {@code co_jvm_options}, which every caller invokes inside
+     * a command substitution — so its {@code exit 1} ends the substitution's subshell and nothing
+     * else. The launcher used to print the error and then start the JVM anyway, with no
+     * {@code --add-exports} and no {@code --add-opens}, which dies deep in startup with
+     * {@code IllegalAccessError: module java.rmi does not export sun.rmi.registry}.
+     *
+     * <p>A conf/ directory mounted over the shipped one — which is what the Dockerfile tells an
+     * operator to do to change the bind addresses — is how an installation arrives in this state.
+     *
+     * <p>{@code start -d} with a pid file of its own: {@code -d} never execs, so a regression
+     * fails this test instead of hanging it, and the running node's own pid file is untouched
+     * either way.
+     */
+    @Test
+    @Order(4)
+    void startWithoutTheJvmOptionsFileFailsInsteadOfStartingACrippledJvm() throws Exception {
+        Path emptyConf = Files.createDirectories(
+                Distribution.workDirectory(NodeLifecycleIT.class, "conf-without-options"));
+        Path pidFile = node.home().resolve("guard.pid");
+        Files.deleteIfExists(pidFile);
+
+        Commands.Result start = node.runWith(
+                Map.of("CASSANDRA_OPENSEARCH_CONF", emptyConf.toString()),
+                Duration.ofMinutes(2),
+                "bin/cassandra-opensearch", "start", "-d", "-p", pidFile.toString());
+
+        assertThat(start.exitCode()).as("start must fail:%n%s", start.describe()).isNotZero();
+        assertThat(start.output())
+                .as("the failure has to name the file that is missing")
+                .contains("jvm21-server.options");
+        assertThat(start.output())
+                .as("no JVM may be launched:%n%s", start.describe())
+                .doesNotContain("started pid");
+        assertThat(pidFile).doesNotExist();
+
+        // And the tools take the same path, through bin/cassandra.in.sh rather than the launcher.
+        Commands.Result nodetool = node.runWith(
+                Map.of("CASSANDRA_OPENSEARCH_CONF", emptyConf.toString()),
+                Duration.ofMinutes(2), "bin/nodetool", "status");
+        assertThat(nodetool.exitCode()).as("nodetool must fail:%n%s", nodetool.describe()).isNotZero();
+        assertThat(nodetool.output()).contains("jvm21-server.options");
+        // What a JVM started without those entries prints on its way down. The message above
+        // names IllegalAccessError to explain itself, so the assertion has to be on the symptom
+        // rather than on the word.
+        assertThat(nodetool.output())
+                .as("it must not have got as far as the JVM")
+                .doesNotContain("unable to access required classes")
+                .doesNotContain("java.lang.IllegalAccessException");
+    }
+
+    /**
+     * A garbage pid file must not let a second {@code start -d} report success.
+     *
+     * <p>The already-running guard only fired when the pid file existed <i>and</i> parsed.
+     * Otherwise a second JVM launched, died on {@code BindException} — and the wait loop, polling
+     * the same JMX host and port, connected to the node that was <b>already</b> running and
+     * printed "up" before {@code kill -0} noticed the new process was gone. The pid file then
+     * named a dead process, and {@code stop} refused to touch the live one: a running node with
+     * no way to stop it through the script.
+     *
+     * <p>This node is up while the test runs, which is the whole point — the false "up" needs
+     * something real answering on that port.
+     */
+    @Test
+    @Order(5)
+    void aGarbagePidFileDoesNotProduceAFalseUp() throws Exception {
+        Path stalePidFile = node.home().resolve("stale.pid");
+        Files.writeString(stalePidFile, "not-a-pid\n");
+
+        Commands.Result start = node.runWith(Map.of(), Duration.ofMinutes(3),
+                "bin/cassandra-opensearch", "start", "-d", "-p", stalePidFile.toString());
+
+        assertThat(start.exitCode())
+                .as("a second node on the same JMX endpoint must be refused:%n%s", start.describe())
+                .isNotZero();
+        assertThat(start.output())
+                .as("it must not claim the node came up:%n%s", start.describe())
+                .doesNotContain("up; supervisor JMX");
+        assertThat(start.output()).contains("already answering");
+
+        // Nothing was launched, so the file it was told to write still holds what we put there.
+        assertThat(Files.readString(stalePidFile).trim()).isEqualTo("not-a-pid");
+        // And the real node is untouched: same pid, still alive, still answering.
+        assertThat(node.readPidFile()).contains(node.pid());
+        assertThat(node.isAlive()).isTrue();
+        assertThat(node.cli("status").exitCode()).isZero();
+
+        Files.deleteIfExists(stalePidFile);
+    }
+
+    /**
+     * The same refusal with a pid file that does not exist at all, which is the other half of the
+     * blind spot: there is then nothing to parse and nothing to {@code kill -0}, and the JMX port
+     * is the only thing that knows a node is already there.
+     */
+    @Test
+    @Order(6)
+    void startIsRefusedWhileTheNodeIsAlreadyAnswering() throws Exception {
+        Path absentPidFile = node.home().resolve("absent.pid");
+        Files.deleteIfExists(absentPidFile);
+
+        Commands.Result start = node.runWith(Map.of(), Duration.ofMinutes(3),
+                "bin/cassandra-opensearch", "start", "-d", "-p", absentPidFile.toString());
+
+        assertThat(start.exitCode()).as("start must be refused:%n%s", start.describe()).isNotZero();
+        assertThat(start.output()).contains("already answering");
+        assertThat(absentPidFile).doesNotExist();
+        assertThat(node.isAlive()).isTrue();
+    }
+
+    /**
      * Stops the node and holds the shutdown to its contract: OpenSearch first, then Cassandra,
      * then a process that exits by itself.
      */
     @Test
-    @Order(4)
+    @Order(7)
     void stopShutsDownInOrderAndTheProcessExitsOnItsOwn() {
         Commands.Result stop = node.stop();
 
@@ -150,7 +264,7 @@ class NodeLifecycleIT {
     }
 
     @Test
-    @Order(5)
+    @Order(8)
     void statusAfterStopExitsNonZeroAndSaysWhy() {
         Commands.Result status = node.cli("status");
 
@@ -166,7 +280,7 @@ class NodeLifecycleIT {
      * half-broken instead of failing.
      */
     @Test
-    @Order(6)
+    @Order(9)
     void theNodeReleasedEveryPortItHeld() throws Exception {
         assertThat(node.isAlive()).isFalse();
         NodeEndpoints endpoints = node.endpoints();

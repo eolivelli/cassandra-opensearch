@@ -101,10 +101,18 @@ public final class OpenSearchService implements EmbeddedService {
     private static final Duration DECOMMISSION_POLL_INTERVAL = Duration.ofSeconds(1);
     private static final long CLOSE_TIMEOUT_SECONDS = 30;
 
+    /**
+     * Upper bound on a {@code _cluster/settings} update, independent of the decommission's own
+     * deadline. {@code prepareDecommission} and {@code abortDecommission} must return promptly —
+     * the long wait belongs in {@code awaitDecommissionReady} — and a decommission timeout is
+     * sized for relocating shards (tens of minutes), not for a cluster-manager write.
+     */
+    private static final Duration SETTINGS_UPDATE_TIMEOUT = Duration.ofSeconds(30);
+
     /** Cluster-wide allocation filter; setting it to our node name drains this node's shards. */
     private static final String ALLOCATION_EXCLUDE_NAME = "cluster.routing.allocation.exclude._name";
 
-    /** Installs a JVM-wide deserialization filter; see {@link #buildSettings}. */
+    /** Installs a JVM-wide deserialization filter; see {@link #nodeEnvironment}. */
     private static final String BOOTSTRAP_SERIAL_FILTER = "bootstrap.serial_filter";
 
     private final AtomicReference<ServiceStatus> status = new AtomicReference<>(ServiceStatus.NEW);
@@ -137,11 +145,7 @@ public final class OpenSearchService implements EmbeddedService {
         status.set(ServiceStatus.STARTING);
         this.context = serviceContext;
         try {
-            Environment environment = InternalSettingsPreparer.prepareEnvironment(
-                    buildSettings(serviceContext),
-                    Map.of(),
-                    serviceContext.configDirectory(),
-                    OpenSearchService::defaultNodeName);
+            Environment environment = nodeEnvironment(serviceContext);
             this.nodeName = Node.NODE_NAME_SETTING.get(environment.settings());
 
             Node started = new EmbeddedNode(environment, List.of(EmbeddedNode.classpathPlugin(Netty4ModulePlugin.class)));
@@ -149,8 +153,13 @@ public final class OpenSearchService implements EmbeddedService {
             started.start();
 
             this.client = started.client();
-            this.clusterService = started.injector().getInstance(ClusterService.class);
-            this.nodeId = clusterService.localNode().getId();
+            // nodeId before clusterService, not the other way round: currentSnapshot() keys its
+            // memoised snapshot off clusterService being non-null and reads nodeId to find this
+            // node's shards, so publishing the service first lets a concurrent details() cache a
+            // snapshot built against a null node id and serve it until the cluster state moves.
+            ClusterService service = started.injector().getInstance(ClusterService.class);
+            this.nodeId = service.localNode().getId();
+            this.clusterService = service;
             this.httpAddress = started.injector().getInstance(HttpServerTransport.class)
                     .boundAddress().publishAddress().toString();
             this.transportAddress = started.injector().getInstance(TransportService.class)
@@ -166,6 +175,57 @@ public final class OpenSearchService implements EmbeddedService {
             closeQuietly();
             throw new ServiceException(NAME, "OpenSearch failed to start", failure);
         }
+    }
+
+    /**
+     * The {@link Environment} {@link #start} hands to the {@link Node}: the layered settings, run
+     * through {@link InternalSettingsPreparer}, with {@code bootstrap.serial_filter} taken back
+     * out.
+     *
+     * <p>Package-private so a test can assert on exactly what the node is constructed with.
+     */
+    Environment nodeEnvironment(ServiceContext serviceContext) throws Exception {
+        Environment prepared = InternalSettingsPreparer.prepareEnvironment(
+                buildSettings(serviceContext),
+                Map.of(),
+                serviceContext.configDirectory(),
+                OpenSearchService::defaultNodeName);
+        return withoutSerialFilter(prepared, serviceContext);
+    }
+
+    /**
+     * Removes {@code bootstrap.serial_filter} from an assembled environment.
+     *
+     * <p>The setting is not OpenSearch's to enable here: where it exists, {@code Node.<init>}
+     * turns it into a process-wide {@link java.io.ObjectInputFilter} that rejects every Java
+     * deserialization, which would break Cassandra's JMX/RMI and internal serialization in the
+     * same JVM. It is dropped rather than set to {@code false}, because {@code opensearch-3.7.0}
+     * does not declare it at all — {@code BootstrapSettings} has only
+     * {@code SECURITY_FILTER_BAD_DEFAULTS}, {@code MEMORY_LOCK}, {@code SYSTEM_CALL_FILTER} and
+     * {@code CTRLHANDLER}, and no class in the jar so much as mentions {@code serial_filter} — so
+     * on today's version leaving it in is an {@code unknown setting} start failure, and on a
+     * future version that knows it, it is the hazard above. Dropping it covers both.
+     *
+     * <p>This happens <b>after</b> {@link InternalSettingsPreparer}, and that is the whole point.
+     * Stripping the key from the builder handed to {@code prepareEnvironment} neutralises nothing:
+     * that method discards the assembled builder, re-reads {@code <configDir>/opensearch.yml} as
+     * the base layer and puts our settings on top, and {@code Settings.Builder.put(Settings)} is a
+     * {@code putAll} — additive, with no way to express a removal. A key present in the operator's
+     * file survives the round trip; only a removal applied to {@code environment.settings()}
+     * afterwards actually removes it.
+     */
+    private static Environment withoutSerialFilter(Environment prepared, ServiceContext serviceContext) {
+        if (!prepared.settings().hasValue(BOOTSTRAP_SERIAL_FILTER)) {
+            return prepared;
+        }
+        Settings.Builder stripped = Settings.builder().put(prepared.settings());
+        stripped.remove(BOOTSTRAP_SERIAL_FILTER);
+        serviceContext.reportEvent("WARN", "opensearch.setting.ignored",
+                BOOTSTRAP_SERIAL_FILTER + " installs a JVM-wide deserialization filter that would"
+                        + " break Cassandra in this process; the setting has been dropped");
+        // Same config directory, so every path Environment derives comes out identical; only the
+        // settings map differs.
+        return new Environment(stripped.build(), prepared.configDir());
     }
 
     /**
@@ -190,17 +250,6 @@ public final class OpenSearchService implements EmbeddedService {
         put(builder, "http.port", supervisor.get(SETTING_HTTP_PORT));
         put(builder, "transport.port", supervisor.get(SETTING_TRANSPORT_PORT));
         put(builder, "network.host", supervisor.get(SETTING_NETWORK_HOST));
-
-        // bootstrap.serial_filter is not OpenSearch's to enable here: where it exists, Node.<init>
-        // turns it into a process-wide ObjectInputFilter that rejects every Java deserialization,
-        // which would break Cassandra's in the same JVM. Dropped rather than set to false, since
-        // 3.7.0 does not know the setting at all and rejects unknown ones; this keeps the hazard
-        // neutralised across an upgrade to a version that does.
-        if (builder.remove(BOOTSTRAP_SERIAL_FILTER) != null) {
-            serviceContext.reportEvent("WARN", "opensearch.setting.ignored",
-                    BOOTSTRAP_SERIAL_FILTER + " installs a JVM-wide deserialization filter that would"
-                            + " break Cassandra in this process; the setting has been dropped");
-        }
 
         return builder
                 .put("path.home", serviceContext.homeDirectory().toAbsolutePath().toString())
@@ -292,6 +341,14 @@ public final class OpenSearchService implements EmbeddedService {
         client = null;
         clusterService = null;
         snapshot = null;
+        // The identity fields go too. They are set one at a time as start() gets further, so after
+        // a failure they describe a node that never came up — and details() would advertise its
+        // name, id and listen addresses next to a status of FAILED, which reads as a node that is
+        // there and merely unhealthy. Nothing is listening on those addresses.
+        nodeName = null;
+        nodeId = null;
+        httpAddress = null;
+        transportAddress = null;
         if (failed == null) {
             return;
         }
@@ -310,35 +367,49 @@ public final class OpenSearchService implements EmbeddedService {
         return status.get();
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Callable from any thread at any point in the lifecycle, so nothing in here may propagate:
+     * a node being closed underneath this call can throw from {@code ClusterService.state()}, and
+     * the health monitor that polls this is not the place to find out.
+     */
     @Override
     public Map<String, String> details() {
         Map<String, String> details = new LinkedHashMap<>();
         details.put("status", status.get().name());
-        if (nodeName != null) {
-            details.put("node.name", nodeName);
-        }
-        if (nodeId != null) {
-            details.put("node.id", nodeId);
-        }
-        if (httpAddress != null) {
-            details.put("http.address", httpAddress);
-            details.put("transport.address", transportAddress);
-        }
-        ClusterSnapshot current = currentSnapshot();
-        if (current != null) {
-            details.put("cluster.name", current.clusterName());
-            details.put("cluster.health", current.healthStatus());
-            details.put("shards.total", Integer.toString(current.shards()));
-            details.put("shards.primaries", Integer.toString(current.primaries()));
-            details.put("shards.relocating", Integer.toString(current.relocating()));
-            details.put("shards.initializing", Integer.toString(current.initializing()));
+        try {
+            String name = nodeName;
+            if (name != null) {
+                details.put("node.name", name);
+            }
+            String id = nodeId;
+            if (id != null) {
+                details.put("node.id", id);
+            }
+            String http = httpAddress;
+            if (http != null) {
+                details.put("http.address", http);
+                details.put("transport.address", transportAddress);
+            }
+            ClusterSnapshot current = currentSnapshot();
+            if (current != null) {
+                details.put("cluster.name", current.clusterName());
+                details.put("cluster.health", current.healthStatus());
+                details.put("shards.total", Integer.toString(current.shards()));
+                details.put("shards.primaries", Integer.toString(current.primaries()));
+                details.put("shards.relocating", Integer.toString(current.relocating()));
+                details.put("shards.initializing", Integer.toString(current.initializing()));
+            }
+        } catch (Throwable failure) {
+            details.put("detailsError", failure.toString());
         }
         return details;
     }
 
     /**
      * @return the derived view of the last applied cluster state, or null if the node is not
-     *         running. Recomputed only when the cluster state version has moved on.
+     *         running. Recomputed only when the applied state has actually changed.
      */
     private ClusterSnapshot currentSnapshot() {
         ClusterService service = clusterService;
@@ -347,7 +418,7 @@ public final class OpenSearchService implements EmbeddedService {
         }
         ClusterState state = service.state();
         ClusterSnapshot cached = snapshot;
-        if (cached != null && cached.version() == state.version()) {
+        if (cached != null && cached.stateUuid().equals(state.stateUUID())) {
             return cached;
         }
         ClusterSnapshot fresh = ClusterSnapshot.of(state, nodeId);
@@ -368,7 +439,7 @@ public final class OpenSearchService implements EmbeddedService {
                     // rebuilt node of the same name from ever holding shards again.
                     .setTransientSettings(Settings.builder().put(ALLOCATION_EXCLUDE_NAME, exclusion))
                     .execute()
-                    .actionGet(TimeValue.timeValueMillis(decommission.timeout().toMillis()));
+                    .actionGet(settingsUpdateTimeout(decommission));
         } catch (Throwable failure) {
             throw new ServiceException(NAME, "failed to exclude " + nodeName + " from shard allocation", failure);
         }
@@ -422,7 +493,7 @@ public final class OpenSearchService implements EmbeddedService {
                 client.admin().cluster().prepareUpdateSettings()
                         .setTransientSettings(update)
                         .execute()
-                        .actionGet(TimeValue.timeValueMillis(decommission.timeout().toMillis()));
+                        .actionGet(settingsUpdateTimeout(decommission));
             } catch (Throwable failure) {
                 throw new ServiceException(NAME,
                         "failed to re-admit " + nodeName + " to shard allocation; the node stays"
@@ -434,14 +505,42 @@ public final class OpenSearchService implements EmbeddedService {
         decommission.reportProgress(-1, "re-admitted " + nodeName + " to shard allocation");
     }
 
-    /** The names in {@code cluster.routing.allocation.exclude._name}, in the order they appear. */
+    /**
+     * The names in the <i>transient</i> {@code cluster.routing.allocation.exclude._name}, in the
+     * order they appear.
+     *
+     * <p>Deliberately not {@code metadata().settings()}, which is the persistent and transient
+     * layers merged. Reading the merged view means copying whatever an operator put in the
+     * persistent layer into the transient one, and the transient copy then outlives its source:
+     * remove the persistent entry and the node it named stays excluded, by a setting nobody wrote
+     * and nothing will clear. This service writes only the transient layer, so it reads only the
+     * transient layer, and {@link #abortDecommission} leaves it exactly as it found it.
+     *
+     * <p>The cost is that a <i>persistent</i> exclusion for another node is shadowed for as long
+     * as ours is in force, because transient wins over persistent for the same key. That window is
+     * the decommission, it is visible in {@code _cluster/settings}, and it ends when this node's
+     * exclusion is cleared — which is a better trade than a transient entry with no owner.
+     *
+     * <p>Best-effort in one further respect: this reads the locally applied cluster state, which
+     * can lag the cluster manager. A concurrent exclusion applied elsewhere in the same instant is
+     * not visible here and would be overwritten by the update that follows.
+     */
     private static Set<String> currentExclusions(ClusterState state) {
         Set<String> names = new LinkedHashSet<>();
-        String existing = state.metadata().settings().get(ALLOCATION_EXCLUDE_NAME);
+        String existing = state.metadata().transientSettings().get(ALLOCATION_EXCLUDE_NAME);
         if (existing != null && !existing.isBlank()) {
             Arrays.stream(existing.split(",")).map(String::trim).filter(s -> !s.isEmpty()).forEach(names::add);
         }
         return names;
+    }
+
+    /**
+     * @return how long to wait for a {@code _cluster/settings} update, never more than
+     *         {@link #SETTINGS_UPDATE_TIMEOUT} however long the decommission itself may run
+     */
+    private static TimeValue settingsUpdateTimeout(DecommissionContext decommission) {
+        long millis = Math.min(decommission.timeout().toMillis(), SETTINGS_UPDATE_TIMEOUT.toMillis());
+        return TimeValue.timeValueMillis(Math.max(1, millis));
     }
 
     @Override

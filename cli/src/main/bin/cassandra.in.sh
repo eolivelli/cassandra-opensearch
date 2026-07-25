@@ -81,7 +81,30 @@ JVM_VERSION="$jvm_feature_version"
 # Left unset on purpose: JAVA_AGENT. The fork's include always adds
 # -javaagent:$CASSANDRA_HOME/lib/jamm-0.4.0.jar, which is not part of this layout and would make
 # every tool fail to start.
-for opt in $(grep -E '^(--|-D)' "$CASSANDRA_CONF/jvm21-server.options"); do
+#
+# The missing-file case is fatal and has to be checked before the loop, not inside it: `for opt in
+# $(grep ...)` over a file that is not there iterates zero times and leaves JVM_OPTS empty, and
+# nodetool then dies with "IllegalAccessError: module java.rmi does not export sun.rmi.registry"
+# a long way from the cause. A conf/ directory mounted over the shipped one is how that happens.
+if [ ! -r "$CASSANDRA_CONF/jvm21-server.options" ]; then
+    echo "cassandra.in.sh: missing $CASSANDRA_CONF/jvm21-server.options." >&2
+    echo "  The Cassandra tools need its --add-exports and --add-opens entries; without them" >&2
+    echo "  nodetool fails with IllegalAccessError on sun.rmi.registry. Restore the file or set" >&2
+    echo "  CASSANDRA_OPENSEARCH_CONF to a directory that has it." >&2
+    exit 1
+fi
+
+# Dropped for the tools only: --add-modules jdk.incubator.vector is there for jvector and Lucene
+# inside the server, and no tool touches either - but every JDK that loads an incubator module
+# prints "WARNING: Using incubator modules" first, on every single nodetool invocation.
+JVM_OPTS_FROM_FILE=$(grep -E '^(--|-D)' "$CASSANDRA_CONF/jvm21-server.options" \
+    | grep -v '^--add-modules[ =]*jdk.incubator.vector' || true)
+if [ -z "$JVM_OPTS_FROM_FILE" ]; then
+    echo "cassandra.in.sh: $CASSANDRA_CONF/jvm21-server.options carries no --add-exports," >&2
+    echo "  --add-opens or -D entries. nodetool cannot run without them." >&2
+    exit 1
+fi
+for opt in $JVM_OPTS_FROM_FILE; do
     JVM_OPTS="$JVM_OPTS $opt"
 done
 

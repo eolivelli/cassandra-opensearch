@@ -110,6 +110,45 @@ class NodeConfigurationTest {
                 .hasMessageContaining("Known settings here");
     }
 
+    /**
+     * S5. {@code directories} was the one section that did not reject what it did not know.
+     *
+     * <p>The consequence is quiet and expensive: {@code dta:} is accepted, {@code data} keeps its
+     * default, and the node's SSTables and commit log go under the installation directory — which
+     * the next upgrade replaces. The README, the shipped configuration file and this class's own
+     * javadoc all promise that cannot happen.
+     */
+    @Test
+    void rejectsATypoInTheDirectoriesSection() {
+        assertThatThrownBy(() -> load("""
+                directories:
+                  dta: /var/lib/cassandra-opensearch
+                  logs: /var/log/cassandra-opensearch
+                services:
+                  cassandra: {}
+                  opensearch: {}
+                """))
+                .isInstanceOf(ConfigurationException.class)
+                .hasMessageContaining("dta")
+                .hasMessageContaining("directories")
+                .hasMessageContaining("Known settings here");
+    }
+
+    @Test
+    void readsTheDirectoriesItDoesKnow() throws Exception {
+        NodeConfiguration configuration = load("""
+                directories:
+                  data: var/data
+                  logs: var/logs
+                services:
+                  cassandra: {}
+                  opensearch: {}
+                """);
+
+        assertThat(configuration.dataDirectory()).isEqualTo(home.resolve("var/data"));
+        assertThat(configuration.logsDirectory()).isEqualTo(home.resolve("var/logs"));
+    }
+
     @Test
     void rejectsATopLevelTypo() {
         assertThatThrownBy(() -> load("""
@@ -148,6 +187,76 @@ class NodeConfigurationTest {
                 .hasMessageContaining("between 1 and 65535");
     }
 
+    /**
+     * A fractional port is a typo, and truncating it produces a node listening somewhere the
+     * operator did not ask for. {@code Number.intValue()} used to do exactly that.
+     */
+    @Test
+    void rejectsANumberThatIsNotWhole() {
+        assertThatThrownBy(() -> load("""
+                services:
+                  cassandra: {}
+                  opensearch:
+                    http_port: 9200.7
+                """))
+                .isInstanceOf(ConfigurationException.class)
+                .hasMessageContaining("http_port")
+                .hasMessageContaining("whole number")
+                .hasMessageContaining("9200.7");
+    }
+
+    /**
+     * And a value too large for an {@code int} used to wrap round: {@code 4294967296} narrowed to
+     * {@code 0}, which the port check then reported as "found 0" — naming a value nobody wrote and
+     * sending the operator looking for a bug that is not there.
+     */
+    @Test
+    void rejectsAnIntegerTooLargeToNarrowInsteadOfWrappingIt() {
+        assertThatThrownBy(() -> load("""
+                services:
+                  cassandra: {}
+                  opensearch:
+                    http_port: 4294967296
+                """))
+                .isInstanceOf(ConfigurationException.class)
+                .hasMessageContaining("http_port")
+                .hasMessageContaining("4294967296");
+    }
+
+    /**
+     * Zero reached {@code scheduleWithFixedDelay} and failed there with a bare
+     * {@code IllegalArgumentException: null}, from a stack that names neither the file nor the key.
+     */
+    @Test
+    void rejectsANonPositiveDuration() {
+        assertThatThrownBy(() -> load("""
+                services:
+                  cassandra: {}
+                  opensearch: {}
+                supervisor:
+                  health_check_interval: 0s
+                """))
+                .isInstanceOf(ConfigurationException.class)
+                .hasMessageContaining("health_check_interval")
+                .hasMessageContaining("positive duration");
+
+        assertThatThrownBy(() -> load("""
+                services:
+                  cassandra:
+                    startup_timeout: -5m
+                  opensearch: {}
+                """))
+                .isInstanceOf(ConfigurationException.class)
+                .hasMessageContaining("startup_timeout")
+                .hasMessageContaining("positive duration");
+    }
+
+    /**
+     * Duplicate keys and syntax errors arrive from snakeyaml as snakeyaml's own exceptions. Left
+     * unwrapped they escape past every caller's {@code ConfigurationException} handler — including
+     * {@code CassandraOpenSearchServer.run}, which then prints a parser stack trace instead of the
+     * message. The position snakeyaml worked out is the useful half and has to survive.
+     */
     @Test
     void rejectsDuplicateKeys() {
         assertThatThrownBy(() -> load("""
@@ -157,7 +266,24 @@ class NodeConfigurationTest {
                   cassandra: {}
                   opensearch: {}
                 """))
-                .isInstanceOf(Exception.class);
+                .isInstanceOf(ConfigurationException.class)
+                .hasMessageContaining("cassandra-opensearch.yaml")
+                .hasMessageContaining("duplicate key")
+                .hasMessageContaining("cluster_name")
+                .hasMessageContaining("line 2");
+    }
+
+    @Test
+    void reportsAYamlSyntaxErrorWithItsPosition() {
+        assertThatThrownBy(() -> load("""
+                services:
+                  cassandra: {}
+                   opensearch: {}
+                """))
+                .isInstanceOf(ConfigurationException.class)
+                .hasMessageContaining("cassandra-opensearch.yaml")
+                .hasMessageContaining("not valid YAML")
+                .hasMessageContaining("line 3");
     }
 
     @Test

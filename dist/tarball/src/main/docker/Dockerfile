@@ -17,8 +17,10 @@ LABEL org.opencontainers.image.title="cassandra-opensearch" \
       org.opencontainers.image.description="An Apache Cassandra node and an OpenSearch node in one JVM, isolated by ClassLoader" \
       org.opencontainers.image.source="https://github.com/eolivelli/cassandra-opensearch"
 
-# procps for `ps`, which the launcher's daemon mode and any operator debugging need; the JRE
-# image has neither it nor `kill -0`'s friends. Kept to one layer and cleaned in the same step.
+# procps for `ps` and `top`. Nothing in bin/ uses them - the launcher's daemon mode tests liveness
+# with `kill -0`, which is a shell builtin - so this is purely so that `docker exec ... ps` works
+# for an operator looking at a container that is misbehaving. Kept to one layer and cleaned in the
+# same step.
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends procps; \
@@ -39,13 +41,19 @@ RUN set -eux; \
 ENV CASSANDRA_OPENSEARCH_HOME=/opt/cassandra-opensearch
 ENV PATH="$CASSANDRA_OPENSEARCH_HOME/bin:$PATH"
 
-# ADD unpacks a local tarball; the extra directory level from the archive's own root is stripped
-# by moving it, so the image path does not carry the version.
-ADD ${DIST_ARCHIVE} /opt/
+# ADD unpacks a local tarball. --chown does the ownership in the same layer that writes the files:
+# a later `chown -R` rewrites the metadata of every file, and a layer diff has no way to express
+# that except by copying all ~130 MB of the distribution a second time.
+#
+# The version-free path is a symlink for the same reason - `mv` moves the whole tree into a second
+# layer, which costs another full copy. The launcher resolves its installation root with `cd -P`,
+# so CASSANDRA_OPENSEARCH_HOME lands on the versioned directory the symlink points at, and both
+# spellings name the same files.
+ADD --chown=1000:1000 ${DIST_ARCHIVE} /opt/
 RUN set -eux; \
-    mv "/opt/${DIST_NAME}" "$CASSANDRA_OPENSEARCH_HOME"; \
-    mkdir -p "$CASSANDRA_OPENSEARCH_HOME/data" "$CASSANDRA_OPENSEARCH_HOME/logs"; \
-    chown -R 1000:1000 "$CASSANDRA_OPENSEARCH_HOME"
+    ln -s "/opt/${DIST_NAME}" "$CASSANDRA_OPENSEARCH_HOME"; \
+    mkdir -p "/opt/${DIST_NAME}/data" "/opt/${DIST_NAME}/logs"; \
+    chown 1000:1000 "/opt/${DIST_NAME}/data" "/opt/${DIST_NAME}/logs"
 
 USER 1000:1000
 WORKDIR $CASSANDRA_OPENSEARCH_HOME
@@ -64,8 +72,24 @@ VOLUME ["/opt/cassandra-opensearch/data", "/opt/cassandra-opensearch/logs"]
 # set whenever the bind address is 0.0.0.0.
 #
 # The supervisor's JMX port (7299) is deliberately not published: the connector is
-# unauthenticated and bound to loopback, so `status`, `stop` and `decommission` are meant to be
-# run with `docker exec`. Publishing it means putting a password file behind it first.
+# unauthenticated and bound to loopback, so anything that talks to it has to run inside the
+# container. Publishing it means putting a password file behind it first.
+#
+#   docker exec <container> cassandra-opensearch status         what the supervisor reports
+#   docker exec <container> cassandra-opensearch decommission   leave both clusters, then exit
+#   docker stop <container>                                     ordered shutdown
+#
+# `docker stop`, and not `docker exec ... stop`: the CMD below runs the node in the foreground as
+# pid 1, and SIGTERM is what the supervisor's shutdown hook is waiting for. `docker exec ...
+# stop` does reach the same shutdown - the foreground launcher writes the pid file too, so it
+# finds pid 1 and signals it - but the exec is itself a process inside the container, so it is
+# killed along with everything else the moment pid 1 exits and reports 137 for a shutdown that
+# actually succeeded. `docker stop` sends the same signal and waits for the container.
+#
+# Give it room: `docker stop` sends SIGKILL after 10 seconds by default, and the ordered shutdown
+# takes about 8 on an idle single-node process - longer with data to drain. Use
+# `docker run --stop-timeout` or `docker stop -t`, because a SIGKILLed Cassandra replays its
+# commit log on the next start.
 EXPOSE 7000 7199 9042 9200 9300
 
 # The defaults the launcher would otherwise pick, named here so `docker run -e` can change them.

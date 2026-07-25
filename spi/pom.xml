@@ -43,10 +43,21 @@
                 </banTransitiveDependencies>
                 <bannedDependencies>
                   <searchTransitive>true</searchTransitive>
-                  <excludes><exclude>*:*:*:*:compile</exclude><exclude>*:*:*:*:runtime</exclude></excludes>
+                  <!-- `provided` and `system` are on this list for the same reason as `compile`:
+                       both put the type on the SPI's own compile classpath, so a class here can
+                       reference it, and both then leave the supervisor to supply it at runtime —
+                       which means supplying it on the parent loader, visible inside every
+                       isolated loader. That is exactly the leak this module exists to prevent,
+                       arrived at by a route that used to pass `validate` silently. -->
+                  <excludes>
+                    <exclude>*:*:*:*:compile</exclude>
+                    <exclude>*:*:*:*:runtime</exclude>
+                    <exclude>*:*:*:*:provided</exclude>
+                    <exclude>*:*:*:*:system</exclude>
+                  </excludes>
                   <message>
-                    No compile/runtime dependency may be added to the SPI module. Test-scoped
-                    dependencies are fine: they never reach the isolated loaders.
+                    No compile/runtime/provided/system dependency may be added to the SPI module.
+                    Test-scoped dependencies are fine: they never reach the isolated loaders.
                   </message>
                 </bannedDependencies>
               </rules>

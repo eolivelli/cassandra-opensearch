@@ -10,17 +10,30 @@
 #   ring              nodetool status, from node 1
 #   health            OpenSearch cluster health and node list, from node 1
 #   decommission n    retire node n through the coupled procedure
-#   destroy           stop everything and delete the cluster directory
+#   destroy [-f]      stop everything and delete the cluster directory
+#
+# Options:
+#   -d DIRECTORY      the cluster directory (default ./cluster)
+#   -f                destroy: delete even if a node could not be stopped
 #
 set -euo pipefail
 
 CLUSTER_DIR="$(pwd)/cluster"
+FORCE=no
 
-while getopts ":d:h" opt; do
+# The comment block above, printed from line 2 up to the first line that is not a comment. A fixed
+# line range goes stale the moment a line is added to it, which is how `set -euo pipefail` used to
+# end up in the help output.
+usage() {
+    awk 'NR == 1 { next } /^#/ { print; next } { exit }' "$0" >&2
+}
+
+while getopts ":d:fh" opt; do
     case "$opt" in
         d) CLUSTER_DIR=$OPTARG ;;
-        h) sed -n '2,15p' "$0" >&2; exit 2 ;;
-        *) sed -n '2,15p' "$0" >&2; exit 2 ;;
+        f) FORCE=yes ;;
+        h) usage; exit 2 ;;
+        *) usage; exit 2 ;;
     esac
 done
 shift $((OPTIND - 1))
@@ -48,6 +61,9 @@ in_node() { # in_node <n> <script> [args...]
 }
 
 all_nodes() { seq 1 "$CLUSTER_NODES"; }
+# Reverse order, for shutdown. `seq <n> -1 1` and not `| tac`: macOS has no tac, and these scripts
+# are documented as working there.
+all_nodes_reverse() { seq "$CLUSTER_NODES" -1 1; }
 
 start_node() {
     local n=$1
@@ -55,10 +71,17 @@ start_node() {
     in_node "$n" cassandra-opensearch start -d
 }
 
+# Records rather than swallows a failure. `destroy` deletes the data directory of every node it
+# stopped, and doing that to a node that is still running is how a JVM ends up writing sstables
+# into a directory that no longer exists.
+STOP_FAILURES=""
 stop_node() {
     local n=$1
     echo "==> stopping node$n"
-    in_node "$n" cassandra-opensearch stop || true
+    if ! in_node "$n" cassandra-opensearch stop; then
+        echo "    node$n did not stop cleanly" >&2
+        STOP_FAILURES="$STOP_FAILURES $n"
+    fi
 }
 
 case "$COMMAND" in
@@ -76,17 +99,18 @@ case "$COMMAND" in
             done
         fi
         echo
-        echo "Cluster is up. Check it with: $0 -d $CLUSTER_DIR ring"
+        echo "Cluster is up. Check it with: $0 -d '$CLUSTER_DIR' ring"
         ;;
 
     stop)
         if [ -n "$NODE" ]; then
             stop_node "$NODE"
         else
-            for n in $(all_nodes | tac); do
+            for n in $(all_nodes_reverse); do
                 stop_node "$n"
             done
         fi
+        [ -z "$STOP_FAILURES" ] || { echo "error: node(s)$STOP_FAILURES did not stop" >&2; exit 1; }
         ;;
 
     status)
@@ -111,7 +135,7 @@ case "$COMMAND" in
 
     decommission)
         [ -z "$NODE" ] && { echo "error: decommission needs a node number" >&2; exit 2; }
-        # --force is required below three nodes: system_distributed and system_auth are RF 3, so
+        # --force is required below four nodes: system_distributed and system_auth are RF 3, so
         # Cassandra refuses an unforced decommission that would drop the ring under the
         # replication factor. At four or more nodes the unforced path works.
         force=""
@@ -124,15 +148,23 @@ case "$COMMAND" in
         ;;
 
     destroy)
-        for n in $(all_nodes | tac); do
+        for n in $(all_nodes_reverse); do
             stop_node "$n"
         done
+        # A node that would not stop is still running, with open file handles into the directory
+        # about to be deleted. Deleting it anyway leaves a JVM writing sstables and OpenSearch
+        # translog into unlinked inodes, holding its ports until somebody finds and kills it.
+        if [ -n "$STOP_FAILURES" ] && [ "$FORCE" = no ]; then
+            echo "error: node(s)$STOP_FAILURES did not stop; refusing to delete $CLUSTER_DIR" >&2
+            echo "       Stop them by hand, or re-run with -f to delete anyway." >&2
+            exit 1
+        fi
         echo "==> removing $CLUSTER_DIR"
         rm -rf "$CLUSTER_DIR"
         ;;
 
     *)
-        sed -n '2,15p' "$0" >&2
+        usage
         exit 2
         ;;
 esac

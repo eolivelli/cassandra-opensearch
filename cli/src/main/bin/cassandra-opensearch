@@ -90,8 +90,14 @@ EOF
 # Builds the full JVM command line into the positional parameters. Paths go in as separate
 # quoted entries so that an installation directory with a space in it still works.
 set_java_arguments() {
-    # shellcheck disable=SC2046  # word splitting is the point; see co_jvm_options
-    set -- $(co_jvm_options) $(shared_properties)
+    # Captured and tested rather than expanded inline: co_jvm_options runs in a subshell inside a
+    # command substitution, so a failure there cannot end this script by itself. Expanding it
+    # straight into `set --` would leave the JVM with no --add-exports and no --add-opens, and
+    # `set --` itself succeeds, so the script would go on to start it.
+    _co_jvm_options=$(co_jvm_options) || exit 1
+
+    # shellcheck disable=SC2046,SC2086  # word splitting is the point; see co_jvm_options
+    set -- $_co_jvm_options $(shared_properties)
 
     set -- "$@" \
         "-Dcassandra-opensearch.home=$CO_HOME" \
@@ -146,20 +152,57 @@ run_cli() {
         --jmx-host "$CO_JMX_HOST" --jmx-port "$CO_JMX_PORT" $CLI_ARGS
 }
 
+# Refuses to start when this node is already up. Two independent checks, because each alone has a
+# blind spot that the other covers:
+#
+#   - The JMX port is the authority on "a node is serving here", and it is the check the pid file
+#     cannot make. A pid file that is missing, stale or unparseable used to let a second JVM
+#     launch, fail on BindException and die - while the -d wait loop below, polling the same
+#     JMX host and port, connected to the node that was ALREADY running and reported success. The
+#     pid file then named a dead process, and `stop` refused to touch the live one.
+#   - The pid file is the authority when the node is still starting up and its JMX port is not
+#     answering yet, which is precisely the window the check above cannot see.
+refuse_if_running() {
+    if supervisor_answers; then
+        co_die "a node is already answering on $CO_JMX_HOST:$CO_JMX_PORT. Stop it first, or point
+  CASSANDRA_OPENSEARCH_JMX_HOST and CASSANDRA_OPENSEARCH_JMX_PORT at a different node."
+    fi
+
+    [ -f "$PIDFILE" ] || return 0
+    _co_recorded=$(cat "$PIDFILE" 2> /dev/null || true)
+    case "$_co_recorded" in
+        # Empty or not a number: there is no process to protect, and refusing on a corrupt file
+        # would leave the operator with a node that cannot be started at all.
+        '' | *[!0-9]*) return 0 ;;
+    esac
+    # Our own pid, from a foreground start that exited without clearing the file: `docker restart`
+    # arrives here as pid 1 both times, so the file would otherwise name us.
+    [ "$_co_recorded" != "$$" ] || return 0
+    if kill -0 "$_co_recorded" 2> /dev/null; then
+        co_die "already running as pid $_co_recorded (from $PIDFILE)"
+    fi
+}
+
 start() {
     co_require_java_21
     mkdir -p "$CO_LOGS"
     # cd so that a relative path in the configuration resolves against the installation and not
     # against wherever the operator happened to be standing.
     cd "$CO_HOME"
+    # Before any of the running checks: a missing conf/jvm21-server.options is a fatal
+    # misconfiguration and saying so costs nothing, whereas the checks below start a JVM.
     set_java_arguments
+    refuse_if_running
 
     if [ "$DAEMON" = no ]; then
+        # The pid file is written in the foreground too, not just under -d. exec replaces this
+        # shell with the JVM and keeps its pid, so $$ is the JVM's pid, which is what makes
+        # `start` in one terminal and `stop` in another work - and what makes the container's
+        # `status` usable. It is deliberately NOT removed on exit: exec means there is no shell
+        # left to run a trap, so a foreground node that has exited leaves a stale file behind and
+        # refuse_if_running is what has to cope with that.
+        echo "$$" > "$PIDFILE"
         eval "exec \"\$JAVA\" $JAVA_ARGUMENTS"
-    fi
-
-    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2> /dev/null; then
-        co_die "already running as pid $(cat "$PIDFILE") (from $PIDFILE)"
     fi
 
     _log="$CO_LOGS/cassandra-opensearch.log"
@@ -178,6 +221,14 @@ start() {
             co_die "the process exited during startup; see $_log"
         fi
         if supervisor_answers; then
+            # An answer on the JMX port is not by itself proof that OUR process is the one giving
+            # it - it is a host and a port, and anything listening there answers. Confirm the
+            # process we launched is still alive before calling this a successful start.
+            if ! kill -0 "$_pid" 2> /dev/null; then
+                rm -f "$PIDFILE"
+                co_die "something is answering on $CO_JMX_HOST:$CO_JMX_PORT, but the process this
+  command started (pid $_pid) has exited. That address belongs to another node; see $_log."
+            fi
             echo "up; supervisor JMX on $CO_JMX_HOST:$CO_JMX_PORT"
             return 0
         fi

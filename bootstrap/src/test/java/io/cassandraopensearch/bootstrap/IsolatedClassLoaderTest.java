@@ -8,6 +8,7 @@
 package io.cassandraopensearch.bootstrap;
 
 import io.cassandraopensearch.spi.EmbeddedService;
+import io.cassandraopensearch.spi.ServiceException;
 import io.cassandraopensearch.spi.ServiceStatus;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -15,10 +16,20 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.net.URL;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Deque;
+import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowable;
 
 /**
  * Proves the isolation properties the whole design rests on, using a service implementation
@@ -126,10 +137,252 @@ class IsolatedClassLoaderTest {
 
             // The probe throws an exception class that exists only inside its own jar. The
             // supervisor must still get something it can load, print and log.
-            assertThatThrownBy(() -> service.start(context))
-                    .isInstanceOf(io.cassandraopensearch.spi.ServiceException.class)
+            Throwable thrown = catchThrowable(() -> service.start(context));
+            assertThat(thrown)
+                    .isInstanceOf(ServiceException.class)
                     .hasMessageContaining("probe was asked to fail");
+
+            // The assertions above pass whether or not the cause chain was translated, which is
+            // the whole failure mode: the exception at the top is a ServiceException because the
+            // probe made it one, and everything interesting is underneath it. That the *cause* is
+            // loadable here is the property being tested.
+            assertThat(unloadableTypesIn(thrown))
+                    .as("every link of the chain the supervisor receives must be a type it can load")
+                    .isEmpty();
+            assertThat(causeChainOf(thrown))
+                    .as("the isolated failure must still be legible, not erased")
+                    .anySatisfy(link -> assertThat(link.getMessage())
+                            .contains("probe.ProbeService$ProbeFailure")
+                            .contains("thrown from inside the isolated loader"));
         }
+    }
+
+    /**
+     * The defect this pins: nothing in {@code bootstrap} used to translate at all, so an
+     * exception class that exists only in the service's own jar arrived at the supervisor exactly
+     * as thrown. Two things follow, and the second is the expensive one — the supervisor cannot
+     * print it without a {@link NoClassDefFoundError}, and anything that retains it retains the
+     * isolated ClassLoader and every class behind it.
+     */
+    @Test
+    void aRawIsolatedExceptionIsWrappedBeforeItReachesTheSupervisor() throws Exception {
+        try (IsolatedService service = IsolatedService.create("probe", IMPL, classpath())) {
+            RecordingServiceContext context = new RecordingServiceContext();
+            context.settings().put("probe.failOnStart", "raw");
+
+            Throwable thrown = catchThrowable(() -> service.start(context));
+
+            assertThat(thrown).isInstanceOf(ServiceException.class);
+            assertThat(((ServiceException) thrown).getOriginalType())
+                    .as("the original type has to survive as data, since it cannot survive as a type")
+                    .isEqualTo("probe.ProbeService$ProbeFailure");
+            assertThat(((ServiceException) thrown).getServiceName()).isEqualTo("probe");
+            assertThat(thrown).hasMessageContaining("raw failure from inside the isolated loader");
+            assertThat(unloadableTypesIn(thrown)).isEmpty();
+
+            // ...and the type it replaced is genuinely one the supervisor could not have held.
+            assertThatThrownBy(() ->
+                    Class.forName("probe.ProbeService$ProbeFailure", false, getClass().getClassLoader()))
+                    .isInstanceOf(ClassNotFoundException.class);
+        }
+    }
+
+    /** Same for an {@link Error}: {@code catch (Exception)} would have let this one straight out. */
+    @Test
+    void aRawIsolatedErrorIsWrappedToo() throws Exception {
+        try (IsolatedService service = IsolatedService.create("probe", IMPL, classpath())) {
+            RecordingServiceContext context = new RecordingServiceContext();
+            context.settings().put("probe.failOnStart", "raw-error");
+
+            Throwable thrown = catchThrowable(() -> service.start(context));
+
+            assertThat(thrown).isInstanceOf(ServiceException.class);
+            assertThat(((ServiceException) thrown).getOriginalType())
+                    .isEqualTo("probe.ProbeService$ProbeError");
+            assertThat(unloadableTypesIn(thrown)).isEmpty();
+        }
+    }
+
+    /**
+     * The other half of the rule. Translating unconditionally would bury every ordinary failure
+     * under a wrapper and break callers that legitimately match on the type — the runtimes' own
+     * tests assert {@code ServiceException} with a particular message, and the CLI matches on
+     * {@code IllegalArgumentException}.
+     */
+    @Test
+    void anExceptionTheSupervisorCanLoadArrivesExactlyAsThrown() throws Exception {
+        try (IsolatedService service = IsolatedService.create("probe", IMPL, classpath())) {
+            RecordingServiceContext context = new RecordingServiceContext();
+            context.settings().put("probe.failOnStart", "loadable");
+
+            assertThatThrownBy(() -> service.start(context))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessage("probe refuses to start")
+                    .hasNoCause();
+        }
+    }
+
+    /** A loadable exception is not enough: the cause is what carries the loader across. */
+    @Test
+    void aLoadableExceptionWithAnIsolatedCauseIsStillWrapped() throws Exception {
+        try (IsolatedService service = IsolatedService.create("probe", IMPL, classpath())) {
+            RecordingServiceContext context = new RecordingServiceContext();
+            context.settings().put("probe.failOnStart", "loadable-with-isolated-cause");
+
+            Throwable thrown = catchThrowable(() -> service.start(context));
+
+            assertThat(thrown).isInstanceOf(ServiceException.class);
+            assertThat(unloadableTypesIn(thrown)).isEmpty();
+            assertThat(causeChainOf(thrown))
+                    .anySatisfy(link -> assertThat(link.getMessage())
+                            .contains("the real reason, unloadable outside"));
+        }
+    }
+
+    /**
+     * A cyclic cause chain is legal — {@code initCause} rejects only self-causation — and used to
+     * take the translation into infinite recursion from inside a constructor.
+     */
+    @Test
+    void aCyclicIsolatedChainCrossesTheBoundaryWithoutOverflowing() throws Exception {
+        try (IsolatedService service = IsolatedService.create("probe", IMPL, classpath())) {
+            RecordingServiceContext context = new RecordingServiceContext();
+            context.settings().put("probe.failOnStart", "cyclic");
+
+            Throwable thrown = catchThrowable(() -> service.start(context));
+
+            assertThat(thrown).isInstanceOf(ServiceException.class);
+            assertThat(unloadableTypesIn(thrown)).isEmpty();
+            assertThat(causeChainOf(thrown))
+                    .hasSizeLessThan(200)
+                    .last()
+                    .satisfies(last -> assertThat(last.getMessage()).startsWith("[CIRCULAR REFERENCE:"));
+        }
+    }
+
+    /**
+     * {@code status()} caught {@link Exception}, so an {@link Error} from the delegate escaped.
+     * {@code Supervisor.stopService} calls {@code status()} after {@code close()}, outside any
+     * try, and an escape there aborts the shutdown before it records the final state, removes the
+     * shutdown hook or counts the process down — the JVM then hangs on exit. This is that
+     * sequence.
+     */
+    @Test
+    void statusAndDetailsSurviveTheirOwnLoaderHavingBeenClosed() throws Exception {
+        IsolatedService service = IsolatedService.create("probe", IMPL, classpath());
+        RecordingServiceContext context = new RecordingServiceContext();
+        service.start(context);
+        assertThat(service.status()).isEqualTo(ServiceStatus.RUNNING);
+
+        // From here on the probe reaches for a class it has never loaded, which is what a real
+        // delegate does on any call into code it has not touched yet.
+        context.settings().put("probe.statusMode", "lazy");
+        context.settings().put("probe.detailsMode", "lazy");
+        service.close();
+
+        assertThatCode(service::status).doesNotThrowAnyException();
+        assertThatCode(service::details).doesNotThrowAnyException();
+        assertThat(service.status())
+                .as("the last status actually observed, not a verdict invented on the way out")
+                .isEqualTo(ServiceStatus.RUNNING);
+        assertThat(service.details()).containsKey("error");
+    }
+
+    /**
+     * "Could not determine the status" is not "the service has failed", and the difference is a
+     * process: {@code Supervisor.checkService} turns {@code FAILED} into a shutdown of the whole
+     * JVM, taking down the other server with it.
+     */
+    @Test
+    void statusReportsTheLastKnownStateRatherThanFailedWhenItCannotBeRead() throws Exception {
+        try (IsolatedService service = IsolatedService.create("probe", IMPL, classpath())) {
+            RecordingServiceContext context = new RecordingServiceContext();
+            service.start(context);
+            assertThat(service.status()).isEqualTo(ServiceStatus.RUNNING);
+
+            for (String mode : List.of("isolated", "error")) {
+                context.settings().put("probe.statusMode", mode);
+                assertThat(service.status())
+                        .as("status mode %s must not be read as a failure of the service", mode)
+                        .isEqualTo(ServiceStatus.RUNNING)
+                        .isNotEqualTo(ServiceStatus.FAILED);
+                assertThat(service.details()).containsEntry("name", "probe");
+            }
+
+            context.settings().remove("probe.statusMode");
+            assertThat(service.status()).isEqualTo(ServiceStatus.RUNNING);
+        }
+    }
+
+    /**
+     * Catching an {@link InterruptedException} clears the interrupt that produced it, and
+     * {@code status()} may run on any thread — including one the supervisor has just asked to
+     * stop. Swallowing the flag there leaves that thread waiting for a signal already sent.
+     */
+    @Test
+    void statusPutsBackAnInterruptItConsumed() throws Exception {
+        try (IsolatedService service = IsolatedService.create("probe", IMPL, classpath())) {
+            RecordingServiceContext context = new RecordingServiceContext();
+            service.start(context);
+            assertThat(service.status()).isEqualTo(ServiceStatus.RUNNING);
+            assertThat(Thread.currentThread().isInterrupted()).isFalse();
+
+            context.settings().put("probe.statusMode", "interrupt");
+            try {
+                assertThat(service.status()).isEqualTo(ServiceStatus.RUNNING);
+                assertThat(Thread.currentThread().isInterrupted())
+                        .as("the interrupt was consumed by the catch and has to be put back")
+                        .isTrue();
+            } finally {
+                // Clear it before close(), and before the next test inherits this thread.
+                Thread.interrupted();
+                context.settings().remove("probe.statusMode");
+            }
+        }
+    }
+
+    /**
+     * {@code details()} used to hand the supervisor the delegate's own Map instance. Its class
+     * belongs to the isolated loader, so every consumer that keeps a status response keeps the
+     * loader.
+     */
+    @Test
+    void detailsCrossTheBoundaryAsASupervisorOwnedMap() throws Exception {
+        try (IsolatedService service = IsolatedService.create("probe", IMPL, classpath())) {
+            service.start(new RecordingServiceContext());
+
+            Map<String, String> details = service.details();
+
+            assertThat(details.getClass())
+                    .as("a Map type from the probe jar would pin the loader for as long as the map lives")
+                    .isSameAs(LinkedHashMap.class);
+            assertThat(details.getClass().getClassLoader()).isNotSameAs(service.classLoader());
+            assertThat(details).containsEntry("name", "probe");
+        }
+    }
+
+    /**
+     * {@code close()} used to run {@code loader.close()} in a {@code finally}, so a loader that
+     * would not close replaced — and erased — the reason the service would not stop, which is
+     * usually the cause of the other.
+     */
+    @Test
+    void closeReportsTheStopFailureAndStillReleasesTheLoader() throws Exception {
+        IsolatedService service = IsolatedService.create("probe", IMPL, classpath());
+        RecordingServiceContext context = new RecordingServiceContext();
+        context.settings().put("probe.failOnStop", "held open by a stuck thread");
+        service.start(context);
+
+        Throwable thrown = catchThrowable(service::close);
+
+        assertThat(thrown).isInstanceOf(ServiceException.class);
+        assertThat(thrown).hasMessageContaining("probe refused to stop");
+        assertThat(unloadableTypesIn(thrown)).isEmpty();
+
+        // The loader still had to be released: leaving a whole server's classes behind because
+        // stop() threw is the worse of the two outcomes.
+        assertThatThrownBy(() -> Class.forName("probe.LazyProbe", false, service.classLoader()))
+                .isInstanceOf(ClassNotFoundException.class);
     }
 
     @Test
@@ -175,5 +428,50 @@ class IsolatedClassLoaderTest {
             assertThat(Class.forName(ClasspathResolver.class.getName(), false, getClass().getClassLoader()))
                     .isSameAs(ClasspathResolver.class);
         }
+    }
+
+    // --- helpers ---------------------------------------------------------------------------
+
+    /** The cause chain below {@code thrown}, bounded so a cyclic chain cannot hang the test. */
+    private static List<Throwable> causeChainOf(Throwable thrown) {
+        List<Throwable> chain = new ArrayList<>();
+        for (Throwable current = thrown.getCause();
+             current != null && chain.size() < 500;
+             current = current.getCause()) {
+            chain.add(current);
+        }
+        return chain;
+    }
+
+    /**
+     * The names of every type in {@code thrown}'s causes and suppressed exceptions that the
+     * supervisor's own ClassLoader would not resolve to that same class — which is the operative
+     * definition of "this exception cannot cross the boundary". Same name is not enough: two
+     * loaders can each hold a class of one name, and only one of them is the one in hand.
+     */
+    private List<String> unloadableTypesIn(Throwable thrown) {
+        List<String> unloadable = new ArrayList<>();
+        Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        Deque<Throwable> pending = new ArrayDeque<>();
+        pending.add(thrown);
+        while (!pending.isEmpty() && seen.size() < 500) {
+            Throwable current = pending.poll();
+            if (!seen.add(current)) {
+                continue;
+            }
+            Class<?> type = current.getClass();
+            try {
+                if (Class.forName(type.getName(), false, getClass().getClassLoader()) != type) {
+                    unloadable.add(type.getName());
+                }
+            } catch (ClassNotFoundException | LinkageError e) {
+                unloadable.add(type.getName());
+            }
+            if (current.getCause() != null) {
+                pending.add(current.getCause());
+            }
+            Collections.addAll(pending, current.getSuppressed());
+        }
+        return unloadable;
     }
 }

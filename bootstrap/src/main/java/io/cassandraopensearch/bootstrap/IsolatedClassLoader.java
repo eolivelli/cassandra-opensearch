@@ -50,8 +50,14 @@ import java.util.function.Predicate;
  *
  * The loader must be {@link #close() closed} after its service has stopped, and nothing may
  * retain a reference to it or to any class it loaded, or the loader — and the entire server's
- * worth of classes and static state behind it — leaks. {@code IsolatedClassLoaderTest} asserts
- * the loader becomes unreachable after a stop/close cycle.
+ * worth of classes and static state behind it — leaks.
+ *
+ * <p><b>Closing releases the jars; it does not make the loader collectable.</b> In practice
+ * neither the Cassandra nor the OpenSearch loader can be garbage collected after its service has
+ * stopped — measured, with the retaining roots named as far as they could be identified, in
+ * {@code docs/KNOWN-GAPS.md} §4. That is harmless as shipped, because the process builds each
+ * loader exactly once; it becomes a metaspace leak the moment anything rebuilds one, which is
+ * why a restart must happen <i>inside</i> the existing loader.
  *
  * <p>This class is parallel-capable and safe for concurrent class loading.
  */

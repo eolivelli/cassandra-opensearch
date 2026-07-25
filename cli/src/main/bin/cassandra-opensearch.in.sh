@@ -4,7 +4,9 @@
 # where is the installation, which java, is that java usable, and what does it need on its
 # command line.
 #
-# Nothing here execs anything, so it is also safe to source from an operator's own script.
+# NOT usable from an operator's own script. Two things tie it to this bin/: the installation root
+# is derived from "$0", which names the sourcing script rather than this file, and co_die calls
+# exit, which would take the sourcing shell with it. Call bin/cassandra-opensearch instead.
 
 # --- installation root ------------------------------------------------------------------
 
@@ -80,8 +82,30 @@ co_require_java_21() {
 # Unquoted is not sloppiness: `--add-exports java.base/sun.nio.ch=ALL-UNNAMED` has to arrive at
 # the JVM as two argv entries, and word splitting is what produces them. Passing each line as a
 # single argument gives "Unrecognized option: --add-exports java.base/sun.nio.ch=ALL-UNNAMED".
+#
+# Returns non-zero rather than calling co_die, because every caller uses it inside a command
+# substitution: `exit` there ends the subshell the substitution runs in and nothing else, so the
+# script would sail on and start a JVM with no --add-exports at all - which dies deep inside
+# startup with "IllegalAccessError: module java.rmi does not export sun.rmi.registry". The caller
+# must therefore test the status; see set_java_arguments in bin/cassandra-opensearch.
 co_jvm_options() {
     _co_options_file="$CO_CONF/jvm21-server.options"
-    [ -r "$_co_options_file" ] || co_die "missing $_co_options_file"
-    grep '^-' "$_co_options_file" | tr '\n' ' '
+    if [ ! -r "$_co_options_file" ]; then
+        echo "cassandra-opensearch: missing $_co_options_file" >&2
+        echo "  Every JVM this distribution starts needs its --add-exports and --add-opens" >&2
+        echo "  entries. Set CASSANDRA_OPENSEARCH_CONF, or restore the file - a mounted conf/" >&2
+        echo "  directory has to carry all of conf/, not just the files you meant to change." >&2
+        return 1
+    fi
+    _co_options=$(grep '^-' "$_co_options_file" | tr '\n' ' ')
+    case "$_co_options" in
+        *[!\ ]*) ;;
+        *)
+            echo "cassandra-opensearch: $_co_options_file has no JVM options in it." >&2
+            echo "  Expected lines beginning with '-'; without them the JVM starts without the" >&2
+            echo "  module opens both servers need and fails with IllegalAccessError." >&2
+            return 1
+            ;;
+    esac
+    printf '%s' "$_co_options"
 }

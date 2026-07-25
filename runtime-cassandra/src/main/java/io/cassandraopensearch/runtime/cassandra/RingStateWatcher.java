@@ -113,6 +113,16 @@ final class RingStateWatcher {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+        if (thread.isAlive()) {
+            // Nothing here can force the thread to end, and there is nothing left to try again
+            // with: the caller discards the isolated ClassLoader the moment stop() returns, so a
+            // watcher still running is a leaked loader plus a thread reporting into a service that
+            // no longer exists. Say so where an operator will see it.
+            context.reportEvent("WARN", "cassandra.ring.watcher.stuck",
+                    "the ring state watcher did not stop within "
+                            + interval.plusSeconds(5).toSeconds() + "s and is still running; the"
+                            + " Cassandra ClassLoader cannot be released while it is");
+        }
     }
 
     private void run() {

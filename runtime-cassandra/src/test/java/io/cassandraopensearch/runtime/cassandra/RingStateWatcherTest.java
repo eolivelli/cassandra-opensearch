@@ -11,6 +11,9 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import io.cassandraopensearch.spi.RingStateEvent;
@@ -163,6 +166,55 @@ class RingStateWatcherTest {
         watcher.stop();
         watcher = null;
 
+        assertThat(watcherThread()).isNull();
+    }
+
+    /**
+     * The join in {@link RingStateWatcher#stop()} can expire, and when it does there is nothing
+     * left to try: the caller discards the isolated ClassLoader the moment {@code stop()} returns,
+     * so a watcher still running is a leaked loader and a thread reporting into a service that no
+     * longer exists. Swallowing that silently makes it invisible; it has to be said out loud.
+     */
+    @Test
+    void saysSoWhenItsThreadWillNotStop() throws Exception {
+        CountDownLatch reading = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicInteger reads = new AtomicInteger();
+        context = new RecordingServiceContext(home, Map.of());
+        watcher = RingStateWatcher.start(context, () -> {
+            if (reads.getAndIncrement() == 0) {
+                // The baseline the constructor takes, on the caller's thread.
+                return "NORMAL";
+            }
+            reading.countDown();
+            // Deliberately not interruptible: a read wedged inside a node being torn down is what
+            // this is modelling, and stop()'s interrupt does not free it.
+            while (true) {
+                try {
+                    release.await();
+                    return "NORMAL";
+                } catch (InterruptedException ignored) {
+                    // Keep waiting, exactly as a wedged read would.
+                }
+            }
+        }, INTERVAL);
+        assertThat(reading.await(10, TimeUnit.SECONDS)).isTrue();
+
+        try {
+            watcher.stop();
+
+            assertThat(context.events())
+                    .filteredOn(event -> event.type().equals("cassandra.ring.watcher.stuck"))
+                    .singleElement()
+                    .satisfies(event -> {
+                        assertThat(event.level()).isEqualTo("WARN");
+                        assertThat(event.message()).contains("ClassLoader");
+                    });
+        } finally {
+            release.countDown();
+            watcher.stop();
+            watcher = null;
+        }
         assertThat(watcherThread()).isNull();
     }
 

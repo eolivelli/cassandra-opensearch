@@ -181,10 +181,23 @@ final class DistributionNode implements AutoCloseable {
     }
 
     Commands.Result run(Duration timeout, String... command) {
+        return runWith(Map.of(), timeout, command);
+    }
+
+    /**
+     * The same, with extra environment on top of this node's own.
+     *
+     * <p>For the tests that break the installation on purpose — an emptied
+     * {@code CASSANDRA_OPENSEARCH_CONF}, say — where the point is what the script does with an
+     * environment no correctly configured node would ever have.
+     */
+    Commands.Result runWith(Map<String, String> extraEnvironment, Duration timeout, String... command) {
         List<String> resolved = new ArrayList<>();
         resolved.add(home.resolve(command[0]).toString());
         resolved.addAll(List.of(command).subList(1, command.length));
-        return Commands.run(home, resolved, environment, timeout);
+        Map<String, String> merged = new LinkedHashMap<>(environment);
+        merged.putAll(extraEnvironment);
+        return Commands.run(home, resolved, merged, timeout);
     }
 
     /**

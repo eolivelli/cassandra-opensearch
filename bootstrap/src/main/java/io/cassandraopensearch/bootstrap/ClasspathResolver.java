@@ -7,6 +7,9 @@
  */
 package io.cassandraopensearch.bootstrap;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.net.URL;
@@ -15,6 +18,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Locale;
 import java.util.stream.Stream;
 
 /**
@@ -27,6 +31,10 @@ import java.util.stream.Stream;
  */
 public final class ClasspathResolver {
 
+    private static final Logger LOG = LoggerFactory.getLogger(ClasspathResolver.class);
+
+    private static final String JAR_SUFFIX = ".jar";
+
     private ClasspathResolver() {
     }
 
@@ -35,7 +43,16 @@ public final class ClasspathResolver {
      *
      * <p>The sort is not cosmetic: classpath order decides which copy wins when two jars contain
      * the same class, so an unsorted directory listing would make startup depend on filesystem
-     * iteration order and produce failures that reproduce on one machine but not another.
+     * iteration order and produce failures that reproduce on one machine but not another. It is
+     * also why the listing is collected with {@code toList()} rather than drained with
+     * {@code forEach}, which is explicitly not required to preserve encounter order.
+     *
+     * <p>The suffix match is case-insensitive, and everything skipped is logged at WARN. A jar
+     * dropped from a service's classpath does not fail here; it fails much later, as a
+     * {@code NoClassDefFoundError} deep inside a server's startup, and an operator who has just
+     * copied {@code E-Upper.JAR} into {@code lib/} has no way to connect the two. A broken
+     * symlink is the same story: {@link Files#isRegularFile} follows links, so a dangling one is
+     * indistinguishable from an absent file unless it is reported.
      *
      * @param libDirectory a directory such as {@code <home>/lib/cassandra}
      * @return the jars, in a stable order; never empty
@@ -48,14 +65,29 @@ public final class ClasspathResolver {
                             + ". The distribution must provide one lib/<service> directory per"
                             + " isolated service; see docs/ARCHITECTURE.md.");
         }
-        List<URL> jars = new ArrayList<>();
-        try (Stream<Path> entries = Files.list(libDirectory)) {
-            entries.filter(p -> p.getFileName().toString().endsWith(".jar"))
-                    .filter(Files::isRegularFile)
+        List<Path> entries;
+        try (Stream<Path> listing = Files.list(libDirectory)) {
+            entries = listing
                     .sorted(Comparator.comparing(p -> p.getFileName().toString()))
-                    .forEach(p -> jars.add(toUrl(p)));
+                    .toList();
         } catch (IOException e) {
             throw new UncheckedIOException("Cannot list " + libDirectory.toAbsolutePath(), e);
+        }
+        List<URL> jars = new ArrayList<>();
+        for (Path entry : entries) {
+            String name = entry.getFileName().toString();
+            if (!name.toLowerCase(Locale.ROOT).endsWith(JAR_SUFFIX)) {
+                LOG.warn("Skipping {}: not a {} file, so it is not on the classpath of {}",
+                        entry.toAbsolutePath(), JAR_SUFFIX, libDirectory.getFileName());
+                continue;
+            }
+            if (!Files.isRegularFile(entry)) {
+                LOG.warn("Skipping {}: names a {} but is not a regular file — a broken symlink, or"
+                                + " a directory. It will NOT be on the classpath of {}.",
+                        entry.toAbsolutePath(), JAR_SUFFIX, libDirectory.getFileName());
+                continue;
+            }
+            jars.add(toUrl(entry));
         }
         if (jars.isEmpty()) {
             throw new IllegalArgumentException(

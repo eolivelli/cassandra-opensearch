@@ -117,6 +117,21 @@
                 <descriptor>src/main/assembly/bin.xml</descriptor>
               </descriptors>
               <tarLongFileMode>posix</tarLongFileMode>
+              <!--
+                Otherwise every tar entry carries the account that ran the build - a login name
+                and a uid that exist on exactly one machine. That is build-host metadata published
+                in a release artifact, it makes the archive differ between two developers who
+                built the same commit, and `tar x` run as root hands the whole installation to
+                whatever local account happens to hold that uid.
+
+                Set on the plugin rather than in bin.xml because the 2.1.0 assembly descriptor's
+                fileSet has no userName/groupName; these four are mojo parameters and apply to the
+                archive as a whole.
+              -->
+              <overrideUid>0</overrideUid>
+              <overrideGid>0</overrideGid>
+              <overrideUserName>root</overrideUserName>
+              <overrideGroupName>root</overrideGroupName>
             </configuration>
           </execution>
         </executions>

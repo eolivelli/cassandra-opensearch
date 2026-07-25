@@ -18,6 +18,8 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Retires this node from both clusters, in the one order that does not lose data.
@@ -45,14 +47,19 @@ import java.util.Map;
  *
  * Steps 1 and 2 are not free of side effects — step 1 excludes this node from shard allocation
  * cluster-wide — so "reversible" only means anything if something actually reverses them. A
- * decommission that fails, is refused or is cancelled anywhere up to and including step 2
- * therefore calls {@code abortDecommission} on every service it had already reached, in reverse
- * order. The case that makes this compulsory is the ordinary one: Cassandra refuses a
+ * decommission that fails, is refused or is cancelled anywhere up to and including {@code
+ * decommission(opensearch)} therefore calls {@code abortDecommission} on every service it had
+ * already reached, in reverse order. The case that makes this compulsory is the ordinary one:
+ * Cassandra refuses a
  * single-node decommission in step 1, <i>after</i> OpenSearch has already been excluded, and a
  * node left excluded never gets a shard again — every index created afterwards sits UNASSIGNED.
  *
- * <p>Compensation stops at step 3. Once Cassandra has begun streaming its ranges the node is
- * genuinely leaving, and there is nothing to put back.
+ * <p>Compensation stops at {@code decommission(cassandra)}, not at the start of step 3.
+ * {@code decommission(opensearch)} is the step that re-checks the shard count and refuses when a
+ * shard has reappeared, so it genuinely throws — and it throws with this node already excluded
+ * from shard allocation and Cassandra still fully in the ring, which is exactly the state the
+ * compensation exists to undo. Only once Cassandra has begun streaming its ranges is the node
+ * genuinely leaving and there is nothing to put back.
  *
  * <p>Every phase is bounded. {@code --timeout} from the CLI, when given, replaces the configured
  * per-phase limits rather than being spread across them: an operator who says "give up after ten
@@ -78,6 +85,12 @@ public final class DecommissionCoordinator {
 
     private volatile boolean cancelled;
 
+    /**
+     * Opened when {@link #run} has returned or thrown, so a shutdown can wait for the coordinator
+     * to let go of the services before it starts stopping them.
+     */
+    private final CountDownLatch finished = new CountDownLatch(1);
+
     /** Receives progress from whichever service is currently doing the waiting. */
     @FunctionalInterface
     public interface ProgressListener {
@@ -99,9 +112,40 @@ public final class DecommissionCoordinator {
         this.listener = listener;
     }
 
-    /** Asks the phase in flight to unwind at its next poll. */
+    /**
+     * Asks the run to unwind at the next opportunity.
+     *
+     * <p>Cancellation is cooperative in two places, and it needs both. A service that is inside a
+     * long poll — {@code awaitDecommissionReady} is the only one that is — sees it through {@link
+     * DecommissionContext#isCancelled()}. Everything else is a call that runs to completion and
+     * never looks, so {@link #run} itself checks at every phase boundary. Without that second
+     * check a cancelled run carried on to the next phase and drove a service the caller had
+     * already begun shutting down.
+     *
+     * <p>This only asks. {@link #awaitCompletion} is how a caller finds out that it happened.
+     */
     public void cancel() {
         cancelled = true;
+    }
+
+    /** True once {@link #run} has returned or thrown, so the services are nobody's but the caller's. */
+    boolean isFinished() {
+        return finished.getCount() == 0;
+    }
+
+    /**
+     * Waits for {@link #run} to return or throw.
+     *
+     * @return false if it is still running when the budget expires, in which case the caller is
+     *         sharing the two services with a coordinator that is still driving them
+     */
+    boolean awaitCompletion(Duration budget) {
+        try {
+            return finished.await(budget.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return isFinished();
+        }
     }
 
     /**
@@ -115,6 +159,14 @@ public final class DecommissionCoordinator {
      *                               is undone before this propagates.
      */
     public String run(Duration operatorTimeout, boolean force) throws DecommissionException {
+        try {
+            return runPhases(operatorTimeout, force);
+        } finally {
+            finished.countDown();
+        }
+    }
+
+    private String runPhases(Duration operatorTimeout, boolean force) throws DecommissionException {
         if (cassandra == null && opensearch == null) {
             throw new DecommissionException("Nothing to decommission: no service is running.");
         }
@@ -125,12 +177,21 @@ public final class DecommissionCoordinator {
 
         try {
             // --- 1. prepare both, so the two hand-offs overlap instead of running back to back -
+            checkNotCancelled();
             prepare(prepared, "prepare-opensearch", opensearch, relocation, force);
+            checkNotCancelled();
             prepare(prepared, "prepare-cassandra", cassandra, streaming, force);
 
             // --- 2. wait for OpenSearch to relocate its shards -----------------------------
+            // Unconditional, and outside the null check: a node running only Cassandra has to
+            // honour a cancellation here too, and this is the boundary a shutdown arrives at.
+            checkNotCancelled();
             if (opensearch != null) {
-                if (awaitShardRelocation(relocation, force)) {
+                boolean relocated = awaitShardRelocation(relocation, force);
+                // Before reading the verdict: a cancelled wait reports "not ready", and blaming
+                // the cluster for a hand-off the operator interrupted is the wrong diagnosis.
+                checkNotCancelled();
+                if (relocated) {
                     summary.add("OpenSearch relocated its shards");
                 } else if (force) {
                     LOG.warn("Proceeding with --force: OpenSearch has shards outstanding and any copy"
@@ -147,17 +208,26 @@ public final class DecommissionCoordinator {
                                     + " other copy.");
                 }
             }
+
+            // --- 3a. OpenSearch leaves ------------------------------------------------------
+            // Inside the compensated block, because this call refuses when a shard reappeared
+            // between the wait and the re-check. Cassandra is still fully in the ring at this
+            // point, so a failure here that left the node excluded from shard allocation would
+            // be precisely the "every index sits UNASSIGNED" outcome the compensation prevents.
+            checkNotCancelled();
+            if (opensearch != null) {
+                phase("decommission-opensearch", opensearch, relocation, force, EmbeddedService::decommission);
+            }
+            // The last boundary at which anything can still be put back.
+            checkNotCancelled();
         } catch (DecommissionException | RuntimeException failure) {
             // Still short of the point of no return, so put back whatever the preparations
-            // changed. Past this catch step 3 hands the data away and nothing can be put back.
+            // changed. Past this catch Cassandra hands its ranges away and nothing can be put back.
             abortPreparation(prepared, failure);
             throw failure;
         }
 
-        // --- 3. leave, OpenSearch first -----------------------------------------------------
-        if (opensearch != null) {
-            phase("decommission-opensearch", opensearch, relocation, force, EmbeddedService::decommission);
-        }
+        // --- 3b. Cassandra leaves: the point of no return -----------------------------------
         if (cassandra != null) {
             phase("decommission-cassandra", cassandra, streaming, force, EmbeddedService::decommission);
             summary.add("Cassandra streamed its ranges and left the ring");
@@ -171,6 +241,23 @@ public final class DecommissionCoordinator {
                 + "; both services stopped";
         listener.onProgress("complete", 100, message);
         return message;
+    }
+
+    /**
+     * Stops the run at a phase boundary if it has been cancelled.
+     *
+     * <p>Thrown from inside the compensated block this unwinds the preparations, which is the
+     * whole point: a cancelled decommission is a decommission that must leave the node exactly as
+     * it found it. The one call after the compensated block is Cassandra's, and reaching the
+     * boundary before it is the last moment at which that is still true.
+     */
+    private void checkNotCancelled() throws DecommissionException {
+        if (cancelled) {
+            throw new DecommissionException(
+                    "The decommission was cancelled. This node has NOT left either cluster:"
+                            + " Cassandra is still in the ring and every preparation that had been"
+                            + " applied has been undone.");
+        }
     }
 
     /**

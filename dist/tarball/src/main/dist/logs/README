@@ -1,3 +1,12 @@
-# system.log and debug.log (Cassandra, via conf/logback.xml)
-# <cluster>.log and <cluster>_server.json (OpenSearch, via conf/log4j2.properties)
-# cassandra-opensearch.log (the supervisor, when started with -d)
+# Where this node writes. Three logging configurations, because there are three of them in the
+# process by design: Cassandra binds logback inside its own ClassLoader, OpenSearch binds log4j2
+# inside its, and the supervisor on the system classpath has only slf4j-simple.
+#
+# system.log, debug.log       Cassandra, via conf/logback.xml
+#                             (rolled to system.log.<date>.<n>.zip, debug.log.<date>.<n>.zip)
+# audit/audit.log             Cassandra's audit log, when it is enabled in conf/cassandra.yaml
+# opensearch.log              OpenSearch, via conf/log4j2.properties
+#                             (rolled to opensearch-<date>-<n>.log.gz)
+# cassandra-opensearch.log    the supervisor's own output, written by bin/cassandra-opensearch
+#                             when the node is started with -d. A foreground start writes the
+#                             same stream to the terminal instead.

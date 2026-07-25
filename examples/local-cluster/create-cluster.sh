@@ -47,6 +47,35 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# --- portability ----------------------------------------------------------------------------
+#
+# These scripts are documented as working on macOS as well as Linux, and macOS ships a BSD
+# userland. Three GNU-isms have to be kept out:
+#
+#   1. `sed -i` with no operand. BSD sed reads the next argument as the backup suffix, so
+#      `sed -i -e ...` on macOS treats "-e" as the suffix; GNU sed rejects `sed -i ''`. Neither
+#      spelling is portable, so nothing here uses -i at all - rewrite() below uses a temp file.
+#   2. `\n` in a sed replacement. GNU sed emits a newline; BSD sed emits a literal "n", which
+#      silently corrupts the YAML it was editing. Anything that has to produce two lines from one
+#      goes through awk, which prints newlines the same way everywhere.
+#   3. `tac`, which macOS does not have. `seq <n> -1 1` counts down on both.
+
+# In-place edit through a temp file. `rewrite <file> <command> [args...]` runs the command with
+# the file on stdin and replaces the file with what it printed.
+rewrite() { # rewrite <file> <command> [args...]
+    local file=$1
+    shift
+    local tmp="$file.rewrite.$$"
+    "$@" < "$file" > "$tmp"
+    mv "$tmp" "$file"
+}
+
+# Single-quotes a string for the printed copy-paste commands, so that a -d directory containing a
+# space still yields something that can be pasted into a shell.
+quoted() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
 if [ -z "$TARBALL" ]; then
     TARBALL=$(ls "$SCRIPT_DIR"/../../dist/tarball/target/cassandra-opensearch-*-bin.tar.gz 2>/dev/null | head -1 || true)
 fi
@@ -116,34 +145,47 @@ for i in $(seq 1 "$NODES"); do
     # Cassandra parses conf/cassandra.yaml itself, so its ports and addresses live there.
     # The identically-named keys in cassandra-opensearch.yaml reach nothing (docs/KNOWN-GAPS.md
     # section 2) — which is exactly why both files must be edited, and edited to agree.
-    sed -i \
+    rewrite "$CONF/cassandra.yaml" sed \
         -e "s|^storage_port: .*|storage_port: $(storage_port "$i")|" \
         -e "s|^ssl_storage_port: .*|ssl_storage_port: $(ssl_storage_port "$i")|" \
         -e "s|^native_transport_port: .*|native_transport_port: $(native_port "$i")|" \
         -e "s|^listen_address: .*|listen_address: $H|" \
         -e "s|^rpc_address: .*|rpc_address: $H|" \
-        -e "s|^\( *- seeds:\).*|\1 \"$cassandra_seed\"|" \
-        "$CONF/cassandra.yaml"
+        -e "s|^\( *- seeds:\).*|\1 \"$cassandra_seed\"|"
 
-    sed -i \
+    rewrite "$CONF/cassandra-opensearch.yaml" sed \
         -e "s|^\( *\)listen_address: .*|\1listen_address: $H|" \
         -e "s|^\( *\)storage_port: .*|\1storage_port: $(storage_port "$i")|" \
         -e "s|^\( *\)native_transport_port: .*|\1native_transport_port: $(native_port "$i")|" \
-        -e "s|^\( *\)jmx_port: .*|\1jmx_port: $(cassandra_jmx_port "$i")\n\1jmx_address: $H|" \
+        -e "s|^\( *\)jmx_port: .*|\1jmx_port: $(cassandra_jmx_port "$i")|" \
         -e "s|^\( *\)network_host: .*|\1network_host: $H|" \
         -e "s|^\( *\)http_port: .*|\1http_port: $(http_port "$i")|" \
-        -e "s|^\( *\)transport_port: .*|\1transport_port: $(transport_port "$i")|" \
-        "$CONF/cassandra-opensearch.yaml"
+        -e "s|^\( *\)transport_port: .*|\1transport_port: $(transport_port "$i")|"
+
+    # jmx_address is not in the shipped file at all - 127.0.0.1 is its default - so it has to be
+    # inserted rather than substituted, immediately after jmx_port and at the same indentation.
+    # awk and not a second sed: emitting a newline from a sed replacement needs GNU's \n.
+    rewrite "$CONF/cassandra-opensearch.yaml" awk -v addr="$H" '
+        { print }
+        /^[[:space:]]*jmx_port:/ {
+            match($0, /^[[:space:]]*/)
+            printf "%sjmx_address: %s\n", substr($0, RSTART, RLENGTH), addr
+        }'
 
     # The shipped opensearch.yml uses single-node discovery, where a node elects itself and never
-    # forms a cluster with anybody. A real cluster has to replace it outright.
+    # forms a cluster with anybody. A real cluster has to replace it outright - one line becoming
+    # two, which is again why this is awk.
     if [ "$NODES" -gt 1 ]; then
-        sed -i \
-            -e "s|^discovery.type: .*|discovery.seed_hosts: [$seed_hosts]\ncluster.initial_cluster_manager_nodes: [$bootstrap_nodes]|" \
-            -e "s|^network.host: .*|network.host: $H|" \
-            "$CONF/opensearch.yml"
+        rewrite "$CONF/opensearch.yml" awk -v seeds="$seed_hosts" -v bootstrap="$bootstrap_nodes" -v h="$H" '
+            /^discovery\.type:/ {
+                print "discovery.seed_hosts: [" seeds "]"
+                print "cluster.initial_cluster_manager_nodes: [" bootstrap "]"
+                next
+            }
+            /^network\.host:/ { print "network.host: " h; next }
+            { print }'
     else
-        sed -i -e "s|^network.host: .*|network.host: $H|" "$CONF/opensearch.yml"
+        rewrite "$CONF/opensearch.yml" sed -e "s|^network.host: .*|network.host: $H|"
     fi
 
     # The launcher reads these; they are what bin/cassandra-opensearch status|stop|decommission
@@ -167,4 +209,4 @@ EOF
 
 echo
 echo "Created. Start it with:"
-echo "  $SCRIPT_DIR/cluster-control.sh -d $CLUSTER_DIR start"
+echo "  $(quoted "$SCRIPT_DIR/cluster-control.sh") -d $(quoted "$CLUSTER_DIR") start"

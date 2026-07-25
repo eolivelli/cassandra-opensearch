@@ -13,6 +13,7 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -56,6 +57,20 @@ final class TestServiceContext implements ServiceContext {
 
     Map<String, String> mutableSettings() {
         return settings;
+    }
+
+    /**
+     * Appends a line to the operator's {@code opensearch.yml}. Call before {@code start()}: the
+     * file is read once, when the service assembles its settings.
+     */
+    TestServiceContext withConfigLine(String line) {
+        try {
+            Files.writeString(configFile(), line.endsWith("\n") ? line : line + "\n",
+                    StandardOpenOption.APPEND);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        return this;
     }
 
     List<String> events() {

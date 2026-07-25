@@ -16,8 +16,9 @@ classpaths produces a build that either fails to resolve or fails at runtime in 
 with every dependency bump.
 
 The technique used here is the one Cassandra's own `dtest` framework uses to run several
-Cassandra nodes in one JVM: a **parent-last** `URLClassLoader` per service whose delegation is
-inverted for everything except a tiny shared surface. See
+Cassandra nodes in one JVM: a `URLClassLoader` per service whose *parent is the platform loader*,
+so ordinary parent-first delegation resolves the JDK and reaches nothing else. (It is often called
+"parent-last", but nothing is inverted — the trick is the choice of parent, not the order.) See
 `test/distributed/org/apache/cassandra/distributed/shared/InstanceClassLoader.java` in the
 Cassandra tree for the original. We reproduce the approach; we do **not** depend on the dtest
 libraries, which are test artifacts and shade their dependencies.
@@ -38,7 +39,7 @@ libraries, which are test artifacts and shade their dependencies.
   │      "cassandra"      │     │      "opensearch"      │
   │  lib/cassandra/*.jar  │     │  lib/opensearch/*.jar  │
   │                       │     │                        │
-  │ CassandraServiceImpl  │     │ OpenSearchServiceImpl  │
+  │ CassandraService      │     │ OpenSearchService      │
   │   → CassandraDaemon   │     │   → org.opensearch     │
   │   → StorageService    │     │       .node.Node       │
   └───────────────────────┘     └────────────────────────┘
@@ -61,7 +62,7 @@ explicitly rather than hopefully:
 
 | Global resource | Risk | Handling |
 |---|---|---|
-| System properties | Both servers read and write them | Namespaces are disjoint in practice (`cassandra.*` vs `opensearch.*`); the audited exceptions are listed in `docs/GLOBAL-STATE.md` |
+| System properties | Both servers read and write them | Namespaces are largely disjoint (`cassandra.*` vs `opensearch.*`). The audited exceptions — Cassandra reads several unnamespaced names such as `ssl.enable` and `default.*` — are in [KNOWN-GAPS.md](KNOWN-GAPS.md) §5, and the shared `io.netty.*` budget is §6 |
 | Shutdown hooks | Either server calling `System.exit`, or registering a hook, affects the whole process | Both runtimes are forbidden from calling `System.exit`; the supervisor owns the single shutdown hook |
 | Native libraries | JNA / Netty native transports load once per JVM per loader | Documented per service; verified by the spikes |
 | JMX platform MBean server | One per JVM; both servers register MBeans | Cassandra registers into a **private** MBeanServer that federates reads with the platform one, so nothing of its own lands in the platform namespace. The supervisor's `io.cassandraopensearch:type=Supervisor` goes on the platform server, reached through the launcher's standard `com.sun.management.jmxremote.*` agent — **not** through a connector the supervisor starts itself. Cassandra's own port (7199) will not reach the supervisor MBean, because its federated server routes every non-JDK domain to the private server. |
@@ -111,7 +112,8 @@ Cassandra has left, the process is on its way out.
   operator: bin/cassandra-opensearch decommission
         │
         ├─1─ prepareDecommission(opensearch)   → cluster.routing.allocation.exclude._name=<node>
-        ├─2─ prepareDecommission(cassandra)    → mark leaving, stop accepting new ownership
+        ├─2─ prepareDecommission(cassandra)    → refuse now if this node cannot leave at all
+        │                                        (sole ring member); nothing is mutated yet
         │
         ├─3─ awaitDecommissionReady(opensearch) → poll until 0 shards remain on this node
         │                                          (progress reported to the CLI)
@@ -124,18 +126,25 @@ Cassandra has left, the process is on its way out.
 
 `--force` proceeds past step 3 with shards outstanding; `--timeout` bounds each waiting phase.
 
-Anything that fails, is refused or is cancelled up to and including step 3 is backed out:
-`abortDecommission` is called on every service already prepared, in reverse order, and OpenSearch
-takes this node back out of `cluster.routing.allocation.exclude._name`. This is not a nicety.
-Cassandra refuses a single-node decommission in step 2, *after* step 1 has excluded the node, and
-an exclusion nobody removes means the cluster never allocates a shard here again — one mistyped
-command would leave every index created afterwards UNASSIGNED. From step 4 on there is nothing to
-back out: the ranges are already streaming.
-
 The coordinator runs one more step than the four above: `decommission` is called on OpenSearch as
 well, before Cassandra's. That is where the shard count is re-checked, `--force` is enforced and
 recorded, and the node moves to `DECOMMISSIONED` rather than merely `STOPPED`. It runs first
 because Cassandra's is the irreversible one.
+
+**Everything up to and including that OpenSearch departure is backed out** if it fails, is refused,
+is cancelled or times out: `abortDecommission` runs on every service already prepared, in reverse
+order, and OpenSearch takes this node back out of
+`cluster.routing.allocation.exclude._name`.
+
+This is not a nicety. Cassandra refuses a single-node decommission in step 2, *after* step 1 has
+excluded the node, and an exclusion nobody removes means the cluster never allocates a shard here
+again — one mistyped command would leave every index created afterwards UNASSIGNED.
+
+The boundary sits exactly at `decommission(cassandra)`, and it took a review to put it there. The
+first implementation closed the compensated block one call early, leaving the OpenSearch departure
+— which genuinely refuses when a shard reappears between the wait and the re-check — outside it,
+reintroducing the same orphaned exclusion it was written to prevent. Past `decommission(cassandra)`
+there is nothing to back out: the ranges are already streaming.
 
 ### The unsupervised path is watched, not made safe
 

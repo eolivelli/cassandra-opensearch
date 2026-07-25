@@ -25,6 +25,11 @@
   <includeBaseDirectory>true</includeBaseDirectory>
   <baseDirectory>${dist.finalName}</baseDirectory>
 
+  <!--
+    Ownership of the tar entries is NOT set here: fileSet has no userName/groupName in the 2.1.0
+    descriptor. It is set once, for the whole archive, by overrideUserName/overrideGroupName on
+    the plugin execution in pom.xml - see the note there.
+  -->
   <fileSets>
     <fileSet>
       <directory>${dist.bin.directory}</directory>

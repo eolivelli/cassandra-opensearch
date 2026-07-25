@@ -93,17 +93,55 @@ final class NodeJmxServer {
         env.put("jmx.remote.x.daemon", "true");
         env.put("jmx.remote.rmi.server.credentials.filter.pattern", String.class.getName() + ";!*");
 
-        JMXServerUtils.JmxRegistry registry =
-                new JMXServerUtils.JmxRegistry(port, null, socketFactory, "jmxrmi");
-        RMIJRMPServerImpl rmiServer = new RMIJRMPServerImpl(port, null, socketFactory, env);
-        JMXServiceURL url = new JMXServiceURL("rmi", bindAddress, port);
-        JMXConnectorServer connectorServer = new RMIConnectorServer(url, env, rmiServer, federated);
-        connectorServer.start();
-        registry.setRemoteServerStub((Remote) rmiServer.toStub());
+        // Everything from here on can fail on something as ordinary as the port already being
+        // taken, and by this point the private MBeanServer exists. MBeanServerFactory holds every
+        // server it creates in a JVM-global list until it is explicitly released, so a server
+        // dropped on the floor here keeps this node's MBeans — and the isolated ClassLoader that
+        // loaded them — alive for the life of the process. start() is called once, from a start()
+        // that will not be retried, so nothing else ever comes back for it.
+        JMXServerUtils.JmxRegistry registry = null;
+        JMXConnectorServer connectorServer = null;
+        try {
+            registry = new JMXServerUtils.JmxRegistry(port, null, socketFactory, "jmxrmi");
+            RMIJRMPServerImpl rmiServer = new RMIJRMPServerImpl(port, null, socketFactory, env);
+            JMXServiceURL url = new JMXServiceURL("rmi", bindAddress, port);
+            connectorServer = new RMIConnectorServer(url, env, rmiServer, federated);
+            connectorServer.start();
+            registry.setRemoteServerStub((Remote) rmiServer.toStub());
 
-        String serviceUrl = "service:jmx:rmi://" + bindAddress + ':' + port
-                + "/jndi/rmi://" + bindAddress + ':' + port + "/jmxrmi";
-        return new NodeJmxServer(connectorServer, registry, wrapper, serviceUrl);
+            String serviceUrl = "service:jmx:rmi://" + bindAddress + ':' + port
+                    + "/jndi/rmi://" + bindAddress + ':' + port + "/jmxrmi";
+            return new NodeJmxServer(connectorServer, registry, wrapper, serviceUrl);
+        } catch (Throwable failure) {
+            releaseQuietly(connectorServer, registry, wrapper);
+            throw failure;
+        }
+    }
+
+    /** Gives back everything {@link #start} had taken by the time it failed. */
+    private static void releaseQuietly(JMXConnectorServer connectorServer,
+                                       JMXServerUtils.JmxRegistry registry,
+                                       NodeMBeanWrapper wrapper) {
+        if (connectorServer != null) {
+            try {
+                connectorServer.stop();
+            } catch (Exception ignored) {
+                // Never started, or already down; the original failure is the one worth reporting.
+            }
+        }
+        if (registry != null) {
+            try {
+                registry.close();
+            } catch (Exception ignored) {
+                // Same.
+            }
+        }
+        // Last, and unconditionally: this is the one that releases the MBeanServer.
+        try {
+            wrapper.close();
+        } catch (Exception ignored) {
+            // Same.
+        }
     }
 
     /** The URL a remote {@code nodetool} or {@code JMXConnector} connects to. */

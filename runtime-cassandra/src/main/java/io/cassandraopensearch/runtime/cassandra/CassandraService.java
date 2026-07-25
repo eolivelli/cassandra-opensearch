@@ -9,6 +9,7 @@ package io.cassandraopensearch.runtime.cassandra;
 
 import java.time.Duration;
 import java.util.LinkedHashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
@@ -88,6 +89,9 @@ public final class CassandraService implements EmbeddedService {
     private volatile DelegatingUncaughtExceptionHandler uncaughtExceptionHandler;
     private volatile RingStateWatcher ringStateWatcher;
 
+    /** Memoised {@code getOwnershipWithPort()}; see {@link #ownership(StorageService)}. */
+    private volatile Ownership ownership;
+
     @Override
     public String name() {
         return NAME;
@@ -102,6 +106,10 @@ public final class CassandraService implements EmbeddedService {
         }
         this.context = context;
         this.status = ServiceStatus.STARTING;
+        // Captured out here, not inside the try, because the failure path needs it: everything
+        // between activate() and installUncaughtExceptionHandler() runs with Cassandra's own
+        // handler installed process-wide and nothing holding the one it displaced.
+        Thread.UncaughtExceptionHandler handlerBeforeCassandra = Thread.getDefaultUncaughtExceptionHandler();
         try {
             applySystemProperties(context);
 
@@ -115,8 +123,6 @@ public final class CassandraService implements EmbeddedService {
             int jmxPort = Integer.parseInt(setting(context, SETTING_JMX_PORT, "7199"));
             jmx = NodeJmxServer.start(jmxAddress, jmxPort);
             context.reportEvent("INFO", "cassandra.jmx.started", jmx.serviceUrl());
-
-            Thread.UncaughtExceptionHandler handlerBeforeCassandra = Thread.getDefaultUncaughtExceptionHandler();
 
             // runManaged=true so exitOrFail() throws rather than calling System.exit.
             daemon = new CassandraDaemon(true);
@@ -144,7 +150,44 @@ public final class CassandraService implements EmbeddedService {
                     context, () -> StorageService.instance.getOperationMode());
         } catch (Throwable t) {
             status = ServiceStatus.FAILED;
+            releaseProcessWideState(handlerBeforeCassandra);
             throw new ServiceException(NAME, "Cassandra node failed to start", t);
+        }
+    }
+
+    /**
+     * Hands back the two pieces of JVM-global state a failed start may have taken, neither of
+     * which anything else will give back.
+     *
+     * <p>Both exist because the sequence above takes them from Cassandra and only tidies up after
+     * {@code activate()} has returned; a failure in between — {@code setup()} throwing, the native
+     * transport finding its port taken, {@code removeShutdownHooks()} itself throwing — leaves
+     * them installed, outliving the node and pinning the isolated ClassLoader they came from.
+     *
+     * <ul>
+     *   <li>{@code StorageService.initServer()} registers a drain-on-shutdown hook with the JVM.
+     *       Left in place it runs on the supervisor's exit, out of order, against a node that
+     *       never came up.</li>
+     *   <li>{@code CassandraDaemon.setup()} sets the process-wide default uncaught-exception
+     *       handler about half way through, and {@link #installUncaughtExceptionHandler} — the
+     *       thing that remembers what it displaced — runs only afterwards. {@link #stop()}
+     *       restores only a handler this class wrapped itself, so before that point there is
+     *       nothing that knows how to take Cassandra's back off.</li>
+     * </ul>
+     *
+     * <p>The handler is left alone once the wrapper is in place: from there {@link #stop()} owns
+     * the restoration, and undoing it here would strip a handler the node is still using.
+     */
+    private void releaseProcessWideState(Thread.UncaughtExceptionHandler handlerBeforeCassandra) {
+        try {
+            // Safe when nothing was registered: the hook list is simply empty.
+            JVMStabilityInspector.removeShutdownHooks();
+        } catch (Throwable ignored) {
+            // Best effort. The startup failure is the one worth reporting.
+        }
+        if (uncaughtExceptionHandler == null
+                && Thread.getDefaultUncaughtExceptionHandler() != handlerBeforeCassandra) {
+            Thread.setDefaultUncaughtExceptionHandler(handlerBeforeCassandra);
         }
     }
 
@@ -222,7 +265,7 @@ public final class CassandraService implements EmbeddedService {
             details.put("nativeTransportActive", String.valueOf(storage.isNativeTransportRunning()));
             details.put("load", storage.getLoadString());
             details.put("liveNodes", String.join(",", storage.getLiveNodes()));
-            details.put("ownership", formatOwnership(storage.getOwnershipWithPort()));
+            details.put("ownership", ownership(storage));
             details.put("jmx", jmx == null ? "not started" : jmx.serviceUrl());
             Throwable lastKill = killer == null ? null : killer.lastKillAttempt();
             if (lastKill != null) {
@@ -236,10 +279,38 @@ public final class CassandraService implements EmbeddedService {
         return details;
     }
 
+    /**
+     * Per-endpoint ring ownership, recomputed only when the ring itself has moved.
+     *
+     * <p>{@code getOwnershipWithPort()} is far too expensive to call on every poll:
+     * {@code TokenMetadata.getRingVersion()} aside, it takes the token metadata read lock once per
+     * token, which with the default 256 vnodes is 256 acquisitions per node in the ring — and
+     * {@code details()} is on the SPI's "must be cheap" list precisely because the health monitor
+     * polls it. The ring version changes on every membership or token change, so a cache keyed on
+     * it is exact rather than merely fresh-enough.
+     */
+    private String ownership(StorageService storage) {
+        long ringVersion = storage.getTokenMetadata().getRingVersion();
+        Ownership cached = ownership;
+        if (cached != null && cached.ringVersion() == ringVersion) {
+            return cached.formatted();
+        }
+        Ownership fresh = new Ownership(ringVersion, formatOwnership(storage.getOwnershipWithPort()));
+        ownership = fresh;
+        return fresh.formatted();
+    }
+
+    /** One computed ownership string and the ring version it was computed from. */
+    private record Ownership(long ringVersion, String formatted) {
+    }
+
     private static String formatOwnership(Map<String, Float> ownership) {
         return ownership.entrySet().stream()
                 .sorted(Map.Entry.comparingByKey())
-                .map(e -> e.getKey() + '=' + String.format("%.1f%%", e.getValue() * 100))
+                // Locale.ROOT, not the default: this string is machine-read as much as it is
+                // displayed, and under a locale such as fr_FR the default would render 100.0% as
+                // "100,0%" — which then collides with the comma that separates the entries.
+                .map(e -> e.getKey() + '=' + String.format(Locale.ROOT, "%.1f%%", e.getValue() * 100))
                 .collect(Collectors.joining(","));
     }
 
@@ -300,12 +371,22 @@ public final class CassandraService implements EmbeddedService {
         try {
             StorageService.instance.decommission(request.force());
         } catch (Throwable t) {
-            // The node is still up and still serving clients; only its operation mode records the
-            // failure, as DECOMMISSION_FAILED rather than a revert to NORMAL.
-            status = ServiceStatus.RUNNING;
+            // Ask the node what actually happened rather than assuming it is still a ring member.
+            // A throw from decommission() does not mean it stopped early: this fork runs its
+            // decommission hooks after unbootstrap(), completes the whole sequence — leaveRing,
+            // shutdownClientServers, Gossiper.stop, MessagingService.shutdown, Stage.shutdownNow,
+            // setMode(DECOMMISSIONED) — and only then throws if a hook failed, deliberately, since
+            // by then there is nothing left to roll back to. Reporting RUNNING on that path tells
+            // the operator this node is still serving a ring it has already left.
+            String mode = StorageService.instance.getOperationMode();
+            boolean left = MODE_DECOMMISSIONED.equals(mode);
+            status = left ? ServiceStatus.DECOMMISSIONED : ServiceStatus.RUNNING;
             throw new ServiceException(NAME,
-                    "Decommission failed; operation mode is now "
-                            + StorageService.instance.getOperationMode(), t);
+                    left
+                            ? "Decommission reported a failure after the node had already left the"
+                                    + " ring; operation mode is " + mode + ". The node is out of the"
+                                    + " cluster and cannot rejoin without bootstrapping."
+                            : "Decommission failed; operation mode is now " + mode, t);
         }
 
         String mode = StorageService.instance.getOperationMode();
@@ -377,10 +458,12 @@ public final class CassandraService implements EmbeddedService {
             if (jmx != null) {
                 step("stop JMX", () -> jmx.stop());
             }
-            status = ServiceStatus.STOPPED;
+            markStopped();
             return;
         }
-        status = ServiceStatus.STOPPING;
+        if (!isTerminalOutcome(status)) {
+            status = ServiceStatus.STOPPING;
+        }
 
         step("stop client transports", () -> daemon.destroyClientTransports());
         step("drain", () -> StorageService.instance.drain());
@@ -404,10 +487,32 @@ public final class CassandraService implements EmbeddedService {
         step("uncaught exception handler", this::restoreUncaughtExceptionHandler);
         step("logging", CassandraService::stopLoggerContext);
 
-        status = ServiceStatus.STOPPED;
+        markStopped();
         if (context != null) {
             context.reportEvent("INFO", "cassandra.stopped", "Cassandra node stopped");
         }
+    }
+
+    /**
+     * DECOMMISSIONED and FAILED survive {@code stop()}, exactly as they do in the OpenSearch
+     * runtime. Both say something STOPPED does not — that this node handed its data off before
+     * leaving, or that it died rather than being asked to leave — and the supervisor reports the
+     * outcome after the final stop, when every service has already been stopped. Overwriting them
+     * with STOPPED turns a decommissioned node into one that merely went away, and loses the
+     * post-mortem of a node that failed.
+     *
+     * <p>Not atomic, and does not need to be: every write to {@code status} happens on the
+     * supervisor's single lifecycle thread.
+     */
+    private void markStopped() {
+        if (!isTerminalOutcome(status)) {
+            status = ServiceStatus.STOPPED;
+        }
+    }
+
+    /** @return true for the two states {@code stop()} must not overwrite */
+    private static boolean isTerminalOutcome(ServiceStatus current) {
+        return current == ServiceStatus.DECOMMISSIONED || current == ServiceStatus.FAILED;
     }
 
     private void restoreUncaughtExceptionHandler() {

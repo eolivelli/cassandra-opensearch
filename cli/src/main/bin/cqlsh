@@ -41,7 +41,10 @@ EOF
     exit 1
 fi
 
-CQLSH_PYTHON="${CQLSH_PYTHON:-$(command -v python3 2> /dev/null)}"
+# `|| true` is load-bearing under `set -e`: an assignment whose value is a command substitution
+# takes that substitution's exit status, so on a machine with no python3 the script died at
+# rc=127 with no output at all and the message below was unreachable.
+CQLSH_PYTHON="${CQLSH_PYTHON:-$(command -v python3 2> /dev/null || true)}"
 if [ -z "$CQLSH_PYTHON" ]; then
     echo "cqlsh: no python3 on PATH. Install Python 3.8 or newer, or set CQLSH_PYTHON." >&2
     exit 1

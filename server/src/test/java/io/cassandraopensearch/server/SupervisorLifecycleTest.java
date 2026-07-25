@@ -20,6 +20,9 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -39,8 +42,23 @@ class SupervisorLifecycleTest {
 
     @AfterEach
     void stopSupervisor() {
+        // Opened first: a test that wedged a service must not leave the teardown wedged too.
+        openEveryGate();
         if (supervisor != null) {
             supervisor.stop();
+        }
+    }
+
+    private void openEveryGate() {
+        for (RecordingService service : List.of(cassandra, opensearch)) {
+            CountDownLatch startGate = service.startGate;
+            if (startGate != null) {
+                startGate.countDown();
+            }
+            CountDownLatch stopGate = service.stopGate;
+            if (stopGate != null) {
+                stopGate.countDown();
+            }
         }
     }
 
@@ -67,6 +85,30 @@ class SupervisorLifecycleTest {
             supervisor:
               health_check_interval: 50ms
             """;
+
+    /** Startup limits a test can afford to let expire. */
+    private static final String IMPATIENT = BOTH.replace("startup_timeout: 5s", "startup_timeout: 300ms");
+
+    /**
+     * Shutdown limits long enough that a test can hold a {@code stop()} open without {@link
+     * TimeLimited} giving up on it first — a drain that takes a while is not a drain that failed.
+     */
+    private static final String WEDGEABLE = BOTH.replace("shutdown_timeout: 5s", "shutdown_timeout: 60s");
+
+    private void awaitCall(String call) throws InterruptedException {
+        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+        while (true) {
+            synchronized (calls) {
+                if (calls.contains(call)) {
+                    return;
+                }
+            }
+            if (System.nanoTime() - deadline > 0) {
+                throw new AssertionError("timed out waiting for " + call + "; saw " + calls);
+            }
+            Thread.sleep(20);
+        }
+    }
 
     @Test
     void startsCassandraFirstAndStopsOpenSearchFirst() throws Exception {
@@ -204,6 +246,153 @@ class SupervisorLifecycleTest {
         assertThat(supervisor.failureMessage()).contains("opensearch").contains("FAILED");
         assertThat(calls).filteredOn(call -> call.endsWith(".stop"))
                 .containsExactly("opensearch.stop", "cassandra.stop");
+    }
+
+    /**
+     * S1. The one thing a JVM shutdown hook may not do is return early.
+     *
+     * <p>{@code Shutdown.runHooks()} halts the JVM as soon as every hook has returned. The
+     * observed failure: a fatal-error thread wins the shutdown CAS and is minutes into Cassandra's
+     * {@code drain()}; an operator sends SIGTERM; the hook loses the CAS and returns in 0 ms; the
+     * JVM halts on top of a half-drained node, which then replays its commit log on the next
+     * start. "Idempotent" has to mean the work happens once, not that the loser leaves.
+     */
+    @Test
+    void theShutdownHookBlocksUntilAnInFlightShutdownHasFinished() throws Exception {
+        Supervisor supervisor = supervisor(WEDGEABLE);
+        supervisor.start();
+        Thread hook = supervisor.shutdownHook();
+        assertThat(hook).isNotNull();
+
+        // Someone else is already inside the ordered shutdown, wedged where a drain would wedge.
+        CountDownLatch draining = new CountDownLatch(1);
+        cassandra.stopGate = draining;
+        Thread firstStopper = new Thread(supervisor::stop, "test-first-stopper");
+        firstStopper.start();
+        awaitCall("cassandra.stop");
+
+        AtomicReference<SupervisorState> stateWhenHookReturned = new AtomicReference<>();
+        AtomicReference<List<String>> callsWhenHookReturned = new AtomicReference<>();
+        Thread hookThread = new Thread(() -> {
+            hook.run();
+            stateWhenHookReturned.set(supervisor.state());
+            synchronized (calls) {
+                callsWhenHookReturned.set(new ArrayList<>(calls));
+            }
+        }, "test-jvm-shutdown-hook");
+        hookThread.start();
+
+        Thread.sleep(300);
+        assertThat(hookThread.isAlive())
+                .as("the hook returned while the shutdown was still inside cassandra.stop(); the"
+                        + " JVM would have halted on a half-drained node")
+                .isTrue();
+
+        draining.countDown();
+        hookThread.join(TimeUnit.SECONDS.toMillis(30));
+        firstStopper.join(TimeUnit.SECONDS.toMillis(30));
+
+        assertThat(hookThread.isAlive()).isFalse();
+        assertThat(stateWhenHookReturned.get()).isEqualTo(SupervisorState.STOPPED);
+        assertThat(callsWhenHookReturned.get())
+                .as("everything the shutdown had to do was done before the hook returned")
+                .containsExactly(
+                        "cassandra.start", "opensearch.start",
+                        "opensearch.stop", "opensearch.close",
+                        "cassandra.stop", "cassandra.close");
+    }
+
+    /** The same promise for the public API: stop() returns when the services are stopped. */
+    @Test
+    void anExplicitStopBlocksUntilAnInFlightShutdownHasFinished() throws Exception {
+        Supervisor supervisor = supervisor(WEDGEABLE);
+        supervisor.start();
+
+        CountDownLatch draining = new CountDownLatch(1);
+        cassandra.stopGate = draining;
+        Thread firstStopper = new Thread(supervisor::stop, "test-first-stopper");
+        firstStopper.start();
+        awaitCall("cassandra.stop");
+
+        Thread secondStopper = new Thread(supervisor::stop, "test-second-stopper");
+        secondStopper.start();
+        Thread.sleep(300);
+        assertThat(secondStopper.isAlive())
+                .as("stop() claims to stop every started service; returning here would have"
+                        + " stopped none of them")
+                .isTrue();
+
+        draining.countDown();
+        secondStopper.join(TimeUnit.SECONDS.toMillis(30));
+        firstStopper.join(TimeUnit.SECONDS.toMillis(30));
+        assertThat(secondStopper.isAlive()).isFalse();
+        assertThat(supervisor.state()).isEqualTo(SupervisorState.STOPPED);
+    }
+
+    /**
+     * A fatal error that arrives while a shutdown is already running is still a fatal error.
+     *
+     * <p>It loses the shutdown CAS, and the exit code used to stay 0 with a null failure message
+     * — telling systemd and the operator that a node which had just lost its commit log directory
+     * had stopped on request.
+     */
+    @Test
+    void aFatalErrorDuringAnInFlightShutdownStillReachesTheExitCode() throws Exception {
+        Supervisor supervisor = supervisor(WEDGEABLE);
+        supervisor.start();
+
+        CountDownLatch draining = new CountDownLatch(1);
+        cassandra.stopGate = draining;
+        Thread stopper = new Thread(supervisor::stop, "test-stopper");
+        stopper.start();
+        awaitCall("cassandra.stop");
+
+        cassandra.reportFatalError("commit log directory is unwritable");
+        draining.countDown();
+        stopper.join(TimeUnit.SECONDS.toMillis(30));
+
+        int exitCode = assertTimeoutPreemptively(Duration.ofSeconds(10), supervisor::awaitShutdown);
+        assertThat(exitCode).isEqualTo(1);
+        assertThat(supervisor.failureMessage()).contains("commit log directory is unwritable");
+        assertThat(supervisor.state()).isEqualTo(SupervisorState.FAILED);
+    }
+
+    /**
+     * S6. A {@code start()} that overran its deadline is still running, and the unwind must leave
+     * it alone.
+     *
+     * <p>Both runtimes latch {@code stop()} behind a CAS. Stopping an abandoned service during the
+     * unwind takes that one stop for a service that is still inside {@code daemon.activate()} —
+     * which ignores interrupts — and the late thread then finishes, publishes {@code RUNNING} and
+     * starts its watcher threads on top of a supervisor that has already declared it stopped.
+     * Nothing can stop those threads afterwards. Closing its ClassLoader is worse: the abandoned
+     * thread is executing out of it.
+     */
+    @Test
+    void anAbandonedStartupIsNeitherStoppedNorClosed() throws Exception {
+        Supervisor supervisor = supervisor(IMPATIENT);
+        // The grace is thirty seconds in production and no test can wait for it.
+        supervisor.startupGrace(Duration.ofMillis(100));
+        CountDownLatch neverComesUp = new CountDownLatch(1);
+        opensearch.startGate = neverComesUp;
+
+        assertThatThrownBy(supervisor::start)
+                .isInstanceOf(SupervisorException.class)
+                .hasMessageContaining("opensearch")
+                .hasMessageContaining("abandoned");
+
+        assertThat(calls)
+                .as("the abandoned service must not be stopped or closed; Cassandra still must be")
+                .containsExactly(
+                        "cassandra.start", "opensearch.start",
+                        "cassandra.stop", "cassandra.close");
+        assertThat(supervisor.state()).isEqualTo(SupervisorState.FAILED);
+        assertThat(supervisor.awaitShutdown()).isEqualTo(1);
+
+        // And when the abandoned startup finally does finish, it finds its stop() unused — which
+        // is the whole point: it is still the only thread that could ever stop it.
+        neverComesUp.countDown();
+        opensearch.startGate = null;
     }
 
     @Test

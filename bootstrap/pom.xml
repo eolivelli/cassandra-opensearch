@@ -13,5 +13,10 @@
   <dependencies>
     <dependency><groupId>io.cassandraopensearch</groupId><artifactId>cassandra-opensearch-spi</artifactId></dependency>
     <dependency><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId></dependency>
+    <!-- Test-only binding, as in server: bootstrap now logs the entries it skips and the
+         throwables status()/details() swallow, and without a binding those lines are dropped by
+         the NOP provider, which is the same silence they exist to end. Ships with slf4j-api
+         alone; the isolated loaders bring their own bindings. -->
+    <dependency><groupId>org.slf4j</groupId><artifactId>slf4j-simple</artifactId><scope>test</scope></dependency>
   </dependencies>
 </project>

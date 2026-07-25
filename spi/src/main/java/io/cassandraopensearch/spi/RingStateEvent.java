@@ -43,6 +43,12 @@ public record RingStateEvent(String state, boolean leaving, String detail) {
     /**
      * Reads back a message produced by {@link #toMessage()}.
      *
+     * <p>{@code leaving} must read exactly {@code true} or {@code false}. It is the field the
+     * supervisor keys its whole reaction on, and {@link Boolean#parseBoolean} maps everything it
+     * does not recognise — {@code yes}, {@code 1}, a typo — to {@code false}, which is the
+     * "nothing to do here" verdict. Silently disabling the watchdog is the one outcome a
+     * malformed message must not produce, so anything else rejects the message.
+     *
      * @return the event, or null if the message is not in this grammar. Null is not a failure to
      *         report: an event of this type from a service that predates the grammar, or a
      *         message an operator has reworded, means only that the supervisor has nothing it can
@@ -67,6 +73,9 @@ public record RingStateEvent(String state, boolean leaving, String detail) {
         if (state == null || state.isEmpty() || leaving == null) {
             return null;
         }
-        return new RingStateEvent(state, Boolean.parseBoolean(leaving), detail);
+        if (!"true".equals(leaving) && !"false".equals(leaving)) {
+            return null;
+        }
+        return new RingStateEvent(state, "true".equals(leaving), detail);
     }
 }

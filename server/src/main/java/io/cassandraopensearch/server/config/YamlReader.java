@@ -7,6 +7,7 @@
  */
 package io.cassandraopensearch.server.config;
 
+import java.math.BigInteger;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Collection;
@@ -88,23 +89,57 @@ final class YamlReader {
         return value;
     }
 
+    /**
+     * Reads a whole number.
+     *
+     * <p>Narrowing is refused rather than performed. {@code Number.intValue()} would turn {@code
+     * 9200.7} into {@code 9200} and {@code 4294967296} into {@code 0} — the second of which is
+     * then reported by {@link #port} as "found 0", naming a value the operator never wrote and
+     * sending them looking for a bug that is not there. Both are typos, and both stop the process.
+     */
     int integer(String key, int defaultValue) {
         Object value = values.get(key);
         if (value == null) {
             return defaultValue;
         }
-        if (value instanceof Number n) {
-            return n.intValue();
+        BigInteger whole = wholeNumber(value);
+        if (whole == null) {
+            throw new ConfigurationException(
+                    "'" + qualify(key) + "' in " + source + " must be a whole number, found "
+                            + describe(value) + " '" + value + "'.");
         }
-        throw new ConfigurationException(
-                "'" + qualify(key) + "' in " + source + " must be a number, found "
-                        + describe(value) + ".");
+        if (whole.bitLength() >= Integer.SIZE) {
+            throw new ConfigurationException(
+                    "'" + qualify(key) + "' in " + source + " must be between " + Integer.MIN_VALUE
+                            + " and " + Integer.MAX_VALUE + ", found " + whole + ".");
+        }
+        return whole.intValue();
+    }
+
+    /** The value as an exact integer, or null when it is not an integral type at all. */
+    private static BigInteger wholeNumber(Object value) {
+        if (value instanceof BigInteger big) {
+            return big;
+        }
+        // snakeyaml's SafeConstructor yields Integer, Long or BigInteger for an integer literal
+        // and Double for anything with a decimal point or an exponent.
+        if (value instanceof Integer || value instanceof Long
+                || value instanceof Short || value instanceof Byte) {
+            return BigInteger.valueOf(((Number) value).longValue());
+        }
+        return null;
     }
 
     /**
      * Reads a duration written the way the rest of the Cassandra and OpenSearch ecosystem writes
      * them: {@code 30s}, {@code 5m}, {@code 2h}, {@code 500ms}. A bare number is rejected rather
      * than assumed to be seconds, since guessing the unit is how timeouts end up 1000x wrong.
+     *
+     * <p>Zero and negative are rejected too. Every duration in this file is a limit on how long
+     * something may take or how often it repeats, and none of them has a sensible meaning at zero
+     * — {@code health_check_interval: 0s} used to reach {@code scheduleWithFixedDelay} and fail
+     * there with a bare {@code IllegalArgumentException: null}, hundreds of lines away from the
+     * key that caused it.
      */
     Duration duration(String key, Duration defaultValue) {
         Object value = values.get(key);
@@ -112,6 +147,16 @@ final class YamlReader {
             return defaultValue;
         }
         String text = String.valueOf(value).trim();
+        Duration parsed = parseDuration(key, text);
+        if (parsed.isZero() || parsed.isNegative()) {
+            throw new ConfigurationException(
+                    "'" + qualify(key) + "' in " + source + " must be a positive duration, found '"
+                            + text + "'.");
+        }
+        return parsed;
+    }
+
+    private Duration parseDuration(String key, String text) {
         try {
             if (text.endsWith("ms")) {
                 return Duration.ofMillis(Long.parseLong(text.substring(0, text.length() - 2).trim()));

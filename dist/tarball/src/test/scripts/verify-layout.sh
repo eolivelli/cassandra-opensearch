@@ -17,6 +17,7 @@ ARCHIVE="${1:?usage: verify-layout.sh <tarball> <work-directory>}"
 WORK="${2:?usage: verify-layout.sh <tarball> <work-directory>}"
 
 FAILURES=0
+SKIPS=0
 
 fail() {
     echo "  FAIL  $*" >&2
@@ -25,6 +26,13 @@ fail() {
 
 pass() {
     echo "  ok    $*"
+}
+
+# For a check that needs a tool this machine does not have. Counted and reported at the end
+# rather than passed silently: a check that quietly does nothing is worse than no check.
+skip() {
+    echo "  skip  $*" >&2
+    SKIPS=$((SKIPS + 1))
 }
 
 check() {
@@ -146,13 +154,41 @@ check "$([ "$(jars_matching lib/cassandra 'opensearch-[0-9]*.jar')" -eq 0 ] && e
 
 # --- conf/ on each child's classpath ---------------------------------------------------------
 
+# unzip is not part of a JDK-only machine's tool set, and without this guard its absence looked
+# exactly like a malformed manifest: `unzip -p` not being there prints nothing on stdout, and the
+# grep below then failed for a reason the message did not mention. The JDK's own jar tool is the
+# fallback, since this build requires a JDK 21 to have run at all.
+MANIFEST_TOOL=none
+if command -v unzip > /dev/null 2>&1; then
+    MANIFEST_TOOL=unzip
+elif [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/jar" ]; then
+    MANIFEST_TOOL=jar
+fi
+
+print_manifest() { # print_manifest <jar>
+    case "$MANIFEST_TOOL" in
+        unzip) unzip -p "$1" META-INF/MANIFEST.MF 2> /dev/null ;;
+        jar)
+            rm -rf "$WORK/manifest-check"
+            mkdir -p "$WORK/manifest-check"
+            (cd "$WORK/manifest-check" && "$JAVA_HOME/bin/jar" xf "$1" META-INF/MANIFEST.MF) \
+                > /dev/null 2>&1 || return 0
+            cat "$WORK/manifest-check/META-INF/MANIFEST.MF" 2> /dev/null
+            ;;
+    esac
+}
+
 for service in cassandra opensearch; do
     jar="$HOME_DIR/lib/$service/000-conf-classpath.jar"
     if [ ! -f "$jar" ]; then
         fail "lib/$service has no 000-conf-classpath.jar; the child loader will not see conf/"
         continue
     fi
-    if unzip -p "$jar" META-INF/MANIFEST.MF 2> /dev/null | tr -d '\r' | grep -q '^Class-Path: \.\./\.\./conf/$'; then
+    if [ "$MANIFEST_TOOL" = none ]; then
+        skip "lib/$service conf/ classpath: neither unzip nor \$JAVA_HOME/bin/jar is available"
+        continue
+    fi
+    if print_manifest "$jar" | tr -d '\r' | grep -q '^Class-Path: \.\./\.\./conf/$'; then
         pass "lib/$service puts conf/ on the child classpath"
     else
         fail "lib/$service/000-conf-classpath.jar does not carry Class-Path: ../../conf/"
@@ -230,25 +266,93 @@ if [ -x "$HOME_DIR/bin/cassandra-opensearch" ]; then
     # JDK 17 or a JDK 25 gets to fail later, somewhere much less legible. Which way round this
     # assertion goes depends on what JAVA_HOME actually is, so both directions get exercised
     # depending on where the build runs.
+    #
+    # The "accepts" half asserts a POSITIVE signal, not merely the absence of "requires Java 21":
+    # absence is also what a launcher that failed for some completely different reason produces,
+    # so the old form scored every other breakage as a pass. Port 1 is never listening, so a
+    # launcher that got all the way through to running the CLI jar exits 3 - the CLI's documented
+    # "nothing is running" - and says so. Nothing else in this script reaches that far.
     if [ -n "${JAVA_HOME:-}" ] && [ -x "${JAVA_HOME}/bin/java" ]; then
         AMBIENT_JAVA=$("${JAVA_HOME}/bin/java" -version 2>&1 \
             | awk -F'"' '/version/ { split($2, v, /[.-]/); print v[1]; exit }')
-        if "$HOME_DIR/bin/cassandra-opensearch" status 2>&1 | grep -q 'requires Java 21'; then
-            REJECTED=yes
+        STATUS_RC=0
+        STATUS_OUT=$(CASSANDRA_OPENSEARCH_JMX_PORT=1 "$HOME_DIR/bin/cassandra-opensearch" status 2>&1) \
+            || STATUS_RC=$?
+        if [ "$AMBIENT_JAVA" = 21 ]; then
+            if [ "$STATUS_RC" -eq 3 ] \
+                    && echo "$STATUS_OUT" | grep -q 'Cannot reach a cassandra-opensearch process'; then
+                pass "bin/cassandra-opensearch accepts the JDK 21 in JAVA_HOME and runs the CLI"
+            else
+                fail "bin/cassandra-opensearch did not reach the CLI on a JDK 21 (exit $STATUS_RC): $STATUS_OUT"
+            fi
         else
-            REJECTED=no
+            if echo "$STATUS_OUT" | grep -q 'requires Java 21'; then
+                pass "bin/cassandra-opensearch rejects the JDK $AMBIENT_JAVA in JAVA_HOME"
+            else
+                fail "bin/cassandra-opensearch did not reject the JDK $AMBIENT_JAVA (exit $STATUS_RC): $STATUS_OUT"
+            fi
         fi
-        if [ "$AMBIENT_JAVA" = 21 ] && [ "$REJECTED" = no ]; then
-            pass "bin/cassandra-opensearch accepts the JDK 21 in JAVA_HOME"
-        elif [ "$AMBIENT_JAVA" != 21 ] && [ "$REJECTED" = yes ]; then
-            pass "bin/cassandra-opensearch rejects the JDK $AMBIENT_JAVA in JAVA_HOME"
+    fi
+
+    # A conf/ directory without jvm21-server.options must stop the launcher, loudly, BEFORE it
+    # starts a JVM. The guard used to live in a function called from inside a command
+    # substitution, where its `exit 1` ended only the subshell: the launcher printed the error and
+    # then started the JVM anyway, with no --add-exports and no --add-opens, which dies inside
+    # startup with "IllegalAccessError: module java.rmi does not export sun.rmi.registry".
+    #
+    # The Dockerfile's own advice - mount a conf/ directory to change the bind addresses - is how
+    # an operator arrives here.
+    #
+    # `start -d` and not a foreground start: -d never execs, so a regression fails this check
+    # instead of hanging the build on a JVM that will not exit.
+    if [ -n "${JAVA_HOME:-}" ] && [ -x "${JAVA_HOME}/bin/java" ]; then
+        EMPTY_CONF="$WORK/conf-without-options"
+        rm -rf "$EMPTY_CONF"
+        mkdir -p "$EMPTY_CONF"
+        GUARD_PID="$WORK/should-never-be-written.pid"
+        rm -f "$GUARD_PID"
+        GUARD_RC=0
+        GUARD_OUT=$(CASSANDRA_OPENSEARCH_CONF="$EMPTY_CONF" \
+            CASSANDRA_OPENSEARCH_JMX_PORT=1 \
+            "$HOME_DIR/bin/cassandra-opensearch" start -d -p "$GUARD_PID" 2>&1) || GUARD_RC=$?
+
+        if [ "$GUARD_RC" -eq 0 ]; then
+            fail "bin/cassandra-opensearch start exited 0 with no conf/jvm21-server.options"
+        elif ! echo "$GUARD_OUT" | grep -q 'jvm21-server.options'; then
+            fail "a missing conf/jvm21-server.options is not reported by name: $GUARD_OUT"
+        elif echo "$GUARD_OUT" | grep -q 'started pid'; then
+            fail "bin/cassandra-opensearch started a JVM despite the missing conf/jvm21-server.options"
+        elif [ -f "$GUARD_PID" ]; then
+            fail "bin/cassandra-opensearch wrote $GUARD_PID despite the missing conf/jvm21-server.options"
         else
-            fail "bin/cassandra-opensearch got the JDK check wrong for Java $AMBIENT_JAVA (rejected=$REJECTED)"
+            pass "bin/cassandra-opensearch refuses to start without conf/jvm21-server.options"
+        fi
+
+        # Same for the tools: an empty conf/ has to stop nodetool before the JVM, not after.
+        NODETOOL_RC=0
+        NODETOOL_OUT=$(CASSANDRA_OPENSEARCH_CONF="$EMPTY_CONF" \
+            "$HOME_DIR/bin/nodetool" version 2>&1) || NODETOOL_RC=$?
+        if [ "$NODETOOL_RC" -ne 0 ] && echo "$NODETOOL_OUT" | grep -q 'jvm21-server.options'; then
+            pass "bin/nodetool refuses to run without conf/jvm21-server.options"
+        else
+            fail "bin/nodetool did not report the missing conf/jvm21-server.options (exit $NODETOOL_RC): $NODETOOL_OUT"
+        fi
+
+        # The tools must not drag jdk.incubator.vector in with them: it is there for jvector and
+        # Lucene inside the server, and every JDK that loads an incubator module warns about it
+        # first - on every single nodetool invocation an operator makes.
+        if "$HOME_DIR/bin/nodetool" version 2>&1 | grep -q 'Using incubator modules'; then
+            fail "bin/nodetool prints the JDK's incubator-module warning"
+        else
+            pass "bin/nodetool does not enable incubator modules"
         fi
     fi
 fi
 
 echo
+if [ "$SKIPS" -ne 0 ]; then
+    echo "$SKIPS check(s) skipped for missing tools" >&2
+fi
 if [ "$FAILURES" -eq 0 ]; then
     echo "distribution layout OK"
     exit 0

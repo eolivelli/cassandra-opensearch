@@ -62,6 +62,20 @@ final class RecordingService implements EmbeddedService, AutoCloseable {
      * phase it spends nearly all its time in, so a test can observe what happens meanwhile.
      */
     volatile CountDownLatch relocationGate;
+    /**
+     * When set, {@code start()} blocks on it and <b>ignores interrupts</b> — which is what
+     * Cassandra's {@code daemon.activate()} does. This is what an abandoned startup looks like.
+     */
+    volatile CountDownLatch startGate;
+    /** When set, {@code stop()} blocks on it; a shutdown wedged where a real drain would wedge. */
+    volatile CountDownLatch stopGate;
+    /** Run on entry to {@code awaitDecommissionReady}, so a test can cancel inside the long wait. */
+    volatile Runnable onAwaitDecommissionReady;
+    /**
+     * Run on entry to {@code prepareDecommission}. Lets a test cancel during a phase that — like
+     * the real ones — never looks at {@code isCancelled()}, so only the coordinator can catch it.
+     */
+    volatile Runnable onPrepareDecommission;
     /** The deadline the coordinator handed each phase, latest last. */
     final Map<String, Duration> phaseTimeouts = new LinkedHashMap<>();
     /** What {@code abortDecommission} saw on its context, for the cancelled-decommission case. */
@@ -80,8 +94,48 @@ final class RecordingService implements EmbeddedService, AutoCloseable {
 
     /** Bounded, so a test that forgets to open a gate fails rather than hanging the build. */
     private static void awaitGate(CountDownLatch gate) throws InterruptedException {
-        if (gate != null) {
-            gate.await(1, TimeUnit.MINUTES);
+        awaitGate(gate, null);
+    }
+
+    /**
+     * Waits on a gate while polling the phase's cancellation flag.
+     *
+     * <p>The polling is the point. {@code awaitDecommissionReady} is the one phase the real
+     * OpenSearch runtime spends minutes inside, and it is the phase that honours a cancellation by
+     * checking {@code isCancelled()} between polls. A fake that only slept could not tell a
+     * coordinator that cancels from one that does not, which is how a "cancelled decommission"
+     * test came to assert nothing about cancellation.
+     */
+    private static void awaitGate(CountDownLatch gate, DecommissionContext context)
+            throws InterruptedException {
+        if (gate == null) {
+            return;
+        }
+        long deadline = System.nanoTime() + TimeUnit.MINUTES.toNanos(1);
+        while (!gate.await(20, TimeUnit.MILLISECONDS)) {
+            if (context != null && context.isCancelled()) {
+                return;
+            }
+            if (System.nanoTime() - deadline > 0) {
+                return;
+            }
+        }
+    }
+
+    /** Ignores interrupts, the way a native server startup does. */
+    private static void awaitUninterruptibly(CountDownLatch gate) {
+        if (gate == null) {
+            return;
+        }
+        long deadline = System.nanoTime() + TimeUnit.MINUTES.toNanos(1);
+        while (System.nanoTime() - deadline < 0) {
+            try {
+                if (gate.await(20, TimeUnit.MILLISECONDS)) {
+                    return;
+                }
+            } catch (InterruptedException swallowed) {
+                // Deliberate: this is the behaviour that makes an abandoned start() dangerous.
+            }
         }
     }
 
@@ -94,6 +148,7 @@ final class RecordingService implements EmbeddedService, AutoCloseable {
     public void start(ServiceContext serviceContext) throws Exception {
         record("start");
         this.context = serviceContext;
+        awaitUninterruptibly(startGate);
         if (startFailure != null) {
             status = ServiceStatus.FAILED;
             throw startFailure;
@@ -120,6 +175,10 @@ final class RecordingService implements EmbeddedService, AutoCloseable {
     public void prepareDecommission(DecommissionContext decommission) throws Exception {
         record("prepareDecommission");
         phaseTimeouts.put("prepareDecommission", decommission.timeout());
+        Runnable onEntry = onPrepareDecommission;
+        if (onEntry != null) {
+            onEntry.run();
+        }
         awaitGate(prepareGate);
         status = ServiceStatus.DECOMMISSIONING;
         if (prepareFailure != null) {
@@ -144,7 +203,19 @@ final class RecordingService implements EmbeddedService, AutoCloseable {
     public boolean awaitDecommissionReady(DecommissionContext decommission) throws Exception {
         record("awaitDecommissionReady");
         phaseTimeouts.put("awaitDecommissionReady", decommission.timeout());
-        awaitGate(relocationGate);
+        Runnable onEntry = onAwaitDecommissionReady;
+        if (onEntry != null) {
+            onEntry.run();
+        }
+        if (decommission.isCancelled()) {
+            return false;
+        }
+        awaitGate(relocationGate, decommission);
+        if (decommission.isCancelled()) {
+            // The contract: gave up with work outstanding, without saying why. The coordinator is
+            // the one that knows it was cancelled.
+            return false;
+        }
         if (waitsForItsDeadline) {
             // What the real OpenSearch runtime does when shards will not move: poll until the
             // deadline in the context expires, then report that it gave up.
@@ -168,10 +239,17 @@ final class RecordingService implements EmbeddedService, AutoCloseable {
 
     @Override
     public void stop() {
+        // The CAS is what both real runtimes do, and it is why an abandoned start() must never be
+        // stopped: whoever wins it takes the one stop() the service will ever honour.
         if (!stopped.compareAndSet(false, true)) {
             return;
         }
         record("stop");
+        try {
+            awaitGate(stopGate);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
         if (status != ServiceStatus.DECOMMISSIONED) {
             status = ServiceStatus.STOPPED;
         }
