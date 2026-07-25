@@ -23,6 +23,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Callable;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * An {@link EmbeddedService} living inside an {@link IsolatedClassLoader}, presented to the
@@ -74,6 +75,17 @@ public final class IsolatedService implements EmbeddedService, AutoCloseable {
      * failure to read a status would take both servers down with it.
      */
     private volatile ServiceStatus lastObservedStatus = ServiceStatus.NEW;
+
+    /**
+     * How many {@link #status()} calls in a row have failed, reset by the first that succeeds.
+     *
+     * <p>The stale-status fallback above is deliberate — reporting {@code FAILED} because a status
+     * could not be read would take the whole JVM down — but on its own it leaves an operator with
+     * no way to tell "healthy" from "cannot be asked": a service whose loader is gone reports
+     * {@code RUNNING} to JMX and the CLI forever. This is the third signal, surfaced through
+     * {@link #details()}, where it costs nothing and no automated decision is taken on it.
+     */
+    private final AtomicInteger consecutiveStatusFailures = new AtomicInteger();
 
     private IsolatedService(String serviceName, IsolatedClassLoader loader, EmbeddedService delegate) {
         this.serviceName = serviceName;
@@ -161,7 +173,8 @@ public final class IsolatedService implements EmbeddedService, AutoCloseable {
      * @return the delegate's status, or the last one it managed to report. Never
      *         {@link ServiceStatus#FAILED} merely because the status could not be determined:
      *         {@code FAILED} means "this service has failed", the supervisor shuts the process
-     *         down on it, and "we could not ask" is not that.
+     *         down on it, and "we could not ask" is not that. {@link #details()} says which of the
+     *         two this was.
      */
     @Override
     public ServiceStatus status() {
@@ -170,23 +183,26 @@ public final class IsolatedService implements EmbeddedService, AutoCloseable {
             if (current != null) {
                 lastObservedStatus = current;
             }
+            consecutiveStatusFailures.set(0);
             return lastObservedStatus;
         } catch (Throwable t) {
             restoreInterruptIfInterrupted(t);
             ServiceStatus last = lastObservedStatus;
-            LOG.error("Could not read the status of service '{}'; reporting the last observed"
-                    + " status {} instead", serviceName, last, t);
+            int failures = consecutiveStatusFailures.incrementAndGet();
+            LOG.error("Could not read the status of service '{}' ({} consecutive failures);"
+                    + " reporting the last observed status {} instead", serviceName, failures, last, t);
             return last;
         }
     }
 
     @Override
     public Map<String, String> details() {
+        Map<String, String> details;
         try {
             // Copy inside the boundary. Handing the delegate's own Map instance to the supervisor
             // hands it an object loaded by the isolated loader, and anything that keeps the
             // details — a status response, a log line held in a buffer — pins the loader.
-            return callWithContextLoader(loader, () -> {
+            details = callWithContextLoader(loader, () -> {
                 Map<String, String> reported = delegate.details();
                 return reported == null
                         ? new LinkedHashMap<String, String>()
@@ -196,8 +212,29 @@ public final class IsolatedService implements EmbeddedService, AutoCloseable {
             // Throwable for the same reason as status(): both are called after close().
             restoreInterruptIfInterrupted(t);
             LOG.error("Could not read the details of service '{}'", serviceName, t);
-            return Map.of("error", String.valueOf(t));
+            details = new LinkedHashMap<>(Map.of("error", String.valueOf(t)));
         }
+        return describeStatusStaleness(details);
+    }
+
+    /**
+     * Adds the one thing {@link #status()} cannot say for itself: that the value it is reporting
+     * is the last one observed rather than a fresh one.
+     *
+     * <p>Without this a service whose loader has gone reports {@code RUNNING} to JMX and to {@code
+     * bin/cassandra-opensearch status} indefinitely, and nothing anywhere distinguishes it from a
+     * service that is genuinely running. It goes in {@code details()} rather than into the status
+     * itself precisely because nothing automated reads {@code details()} — the supervisor's health
+     * check acts on {@code status()}, and a status that meant two things would make it act on the
+     * wrong one.
+     */
+    private Map<String, String> describeStatusStaleness(Map<String, String> details) {
+        int failures = consecutiveStatusFailures.get();
+        if (failures > 0) {
+            details.put("status_stale", "true");
+            details.put("status_read_failures", String.valueOf(failures));
+        }
+        return details;
     }
 
     /**
@@ -205,10 +242,23 @@ public final class IsolatedService implements EmbeddedService, AutoCloseable {
      * cleared it. {@link #status()} and {@link #details()} may run on any thread, including one
      * the supervisor is in the middle of shutting down, and swallowing its interrupt leaves it
      * waiting for a stop signal that has already been sent.
+     *
+     * <p>The whole chain is walked, not just the top: an {@code InterruptedException} that reaches
+     * here is usually already wrapped — Netty's {@code PlatformDependent.throwException} is inside
+     * both real loaders, and both runtimes wrap what their executors throw — and looking only at
+     * the outermost type left the flag clear in exactly the common case. Bounded and
+     * cycle-checked, because the chain is assembled by code this project does not own.
      */
     private static void restoreInterruptIfInterrupted(Throwable t) {
-        if (t instanceof InterruptedException) {
-            Thread.currentThread().interrupt();
+        Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        int depth = 0;
+        for (Throwable current = t;
+             current != null && seen.add(current) && ++depth <= MAX_CAUSE_DEPTH;
+             current = current.getCause()) {
+            if (current instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+                return;
+            }
         }
     }
 

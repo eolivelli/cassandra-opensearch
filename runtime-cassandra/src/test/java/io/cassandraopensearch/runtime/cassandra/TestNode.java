@@ -65,13 +65,23 @@ final class TestNode implements AutoCloseable {
 
     /** Creates the node and its isolated loader, but does not start it. */
     static TestNode create(Path home) throws Exception {
+        return create(home, ADDRESS);
+    }
+
+    /**
+     * @param jmxAddress what to put in {@code cassandra.jmx.address}. Only the JMX connector reads
+     *                   it; {@code cassandra.yaml} still binds {@link #ADDRESS}, so a value that
+     *                   does not resolve fails {@link NodeJmxServer} and nothing else — which is
+     *                   the point of being able to set it.
+     */
+    static TestNode create(Path home, String jmxAddress) throws Exception {
         int offset = NODES_STARTED.getAndIncrement() * 10;
         int storagePort = intProperty("test.cassandra.storagePort", 17000) + offset;
         int nativePort = intProperty("test.cassandra.nativePort", 19042) + offset;
         int jmxPort = intProperty("test.cassandra.jmxPort", 17199) + offset;
 
         RecordingServiceContext context = new RecordingServiceContext(home, Map.of(
-                CassandraService.NAME + '.' + CassandraService.SETTING_JMX_ADDRESS, ADDRESS,
+                CassandraService.NAME + '.' + CassandraService.SETTING_JMX_ADDRESS, jmxAddress,
                 CassandraService.NAME + '.' + CassandraService.SETTING_JMX_PORT, String.valueOf(jmxPort),
                 CassandraService.NAME + '.' + CassandraService.SETTING_STARTUP_TIMEOUT_SECONDS, "180"));
 

@@ -56,8 +56,15 @@ final class RingStateWatcher {
      *
      * <p>Deliberately not {@code MOVING} or {@code DRAINING}: a node that is moving a token or
      * being drained is still a ring member and still owns its data, and excluding its OpenSearch
-     * half from shard allocation would relocate every shard away for nothing. {@code
-     * DECOMMISSION_FAILED} is excluded for the opposite reason — the node did not leave.
+     * half from shard allocation would relocate every shard away for nothing.
+     *
+     * <p>{@code DECOMMISSION_FAILED} is absent for a different reason, and not because the node is
+     * still a member — it is not: every path that produces that mode runs after
+     * {@code unbootstrap()} has called {@code leaveRing()}. It is absent because it is unreachable
+     * as a <i>transition</i> this watcher could report. The fork sets LEAVING before it starts, so
+     * the departure has already been announced from here by the time anything can fail, and
+     * re-announcing it would be a second event for one departure. {@code CassandraService} reports
+     * the outcome of that failure as FAILED; see {@code statusAfterFailedDecommission}.
      */
     private static final Set<String> LEAVING_THE_RING = Set.of("LEAVING", "DECOMMISSIONED");
 

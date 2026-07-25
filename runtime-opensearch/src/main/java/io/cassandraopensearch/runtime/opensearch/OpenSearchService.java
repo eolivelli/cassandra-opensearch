@@ -302,8 +302,12 @@ public final class OpenSearchService implements EmbeddedService {
             markStopped();
             return;
         }
-        ServiceStatus previous = status.get();
-        if (previous != ServiceStatus.DECOMMISSIONED) {
+        // The same two states markStopped() refuses to overwrite, and for the same reason: a node
+        // that decommissioned or that died is not "stopping", and STOPPING would erase the outcome
+        // the supervisor reads after the final stop. Guarding only DECOMMISSIONED here left FAILED
+        // out — unreachable today, but it is exactly the asymmetry isTerminalOutcome() exists to
+        // remove, and CassandraService.stop() has never had it.
+        if (!isTerminalOutcome(status.get())) {
             status.set(ServiceStatus.STOPPING);
         }
         try {
@@ -328,10 +332,12 @@ public final class OpenSearchService implements EmbeddedService {
      * asked to leave — and the supervisor reports the outcome after the final stop.
      */
     private void markStopped() {
-        status.updateAndGet(current ->
-                current == ServiceStatus.DECOMMISSIONED || current == ServiceStatus.FAILED
-                        ? current
-                        : ServiceStatus.STOPPED);
+        status.updateAndGet(current -> isTerminalOutcome(current) ? current : ServiceStatus.STOPPED);
+    }
+
+    /** @return true for the two states {@code stop()} must neither overwrite nor step on */
+    private static boolean isTerminalOutcome(ServiceStatus current) {
+        return current == ServiceStatus.DECOMMISSIONED || current == ServiceStatus.FAILED;
     }
 
     /** Best-effort cleanup of a half-built node after a failed {@code start()}. */
@@ -418,7 +424,7 @@ public final class OpenSearchService implements EmbeddedService {
         }
         ClusterState state = service.state();
         ClusterSnapshot cached = snapshot;
-        if (cached != null && cached.stateUuid().equals(state.stateUUID())) {
+        if (cached != null && cached.key().equals(ClusterSnapshot.key(state))) {
             return cached;
         }
         ClusterSnapshot fresh = ClusterSnapshot.of(state, nodeId);

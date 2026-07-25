@@ -8,10 +8,24 @@
 # is derived from "$0", which names the sourcing script rather than this file, and co_die calls
 # exit, which would take the sourcing shell with it. Call bin/cassandra-opensearch instead.
 
+# Defined first, because everything below it - starting with the very first assignment - may need
+# to fail with a message rather than with `set -e`'s silence.
+co_die() {
+    echo "cassandra-opensearch: $*" >&2
+    exit 1
+}
+
 # --- installation root ------------------------------------------------------------------
 
-# Follows symlinks, so `ln -s .../bin/cassandra-opensearch /usr/local/bin/` still finds conf/
-# and lib/ rather than looking for them in /usr/local.
+# Follows symlinks, so a script reached through `ln -s .../bin/cassandra-opensearch
+# /usr/local/bin/` finds conf/ and lib/ in the installation rather than in /usr/local.
+#
+# This function cannot be what makes that symlink work on its own, and it never could: it lives in
+# the file the sourcing script has to have found already. bin/cassandra-opensearch repeats the
+# resolution inline, before it looks for this include, which is what makes the symlink above
+# usable. The other wrappers in bin/ - nodetool, cqlsh, opensearch-plugin, opensearch-keystore -
+# deliberately do not: they take `dirname "$0"` at face value and must be invoked through their
+# real path. Symlink bin/cassandra-opensearch, or put bin/ on PATH.
 co_resolve_bin_dir() {
     _co_script="$1"
     while [ -h "$_co_script" ]; do
@@ -25,8 +39,13 @@ co_resolve_bin_dir() {
     cd -P "$(dirname "$_co_script")" > /dev/null && pwd
 }
 
-CO_BIN=$(co_resolve_bin_dir "$0")
-CO_HOME=$(cd -P "$CO_BIN/.." > /dev/null && pwd)
+# Both take the exit status of their command substitution, and both are read under `set -e`, so
+# each needs an explicit failure branch or the sourcing script dies silently on a bin/ that has
+# been moved out from under it.
+CO_BIN=$(co_resolve_bin_dir "$0") \
+    || co_die "cannot resolve the bin/ directory this script was run from ($0)."
+CO_HOME=$(cd -P "$CO_BIN/.." > /dev/null && pwd) \
+    || co_die "cannot resolve the installation root above $CO_BIN."
 CO_CONF="${CASSANDRA_OPENSEARCH_CONF:-$CO_HOME/conf}"
 CO_LOGS="${CASSANDRA_OPENSEARCH_LOGS:-$CO_HOME/logs}"
 
@@ -37,9 +56,33 @@ CO_LOGS="${CASSANDRA_OPENSEARCH_LOGS:-$CO_HOME/logs}"
 CO_JMX_HOST="${CASSANDRA_OPENSEARCH_JMX_HOST:-127.0.0.1}"
 CO_JMX_PORT="${CASSANDRA_OPENSEARCH_JMX_PORT:-7299}"
 
-co_die() {
-    echo "cassandra-opensearch: $*" >&2
-    exit 1
+# --- processes ---------------------------------------------------------------------------
+
+# Whether a pid names a process that is still there.
+#
+# `kill -0` alone is not that question. It answers EPERM, not ESRCH, for a live process owned by
+# another uid - a node started by root or by a service account, which is the ordinary case in an
+# installed deployment and in any container that drops privileges. Reading that as "not running"
+# is what let `start -d` launch a second JVM onto a data directory another JVM already had open.
+#
+# `ps -p` answers regardless of ownership and is POSIX, so it is the second opinion. Where there is
+# no ps - a stripped container image - the last resort is kill's own message: ESRCH is the only
+# failure that means the process is gone, so anything else is read as "still there". Every fallback
+# errs towards "alive", because refusing to start is recoverable and starting twice is not.
+co_process_is_alive() { # co_process_is_alive <pid>
+    if kill -0 "$1" 2> /dev/null; then
+        return 0
+    fi
+    if command -v ps > /dev/null 2>&1; then
+        if ps -p "$1" > /dev/null 2>&1; then
+            return 0
+        fi
+        return 1
+    fi
+    case "$(kill -0 "$1" 2>&1 || true)" in
+        *'o such process'*) return 1 ;;
+        *) return 0 ;;
+    esac
 }
 
 # --- java -------------------------------------------------------------------------------
@@ -48,7 +91,11 @@ if [ -n "$JAVA_HOME" ]; then
     JAVA="$JAVA_HOME/bin/java"
     [ -x "$JAVA" ] || co_die "JAVA_HOME is set to $JAVA_HOME but $JAVA is not executable."
 else
-    JAVA=$(command -v java 2> /dev/null)
+    # `|| true` is load-bearing, and this file is sourced by scripts that all run under `set -e`:
+    # an assignment whose value is a command substitution takes that substitution's exit status,
+    # so on a machine with no java the sourcing script died at rc=127 with no output at all and
+    # the co_die below was unreachable. Same shape as the one in bin/cqlsh.
+    JAVA=$(command -v java 2> /dev/null || true)
     [ -n "$JAVA" ] || co_die "no java on PATH and JAVA_HOME is not set."
 fi
 

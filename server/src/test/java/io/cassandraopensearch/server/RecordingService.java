@@ -69,6 +69,33 @@ final class RecordingService implements EmbeddedService, AutoCloseable {
     volatile CountDownLatch startGate;
     /** When set, {@code stop()} blocks on it; a shutdown wedged where a real drain would wedge. */
     volatile CountDownLatch stopGate;
+    /**
+     * When true, the {@link #stopGate} wait <b>ignores interrupts</b>, the way Cassandra's
+     * {@code drain()} does. This is what makes a {@code stop()} that overran its deadline
+     * genuinely still running when the supervisor gives up on it, rather than politely returning.
+     */
+    volatile boolean stopIgnoresInterrupts;
+    /**
+     * When set, {@code decommission()} blocks on it and never looks at {@code isCancelled()} —
+     * which is exactly what {@code StorageService.decommission()} does. The phase a shutdown
+     * cannot cancel.
+     */
+    volatile CountDownLatch decommissionGate;
+    /**
+     * When set, {@code status()} blocks on it, ignoring interrupts. A runtime whose status call
+     * has wedged; the supervisor must not be holding a lock while it waits for one.
+     */
+    volatile CountDownLatch statusGate;
+    /** Opened as {@code status()} enters {@link #statusGate}, so a test can wait for the wedge. */
+    final CountDownLatch statusWedged = new CountDownLatch(1);
+    /** When set, {@code stop()} throws it — including an {@code Error}, which a closed loader gives. */
+    volatile Throwable stopFailure;
+    /** When set, {@code status()} throws it once every service call is over. */
+    volatile Throwable statusFailureAfterStop;
+    /** When true, {@code status()} returns null after the service has been stopped. */
+    volatile boolean nullStatusAfterStop;
+    /** True once {@code stop()} has actually returned — not merely been entered. */
+    volatile boolean stopReturned;
     /** Run on entry to {@code awaitDecommissionReady}, so a test can cancel inside the long wait. */
     volatile Runnable onAwaitDecommissionReady;
     /**
@@ -158,7 +185,28 @@ final class RecordingService implements EmbeddedService, AutoCloseable {
 
     @Override
     public ServiceStatus status() {
+        CountDownLatch wedge = statusGate;
+        if (wedge != null) {
+            statusWedged.countDown();
+            awaitUninterruptibly(wedge);
+        }
+        if (stopped.get()) {
+            Throwable failure = statusFailureAfterStop;
+            if (failure != null) {
+                sneakyThrow(failure);
+            }
+            if (nullStatusAfterStop) {
+                // What a delegate returns when it can no longer work its state out. The supervisor
+                // must survive it: it feeds a ConcurrentHashMap, which rejects nulls.
+                return null;
+            }
+        }
         return status;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T extends Throwable> void sneakyThrow(Throwable t) throws T {
+        throw (T) t;
     }
 
     @Override
@@ -228,6 +276,9 @@ final class RecordingService implements EmbeddedService, AutoCloseable {
     public void decommission(DecommissionContext decommission) throws Exception {
         record("decommission");
         phaseTimeouts.put("decommission", decommission.timeout());
+        // Deliberately without a cancellation check: this is the phase that has none, and the
+        // point of the gate is to hold a shutdown against a decommission it cannot cancel.
+        awaitUninterruptibly(decommissionGate);
         if (decommissionFailure != null) {
             throw decommissionFailure;
         }
@@ -245,14 +296,23 @@ final class RecordingService implements EmbeddedService, AutoCloseable {
             return;
         }
         record("stop");
-        try {
-            awaitGate(stopGate);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+        if (stopIgnoresInterrupts) {
+            awaitUninterruptibly(stopGate);
+        } else {
+            try {
+                awaitGate(stopGate);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        Throwable failure = stopFailure;
+        if (failure != null) {
+            sneakyThrow(failure);
         }
         if (status != ServiceStatus.DECOMMISSIONED) {
             status = ServiceStatus.STOPPED;
         }
+        stopReturned = true;
     }
 
     @Override

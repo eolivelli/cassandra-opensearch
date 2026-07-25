@@ -342,6 +342,69 @@ class IsolatedClassLoaderTest {
     }
 
     /**
+     * The same, for the shape the interrupt actually arrives in.
+     *
+     * <p>A bare {@code InterruptedException} out of a delegate is the easy case and the one that
+     * was handled. What both real loaders produce is a wrapped one — Netty's {@code
+     * PlatformDependent.throwException} is inside each of them, and both runtimes wrap what their
+     * executors throw — and matching only on the outermost type left the flag clear in exactly the
+     * case that matters.
+     */
+    @Test
+    void statusPutsBackAnInterruptCarriedInsideAWrappedFailure() throws Exception {
+        try (IsolatedService service = IsolatedService.create("probe", IMPL, classpath())) {
+            RecordingServiceContext context = new RecordingServiceContext();
+            service.start(context);
+            assertThat(service.status()).isEqualTo(ServiceStatus.RUNNING);
+            assertThat(Thread.interrupted()).isFalse();
+
+            context.settings().put("probe.statusMode", "wrapped-interrupt");
+            try {
+                assertThat(service.status()).isEqualTo(ServiceStatus.RUNNING);
+                assertThat(Thread.currentThread().isInterrupted())
+                        .as("the interrupt was consumed by a catch two levels up from the"
+                                + " InterruptedException, and still has to be put back")
+                        .isTrue();
+            } finally {
+                Thread.interrupted();
+                context.settings().remove("probe.statusMode");
+            }
+        }
+    }
+
+    /**
+     * The third signal. {@code status()} answering with the last value it managed to read is the
+     * right trade — {@code FAILED} would take the JVM down over a status that could not be read —
+     * but on its own it makes a dead service indistinguishable from a healthy one: it reports
+     * {@code RUNNING} to JMX and to the CLI forever. "Cannot be asked" now says so, in {@code
+     * details()}, where nothing automated acts on it.
+     */
+    @Test
+    void detailsSayWhenTheStatusIsStaleRatherThanFreshlyRead() throws Exception {
+        try (IsolatedService service = IsolatedService.create("probe", IMPL, classpath())) {
+            RecordingServiceContext context = new RecordingServiceContext();
+            service.start(context);
+            assertThat(service.status()).isEqualTo(ServiceStatus.RUNNING);
+            assertThat(service.details()).doesNotContainKey("status_stale");
+
+            context.settings().put("probe.statusMode", "error");
+            assertThat(service.status()).isEqualTo(ServiceStatus.RUNNING);
+            assertThat(service.status()).isEqualTo(ServiceStatus.RUNNING);
+
+            assertThat(service.details())
+                    .as("the reported status is two polls old and nothing else says so")
+                    .containsEntry("status_stale", "true")
+                    .containsEntry("status_read_failures", "2");
+
+            context.settings().remove("probe.statusMode");
+            assertThat(service.status()).isEqualTo(ServiceStatus.RUNNING);
+            assertThat(service.details())
+                    .as("and a service that answers again is not stale")
+                    .doesNotContainKey("status_stale");
+        }
+    }
+
+    /**
      * {@code details()} used to hand the supervisor the delegate's own Map instance. Its class
      * belongs to the isolated loader, so every consumer that keeps a status response keeps the
      * loader.

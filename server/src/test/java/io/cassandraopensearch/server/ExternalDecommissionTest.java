@@ -240,6 +240,50 @@ class ExternalDecommissionTest {
     }
 
     /**
+     * R5. The catch-up exclusion ran on a daemon thread that was registered nowhere.
+     *
+     * <p>Its guard was a bare re-read of the state — a check-then-act with no lock and no latch —
+     * so a shutdown could move to {@code STOPPING} immediately after it and go on to {@code stop()}
+     * and {@code close()} the OpenSearch loader while this thread was inside {@code
+     * prepareDecommission}, executing out of it. Nothing cancelled it and nothing waited for it,
+     * and its call was the only one in the supervisor that {@link TimeLimited} did not bound.
+     *
+     * <p>It now gets what the coordinator gets: registered under the transition lock so the two
+     * cannot interleave, cancelled, waited for, and — when it is still inside the service after
+     * the budget — treated as an abandoned call rather than stopped and closed around.
+     */
+    @Test
+    void aShutdownWaitsForTheCatchUpExclusionRatherThanClosingOpenSearchUnderIt() throws Exception {
+        Supervisor supervisor = supervisor(WATCHING);
+        // A minute in production; what is asserted is what happens after it expires.
+        supervisor.decommissionCancelBudget(Duration.ofMillis(300));
+        supervisor.start();
+        CountDownLatch excluding = new CountDownLatch(1);
+        opensearch.prepareGate = excluding;
+
+        reportLeaving();
+        awaitCall("opensearch.prepareDecommission");
+
+        supervisor.stop();
+
+        assertThat(excluding.getCount())
+                .as("the premise: the exclusion is still inside OpenSearch")
+                .isEqualTo(1);
+        assertThat(calls)
+                .as("close() here closes the URLClassLoader that thread is executing out of")
+                .doesNotContain("opensearch.stop", "opensearch.close");
+        assertThat(calls)
+                .as("Cassandra is nobody else's and still has to be stopped")
+                .contains("cassandra.stop", "cassandra.close");
+        assertThat(supervisor.state()).isEqualTo(SupervisorState.FAILED);
+        assertThat(supervisor.awaitShutdown()).isEqualTo(1);
+        assertThat(supervisor.failureMessage()).contains("opensearch").contains("abandoned");
+
+        excluding.countDown();
+        opensearch.prepareGate = null;
+    }
+
+    /**
      * The listener runs supervisor code on a thread belonging to the service, and the SPI promises
      * {@code reportEvent} never throws. A defect on our side of that call must therefore not
      * surface inside Cassandra as a failure of whatever it was doing at the time.

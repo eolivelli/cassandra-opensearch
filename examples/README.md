@@ -36,6 +36,11 @@ node is a complete, independent installation — a node is a whole JVM hosting b
 | `decommission n` | retire node `n` through the coupled procedure |
 | `destroy` | stop everything and delete the directory — refuses if a node would not stop, unless `-f` |
 
+A node that was already stopped is not a node that "would not stop": the launcher reports exit
+code 3 for it, which is the CLI's "nothing is running", and `destroy` treats that as success. So
+destroying a cluster you have just stopped, or one you never started, needs no `-f`. Options may
+be written on either side of the command, so `destroy -f` and `-f destroy` are the same thing.
+
 ### Port plan
 
 Node `i` binds `127.0.0.i`, with ports at `21000 + i*10 + offset`:

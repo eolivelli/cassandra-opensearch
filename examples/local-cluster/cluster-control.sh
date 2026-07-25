@@ -16,6 +16,9 @@
 #   -d DIRECTORY      the cluster directory (default ./cluster)
 #   -f                destroy: delete even if a node could not be stopped
 #
+# Options may be written before or after the command, so `destroy -f` and `-f destroy` are the
+# same thing. A node that was already stopped is not a failure and does not need -f.
+#
 set -euo pipefail
 
 CLUSTER_DIR="$(pwd)/cluster"
@@ -37,6 +40,30 @@ while getopts ":d:fh" opt; do
     esac
 done
 shift $((OPTIND - 1))
+
+# A second pass over what is left. getopts stops at the first non-option word, so every flag
+# written after the command - `destroy -f`, which is the form the help above and the refusal
+# message below both document - was collected as a positional argument and silently dropped, and
+# -f did nothing at all unless it was written before the command as `-f destroy`.
+POSITIONAL=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -f|--force) FORCE=yes ;;
+        -d|--directory)
+            shift
+            [ $# -gt 0 ] || { echo "error: -d needs a directory" >&2; exit 2; }
+            CLUSTER_DIR=$1
+            ;;
+        -h|--help) usage; exit 2 ;;
+        -*) echo "error: unknown option '$1'" >&2; usage; exit 2 ;;
+        # No path or node number this script accepts contains whitespace - node numbers are 1..9 -
+        # so a space-separated list is enough and keeps this a plain POSIX-shaped loop.
+        *) POSITIONAL="$POSITIONAL $1" ;;
+    esac
+    shift
+done
+# shellcheck disable=SC2086  # deliberate word splitting; see above
+set -- $POSITIONAL
 
 COMMAND="${1:-}"
 NODE="${2:-}"
@@ -74,14 +101,27 @@ start_node() {
 # Records rather than swallows a failure. `destroy` deletes the data directory of every node it
 # stopped, and doing that to a node that is still running is how a JVM ends up writing sstables
 # into a directory that no longer exists.
+#
+# Exit code 3 is NOT a failure. It is the CLI's NOT_RUNNING - nothing was listening on the
+# supervisor's JMX port - which is the ordinary state of a node that has already been stopped, or
+# that was never started. The launcher propagates it verbatim. Reading it as "did not stop
+# cleanly" made `destroy` refuse to delete a cluster that was entirely down, which is the exact
+# case the README's worked example leaves behind, and create-cluster.sh then refuses to reuse the
+# directory - so the operator's only way out was rm -rf by hand.
 STOP_FAILURES=""
 stop_node() {
     local n=$1
+    local rc=0
     echo "==> stopping node$n"
-    if ! in_node "$n" cassandra-opensearch stop; then
-        echo "    node$n did not stop cleanly" >&2
-        STOP_FAILURES="$STOP_FAILURES $n"
-    fi
+    in_node "$n" cassandra-opensearch stop || rc=$?
+    case "$rc" in
+        0) ;;
+        3) echo "    node$n was not running" ;;
+        *)
+            echo "    node$n did not stop cleanly (exit $rc)" >&2
+            STOP_FAILURES="$STOP_FAILURES $n"
+            ;;
+    esac
 }
 
 case "$COMMAND" in

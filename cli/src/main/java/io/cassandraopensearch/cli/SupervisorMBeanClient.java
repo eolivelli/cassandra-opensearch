@@ -8,6 +8,10 @@
 package io.cassandraopensearch.cli;
 
 import java.io.IOException;
+import java.io.Serializable;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.rmi.server.RMIClientSocketFactory;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
@@ -82,6 +86,47 @@ final class SupervisorMBeanClient implements AutoCloseable {
             new String[] {"long"},
             new String[] {});
 
+    /**
+     * How long any single network operation this client performs may take.
+     *
+     * <p>Ten seconds and not the JDK default, which is no bound at all. {@code
+     * JMXConnectorFactory.connect} with a null environment hands the TCP connect to the operating
+     * system, so a JMX host that drops packets rather than refusing them — a firewall, a
+     * disappeared container, a stale address in {@code CASSANDRA_OPENSEARCH_JMX_HOST} — blocks for
+     * the kernel's SYN retry budget, measured at over 25 seconds on Linux and considerably longer
+     * elsewhere. That is not merely a slow {@code status}: {@code bin/cassandra-opensearch}'s
+     * {@code refuse_if_running} runs this on the way into <i>every</i> start, including the
+     * container image's {@code CMD}, so an unreachable JMX address delays every start by it.
+     */
+    private static final int TIMEOUT_MILLIS = Integer.getInteger(
+            "cassandra-opensearch.cli.jmx.timeout.millis", 10_000);
+
+    static {
+        // Bounds how long an idle pooled connection is kept before being discarded. The RMI
+        // transport reads it once, from a static initialiser of a class this process only ever
+        // loads through the connect below, so setting it here is early enough. Not overwritten:
+        // an operator who set it on the command line meant it.
+        defaultProperty("sun.rmi.transport.connectionTimeout", TIMEOUT_MILLIS);
+
+        // sun.rmi.transport.tcp.responseTimeout is deliberately NOT set, though it looks like it
+        // belongs beside the line above and was set here at first. It bounds how long a client
+        // waits for the *reply to a call*, not how long it waits to connect — and `decommission`
+        // legitimately blocks for as long as it takes to relocate every shard and stream every
+        // range, which the shipped configuration allows an hour for. With it set to ten seconds
+        // the reply never arrived: the transport tore the connection down mid-call, the CLI read
+        // that as the connection loss a completed decommission produces, and the operator was
+        // told the node had gone while it was still streaming.
+        //
+        // The connect this class actually needed to bound is the first hop, and BoundedSocketFactory
+        // below does that without touching call durations.
+    }
+
+    private static void defaultProperty(String name, int millis) {
+        if (System.getProperty(name) == null) {
+            System.setProperty(name, Integer.toString(millis));
+        }
+    }
+
     private final JMXConnector connector;
     private final MBeanServerConnection connection;
     private final ObjectName supervisor;
@@ -103,7 +148,7 @@ final class SupervisorMBeanClient implements AutoCloseable {
     static SupervisorMBeanClient connect(String serviceUrl) {
         JMXConnector connector;
         try {
-            connector = JMXConnectorFactory.connect(new JMXServiceURL(serviceUrl), null);
+            connector = JMXConnectorFactory.connect(new JMXServiceURL(serviceUrl), connectEnvironment());
         } catch (IOException e) {
             throw new CliException(CliException.NOT_RUNNING,
                     "Cannot reach a cassandra-opensearch process at " + serviceUrl
@@ -120,6 +165,95 @@ final class SupervisorMBeanClient implements AutoCloseable {
                 throw cliException;
             }
             throw new CliException(CliException.FAILED, "JMX connection to " + serviceUrl + " failed", e);
+        }
+    }
+
+    /**
+     * The environment every connection this class makes is built with.
+     *
+     * <p>Package-private so the timeouts can be asserted: an unbounded connect is invisible until
+     * the day it is not, and "it was fast on my machine" is not evidence that a bound exists.
+     *
+     * <ul>
+     *   <li>{@code com.sun.jndi.rmi.factory.socket} is the one that matters. The first thing a
+     *       {@code service:jmx:rmi:///jndi/rmi://host:port/jmxrmi} URL does is a JNDI lookup of the
+     *       RMI registry, and that is the hop that hangs against an unreachable host. It is also
+     *       the only socket in the exchange this side gets to choose.</li>
+     *   <li>{@code jmx.remote.x.client.connection.check.period} switches off the client's
+     *       background heartbeat. This CLI is a short-lived process that makes one call and exits;
+     *       the heartbeat only adds a non-daemon thread and a second way to block.</li>
+     * </ul>
+     */
+    static Map<String, Object> connectEnvironment() {
+        Map<String, Object> environment = new LinkedHashMap<>();
+        environment.put("com.sun.jndi.rmi.factory.socket", new BoundedSocketFactory(TIMEOUT_MILLIS));
+        environment.put("jmx.remote.x.client.connection.check.period", 0L);
+        return environment;
+    }
+
+    /**
+     * An {@link RMIClientSocketFactory} that connects with a deadline instead of without one.
+     *
+     * <p>{@code new Socket(host, port)} blocks in the kernel until the SYN retry budget runs out;
+     * {@code Socket.connect(address, timeout)} does not. The read timeout is set for the same
+     * reason on the other side of the exchange: a host that accepts the connection and then says
+     * nothing is as good as a hang.
+     *
+     * <p><b>Scope.</b> This factory is supplied through {@code com.sun.jndi.rmi.factory.socket},
+     * so it covers exactly one hop: the JNDI lookup of the {@code RMIServer} stub in the registry.
+     * That is a single short request and response, which is why a read timeout is safe here. Every
+     * later hop — {@code newClient()} and every MBean call after it — goes through a socket factory
+     * the *server* supplies, which this class cannot reach and must not try to bound: those calls
+     * include {@code decommission}, which blocks for as long as the operation takes.
+     *
+     * <p>{@link Serializable} because {@code RMIClientSocketFactory} implementations normally
+     * travel inside a stub. This one never does — it is supplied client-side, through the JNDI
+     * environment — but a factory that could not be serialised if it ever were is a trap for
+     * whoever moves it.
+     */
+    private static final class BoundedSocketFactory implements RMIClientSocketFactory, Serializable {
+
+        private static final long serialVersionUID = 1L;
+
+        private final int timeoutMillis;
+
+        BoundedSocketFactory(int timeoutMillis) {
+            this.timeoutMillis = timeoutMillis;
+        }
+
+        @Override
+        public Socket createSocket(String host, int port) throws IOException {
+            Socket socket = new Socket();
+            try {
+                socket.connect(new InetSocketAddress(host, port), timeoutMillis);
+                socket.setSoTimeout(timeoutMillis);
+            } catch (IOException | RuntimeException failure) {
+                try {
+                    socket.close();
+                } catch (IOException ignored) {
+                    // Already failing for a better reason.
+                }
+                throw failure;
+            }
+            return socket;
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            // RMI compares factories to decide whether two stubs may share a connection; without
+            // this every lookup would open its own.
+            return other instanceof BoundedSocketFactory factory
+                    && factory.timeoutMillis == timeoutMillis;
+        }
+
+        @Override
+        public int hashCode() {
+            return timeoutMillis;
+        }
+
+        @Override
+        public String toString() {
+            return "BoundedSocketFactory(" + timeoutMillis + "ms)";
         }
     }
 

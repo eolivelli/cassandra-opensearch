@@ -77,6 +77,11 @@ public final class CassandraService implements EmbeddedService {
 
     private static final String MODE_NORMAL = "NORMAL";
     private static final String MODE_DECOMMISSIONED = "DECOMMISSIONED";
+    /**
+     * The mode the fork leaves behind when {@code decommission()} threw <i>after</i>
+     * {@code unbootstrap()}; see {@link #statusAfterFailedDecommission}.
+     */
+    private static final String MODE_DECOMMISSION_FAILED = "DECOMMISSION_FAILED";
     private static final Duration SHUTDOWN_STEP_TIMEOUT = Duration.ofMinutes(1);
 
     private final AtomicBoolean stopped = new AtomicBoolean();
@@ -379,10 +384,9 @@ public final class CassandraService implements EmbeddedService {
             // by then there is nothing left to roll back to. Reporting RUNNING on that path tells
             // the operator this node is still serving a ring it has already left.
             String mode = StorageService.instance.getOperationMode();
-            boolean left = MODE_DECOMMISSIONED.equals(mode);
-            status = left ? ServiceStatus.DECOMMISSIONED : ServiceStatus.RUNNING;
+            status = statusAfterFailedDecommission(mode);
             throw new ServiceException(NAME,
-                    left
+                    MODE_DECOMMISSIONED.equals(mode)
                             ? "Decommission reported a failure after the node had already left the"
                                     + " ring; operation mode is " + mode + ". The node is out of the"
                                     + " cluster and cannot rejoin without bootstrapping."
@@ -391,7 +395,7 @@ public final class CassandraService implements EmbeddedService {
 
         String mode = StorageService.instance.getOperationMode();
         if (!MODE_DECOMMISSIONED.equals(mode)) {
-            status = ServiceStatus.RUNNING;
+            status = statusAfterFailedDecommission(mode);
             throw new ServiceException(NAME,
                     "Decommission returned without leaving the ring; operation mode is " + mode);
         }
@@ -401,6 +405,34 @@ public final class CassandraService implements EmbeddedService {
         // reported this very transition off its own poll. This one says something the mode alone
         // does not — that the node left because the supervisor asked it to.
         context.reportEvent("INFO", "cassandra.decommissioned", "this node has left the ring");
+    }
+
+    /**
+     * What to report once a decommission has ended in something other than success.
+     *
+     * <p>Three answers, and the middle one is the reason this is a method rather than a ternary:
+     *
+     * <ul>
+     *   <li>{@code DECOMMISSIONED} — it worked; only a hook or a shutdown step complained.</li>
+     *   <li>{@code DECOMMISSION_FAILED} — <b>not</b> RUNNING. The fork sets this mode from the
+     *       catch blocks at the very bottom of {@code StorageService.decommission()}, every one of
+     *       which sits <i>after</i> {@code unbootstrap()} has already called {@code leaveRing()}:
+     *       the endpoint is out of {@code TokenMetadata}, LEFT has been gossiped and the bootstrap
+     *       state is persisted. A bare {@code InterruptedException}, or a throw from
+     *       {@code shutdownClientServers()}, {@code Gossiper.stop()} or {@code Stage.shutdownNow()},
+     *       all land here. The node holds no ranges and is serving nothing; calling that RUNNING is
+     *       the same lie about the same code path that the {@code DECOMMISSIONED} branch above
+     *       exists to prevent. FAILED also survives {@link #markStopped()}, so the post-mortem
+     *       reaches the operator after the supervisor's final stop.</li>
+     *   <li>anything else — NORMAL, LEAVING, MOVING: the ring is intact and the node really is
+     *       still serving, so RUNNING is the truth.</li>
+     * </ul>
+     */
+    private static ServiceStatus statusAfterFailedDecommission(String mode) {
+        if (MODE_DECOMMISSIONED.equals(mode)) {
+            return ServiceStatus.DECOMMISSIONED;
+        }
+        return MODE_DECOMMISSION_FAILED.equals(mode) ? ServiceStatus.FAILED : ServiceStatus.RUNNING;
     }
 
     /**
@@ -463,6 +495,16 @@ public final class CassandraService implements EmbeddedService {
         }
         if (!isTerminalOutcome(status)) {
             status = ServiceStatus.STOPPING;
+        }
+
+        // Before every step that shuts something down, and in particular before drain(). The
+        // GCInspector this node registered is a listener on the JVM's own garbage-collector
+        // MXBeans, and on an old-generation collection it submits to an executor drain() has
+        // already stopped; the platform beans dispatch listeners in a bare loop, so the
+        // RejectedExecutionException that follows also silences every listener behind it. Taking
+        // it off first closes that window instead of leaving it open for the whole teardown.
+        if (jmx != null) {
+            step("detach GCInspector", () -> jmx.detachGcInspector());
         }
 
         step("stop client transports", () -> daemon.destroyClientTransports());

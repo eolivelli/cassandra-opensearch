@@ -79,6 +79,9 @@ final class NodeJmxServer {
         MBeanServer federated = MBeanWrapper.instance.getMBeanServer();
         NodeMBeanWrapper wrapper = NodeMBeanWrapper.current();
         if (wrapper == null) {
+            // Outside the compensation below on purpose: no NodeMBeanWrapper was constructed, so no
+            // private MBeanServer was created either — whatever MBeanWrapper.instance resolved to
+            // is using the platform server, which is not ours to release.
             throw new IllegalStateException(
                     "MBeanWrapper.instance resolved to " + MBeanWrapper.instance.getClass().getName()
                             + " instead of " + NodeMBeanWrapper.class.getName()
@@ -86,22 +89,29 @@ final class NodeJmxServer {
                             + " set before any Cassandra class touches MBeanWrapper.");
         }
 
-        RMIServerSocketFactory socketFactory =
-                new RMIServerSocketFactoryImpl(InetAddress.getByName(bindAddress));
-        Map<String, Object> env = new HashMap<>();
-        env.put(RMIConnectorServer.RMI_SERVER_SOCKET_FACTORY_ATTRIBUTE, socketFactory);
-        env.put("jmx.remote.x.daemon", "true");
-        env.put("jmx.remote.rmi.server.credentials.filter.pattern", String.class.getName() + ";!*");
-
-        // Everything from here on can fail on something as ordinary as the port already being
-        // taken, and by this point the private MBeanServer exists. MBeanServerFactory holds every
-        // server it creates in a JVM-global list until it is explicitly released, so a server
-        // dropped on the floor here keeps this node's MBeans — and the isolated ClassLoader that
-        // loaded them — alive for the life of the process. start() is called once, from a start()
-        // that will not be retried, so nothing else ever comes back for it.
+        // Everything from here on can fail, and by this point the private MBeanServer exists.
+        // MBeanServerFactory holds every server it creates in a JVM-global list until it is
+        // explicitly released, so a server dropped on the floor here keeps this node's MBeans — and
+        // the isolated ClassLoader that loaded them — alive for the life of the process. start() is
+        // called once, from a start() that will not be retried, so nothing else ever comes back for
+        // it: CassandraService.stop() takes the daemon == null / jmx == null branch and never sees
+        // this wrapper.
+        //
+        // The try opens HERE, above the socket factory, and not at the registry below. Both
+        // statements in between throw on ordinary misconfiguration —
+        // InetAddress.getByName(bindAddress) with an unresolvable cassandra.jmx.address is an
+        // UnknownHostException before a single socket has been asked for — and a boundary drawn
+        // after them leaks exactly the same MBeanServer as no boundary at all.
         JMXServerUtils.JmxRegistry registry = null;
         JMXConnectorServer connectorServer = null;
         try {
+            RMIServerSocketFactory socketFactory =
+                    new RMIServerSocketFactoryImpl(InetAddress.getByName(bindAddress));
+            Map<String, Object> env = new HashMap<>();
+            env.put(RMIConnectorServer.RMI_SERVER_SOCKET_FACTORY_ATTRIBUTE, socketFactory);
+            env.put("jmx.remote.x.daemon", "true");
+            env.put("jmx.remote.rmi.server.credentials.filter.pattern", String.class.getName() + ";!*");
+
             registry = new JMXServerUtils.JmxRegistry(port, null, socketFactory, "jmxrmi");
             RMIJRMPServerImpl rmiServer = new RMIJRMPServerImpl(port, null, socketFactory, env);
             JMXServiceURL url = new JMXServiceURL("rmi", bindAddress, port);
@@ -147,6 +157,21 @@ final class NodeJmxServer {
     /** The URL a remote {@code nodetool} or {@code JMXConnector} connects to. */
     String serviceUrl() {
         return serviceUrl;
+    }
+
+    /**
+     * Takes this node's {@code GCInspector} off the platform garbage-collector MXBeans, and nothing
+     * else.
+     *
+     * <p>Separate from {@link #stop()} because it has to happen earlier than {@code stop()} does.
+     * {@code stop()} is the third step of {@link CassandraService#stop()}, after
+     * {@code destroyClientTransports()} and {@code drain()} — and {@code drain()} shuts down the
+     * executor that {@code GCInspector}'s notification handler submits
+     * {@code LifecycleTransaction.rescheduleFailedDeletions()} to. See
+     * {@link NodeMBeanWrapper#detachGcInspector()} for what a throw from there costs.
+     */
+    void detachGcInspector() {
+        wrapper.detachGcInspector();
     }
 
     /**

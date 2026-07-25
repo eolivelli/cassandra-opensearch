@@ -16,8 +16,10 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -122,6 +124,14 @@ public final class DecommissionCoordinator {
      * check a cancelled run carried on to the next phase and drove a service the caller had
      * already begun shutting down.
      *
+     * <p>There is one phase it cannot reach, and callers have to plan for it: {@code
+     * decommission-cassandra} sits past the last boundary check, {@code
+     * StorageService.decommission()} polls nothing and ignores interrupts, and the {@link
+     * TimeLimited} bound on it is {@code ring_streaming_timeout} plus a grace — an hour and a half
+     * by default. A cancellation that arrives there is not observed at all until that call returns,
+     * and the node has left the ring by then. Cancelling is still correct; expecting it to be
+     * prompt is not.
+     *
      * <p>This only asks. {@link #awaitCompletion} is how a caller finds out that it happened.
      */
     public void cancel() {
@@ -131,6 +141,26 @@ public final class DecommissionCoordinator {
     /** True once {@link #run} has returned or thrown, so the services are nobody's but the caller's. */
     boolean isFinished() {
         return finished.getCount() == 0;
+    }
+
+    /**
+     * The services this coordinator drives, in the order it drives them.
+     *
+     * <p>Used by a shutdown that gave up waiting for the run to unwind: these are the services it
+     * must not stop or close, because this coordinator is still inside them and stops them itself.
+     */
+    Set<String> serviceNames() {
+        // The keys the supervisor knows these services by, which are the keys it looks them up in
+        // `started` and records them in `abandoned` under — not EmbeddedService.name(), which a
+        // service supplies for itself.
+        Set<String> names = new LinkedHashSet<>();
+        if (opensearch != null) {
+            names.add("opensearch");
+        }
+        if (cassandra != null) {
+            names.add("cassandra");
+        }
+        return names;
     }
 
     /**

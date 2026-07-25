@@ -178,10 +178,12 @@ public final class NodeMBeanWrapper implements MBeanWrapper {
      *       {@code GCInspector} silently stops working.</li>
      * </ul>
      *
-     * <p>Done here, at the start of the teardown, rather than at the end: from this point on the
-     * node's executors begin going down, which is exactly when a late notification would throw.
+     * <p>Package-private and idempotent — {@code gcInspector} is cleared on the way through — so
+     * that {@link CassandraService#stop()} can run it as its <i>first</i> teardown step, before
+     * {@code drain()} shuts down the executor {@code rescheduleFailedDeletions()} submits to.
+     * {@link #close()} calls it again for the paths that never get that far.
      */
-    private void detachGcInspector() {
+    void detachGcInspector() {
         Object registered = gcInspector;
         gcInspector = null;
         if (!(registered instanceof NotificationListener listener)) {
@@ -199,6 +201,12 @@ public final class NodeMBeanWrapper implements MBeanWrapper {
                     // collector; one this inspector never subscribed to is not a problem.
                 }
             }
+            // Logged, and named, because when this runs is the whole point: it has to be before
+            // drain(), and the node's own log is where that ordering is visible after the fact.
+            // Resolved on demand rather than held in a static field, as CassandraService does, so
+            // that loading this class cannot initialise logback before cassandra.logdir is set.
+            org.slf4j.LoggerFactory.getLogger(NodeMBeanWrapper.class)
+                    .info("{} detached from the platform garbage-collector MXBeans", GC_INSPECTOR);
         } catch (Exception ignored) {
             // Best effort, like the rest of close(): a teardown must not fail on its own cleanup.
         }

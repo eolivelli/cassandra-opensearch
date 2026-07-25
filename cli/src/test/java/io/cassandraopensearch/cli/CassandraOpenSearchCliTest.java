@@ -10,10 +10,13 @@ package io.cassandraopensearch.cli;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.PrintStream;
+import java.net.InetAddress;
 import java.net.ServerSocket;
+import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.rmi.ConnectException;
 import java.rmi.RemoteException;
+import java.rmi.server.RMIClientSocketFactory;
 import java.time.Duration;
 
 import org.junit.jupiter.api.AfterEach;
@@ -292,6 +295,86 @@ class CassandraOpenSearchCliTest {
                     new String[] {"status", "--quiet", "--jmx-port", port}))
                     .isInstanceOf(CliException.class);
             assertThat(stdout()).isEmpty();
+        }
+    }
+
+    // --- the connect deadline ------------------------------------------------------------------
+
+    /**
+     * Every network operation this CLI performs has to be bounded, and by something it chose.
+     *
+     * <p>{@code JMXConnectorFactory.connect(url, null)} hands the TCP connect to the operating
+     * system, so a JMX host that drops packets rather than refusing them blocks for the kernel's
+     * SYN retry budget — measured at over 25 seconds on Linux, and unbounded in the sense that
+     * matters: it is a property of the machine, not of this program. That is not only a slow
+     * {@code status}. {@code bin/cassandra-opensearch}'s {@code refuse_if_running} runs a
+     * {@code status --quiet} on the way into <i>every</i> start, including the container image's
+     * {@code CMD}, so an unreachable JMX address taxes every start by it.
+     *
+     * <p>These assert the configuration rather than a wall-clock measurement on purpose: whether a
+     * given address blackholes or refuses is a property of the network the test happens to run on,
+     * and a timing test that passes because the packet was refused quickly proves nothing at all.
+     */
+    @Nested
+    class ConnectDeadline {
+
+        @Test
+        void theConnectEnvironmentCarriesASocketFactoryOfOurOwn() {
+            assertThat(SupervisorMBeanClient.connectEnvironment())
+                    .containsKey("com.sun.jndi.rmi.factory.socket")
+                    .containsEntry("jmx.remote.x.client.connection.check.period", 0L);
+            assertThat(SupervisorMBeanClient.connectEnvironment().get("com.sun.jndi.rmi.factory.socket"))
+                    .as("the JNDI registry lookup is the hop that hangs, and the only socket in the"
+                            + " exchange this side gets to choose")
+                    .isInstanceOf(RMIClientSocketFactory.class);
+        }
+
+        /**
+         * The factory has to apply the bound, not merely exist. A read timeout is the observable
+         * half — a host that accepts and then says nothing is as good as a hang, and it is the same
+         * number the connect uses.
+         */
+        @Test
+        void theSocketsItMakesAreBoundedInBothDirections() throws IOException {
+            RMIClientSocketFactory factory = (RMIClientSocketFactory)
+                    SupervisorMBeanClient.connectEnvironment().get("com.sun.jndi.rmi.factory.socket");
+
+            try (ServerSocket listening = new ServerSocket(0, 1, InetAddress.getLoopbackAddress());
+                 Socket socket = factory.createSocket(
+                         listening.getInetAddress().getHostAddress(), listening.getLocalPort())) {
+                assertThat(socket.isConnected()).isTrue();
+                assertThat(socket.getSoTimeout()).isPositive();
+            }
+        }
+
+        /**
+         * The idle-connection bound is set; the <em>response</em> bound must not be.
+         *
+         * <p>This is a regression test with a scar behind it. An earlier version set both, on the
+         * reasoning that the second hop uses a server-supplied socket factory this side cannot
+         * replace and therefore had to be bounded by RMI properties instead. That is true of the
+         * connect and false of the call: {@code sun.rmi.transport.tcp.responseTimeout} bounds how
+         * long the client waits for the <em>reply</em>, and {@code decommission} legitimately
+         * blocks for as long as it takes to relocate every shard and stream every range — an hour,
+         * in the shipped configuration.
+         *
+         * <p>At ten seconds the transport tore the connection down mid-call. The CLI read that as
+         * the connection loss a <em>completed</em> decommission produces and told the operator the
+         * node had gone, while it was still streaming. {@code TwoNodeDecommissionIT} caught it; no
+         * unit test could have, because the defect only appears on a call that outlives the bound.
+         */
+        @Test
+        void theResponseTimeoutIsNotSetBecauseCallsCanLegitimatelyRunForAnHour() {
+            assertThat(SupervisorMBeanClient.connectEnvironment()).isNotNull();  // forces the class
+
+            assertThat(System.getProperty("sun.rmi.transport.connectionTimeout"))
+                    .as("an idle pooled connection should still be discarded")
+                    .isNotNull()
+                    .satisfies(value -> assertThat(Long.parseLong(value)).isPositive());
+
+            assertThat(System.getProperty("sun.rmi.transport.tcp.responseTimeout"))
+                    .as("bounding the reply to a call would cut short a running decommission")
+                    .isNull();
         }
     }
 

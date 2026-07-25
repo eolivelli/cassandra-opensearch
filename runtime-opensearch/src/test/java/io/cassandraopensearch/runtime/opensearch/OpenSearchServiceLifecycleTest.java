@@ -13,8 +13,10 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.lang.reflect.Field;
 import java.nio.file.Path;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -88,6 +90,40 @@ class OpenSearchServiceLifecycleTest {
         assertThat(new Rest(HTTP_PORT).get("/_cluster/health").status()).isEqualTo(200);
         // Same data directory, so the node keeps its identity across the restart.
         assertThat(service.details().get("node.id")).isEqualTo(firstNodeId);
+    }
+
+    /**
+     * FAILED survives {@code stop()}, exactly as DECOMMISSIONED does — see {@code
+     * OpenSearchDecommissionTest.decommissionedSurvivesStop}, and {@code CassandraService}, which
+     * has treated the two alike from the start.
+     *
+     * <p>Two separate assignments could erase it, and only one of them was guarded: {@code
+     * markStopped()} on the way out kept FAILED, while the STOPPING assignment on the way in
+     * checked for DECOMMISSIONED alone and overwrote FAILED before {@code markStopped()} ever got
+     * to see it. Nothing reaches that combination today — a node that is FAILED has no {@code Node}
+     * left to close — but "unreachable" is a property of today's call sites, not of the class, and
+     * the whole point of a status the supervisor reads after the final stop is that it says what
+     * happened.
+     *
+     * <p>The status is set through the field because there is no honest way to make a running node
+     * fail on demand; what is under test is the bookkeeping, not the failure.
+     */
+    @Test
+    void failedSurvivesStop(@TempDir Path home) throws Exception {
+        service.start(new TestServiceContext(home, "failed-node", HTTP_PORT, TRANSPORT_PORT));
+        setStatus(ServiceStatus.FAILED);
+
+        service.stop();
+
+        assertThat(service.status()).isEqualTo(ServiceStatus.FAILED);
+        assertThat(service.details()).containsEntry("status", "FAILED");
+    }
+
+    @SuppressWarnings("unchecked")
+    private void setStatus(ServiceStatus status) throws Exception {
+        Field field = OpenSearchService.class.getDeclaredField("status");
+        field.setAccessible(true);
+        ((AtomicReference<ServiceStatus>) field.get(service)).set(status);
     }
 
     @Test

@@ -64,9 +64,14 @@ class SupervisorDecommissionConcurrencyTest {
 
     @AfterEach
     void stopSupervisor() {
-        CountDownLatch relocating = opensearch.relocationGate;
-        if (relocating != null) {
-            relocating.countDown();
+        // Every gate first: a test that wedged a service must not leave the teardown wedged too.
+        for (RecordingService service : List.of(cassandra, opensearch)) {
+            for (CountDownLatch gate : new CountDownLatch[] {
+                    service.relocationGate, service.decommissionGate, service.statusGate}) {
+                if (gate != null) {
+                    gate.countDown();
+                }
+            }
         }
         if (supervisor != null) {
             supervisor.stop();
@@ -222,6 +227,130 @@ class SupervisorDecommissionConcurrencyTest {
                 "opensearch.stop", "opensearch.close",
                 "cassandra.stop", "cassandra.close");
         assertThat(supervisor.state()).isEqualTo(SupervisorState.STOPPED);
+    }
+
+    /**
+     * R2. The lock the round-1 fix introduced, and the three-thread jam it made possible.
+     *
+     * <p>{@code checkHealth} held the {@code started} monitor across every {@code status()} call
+     * into an isolated loader — {@code synchronizedMap.forEach} holds it anyway — and neither
+     * runtime's {@code status()} is interruptible, so {@code stopHealthMonitor()} cannot free one
+     * that has wedged. {@code beginDecommission} then wanted that same monitor <i>while holding
+     * {@code transitionLock}</i>, and the shutdown wanted {@code transitionLock} before it reached
+     * the line that stops the health monitor. Health thread wedged in {@code status()},
+     * decommissioner blocked behind it holding {@code transitionLock}, shutdown blocked on
+     * {@code transitionLock}: no deadline anywhere, and the process never went down.
+     *
+     * <p>The rule this pins is "no monitor is held across a call into a service", and both halves
+     * of it are needed: the health poll must not hold one, and the transition must not want one.
+     */
+    @Test
+    void aWedgedStatusCallBlocksNeitherADecommissionNorAShutdown() throws Exception {
+        Supervisor supervisor = supervisor();
+        supervisor.start();
+        // A status() that has stopped answering, on the thread that polls it every 50ms.
+        CountDownLatch wedged = new CountDownLatch(1);
+        opensearch.statusGate = wedged;
+        assertThat(opensearch.statusWedged.await(30, TimeUnit.SECONDS))
+                .as("the premise: the health monitor is inside a status() that will not return")
+                .isTrue();
+        // And a decommission that parks where a real one spends its time.
+        CountDownLatch relocating = new CountDownLatch(1);
+        opensearch.relocationGate = relocating;
+
+        List<Throwable> outcome = Collections.synchronizedList(new ArrayList<>());
+        Thread decommissioning = new Thread(() -> {
+            try {
+                supervisor.decommission(null, false);
+            } catch (Throwable e) {
+                outcome.add(e);
+            }
+        }, "test-decommission");
+        decommissioning.start();
+        // This is where it used to stop: blocked at `synchronized (started)` inside
+        // beginDecommission, holding transitionLock.
+        awaitCall("opensearch.awaitDecommissionReady");
+
+        Thread stopper = new Thread(supervisor::stop, "test-stopper");
+        stopper.start();
+        // And this is where the shutdown used to stop: blocked on transitionLock, which it takes
+        // before the line that would have stopped the health monitor.
+        awaitCall("opensearch.stop");
+
+        wedged.countDown();
+        opensearch.statusGate = null;
+        stopper.join(TimeUnit.SECONDS.toMillis(60));
+        decommissioning.join(TimeUnit.SECONDS.toMillis(60));
+
+        assertThat(stopper.isAlive()).isFalse();
+        assertThat(outcome).singleElement().isInstanceOf(DecommissionException.class);
+        assertThat(calls).contains("cassandra.stop", "cassandra.close");
+        assertThat(supervisor.state()).isEqualTo(SupervisorState.STOPPED);
+    }
+
+    /**
+     * R4. The phase a cancellation cannot reach, which is the phase the whole cancellation
+     * mechanism was documented as covering.
+     *
+     * <p>{@code decommission-cassandra} sits past the last {@code checkNotCancelled()}, is bounded
+     * by {@code ring_streaming_timeout} plus a grace rather than by the cancellation budget, and
+     * {@code StorageService.decommission()} neither polls nor honours an interrupt. A shutdown
+     * arriving there waits out its budget and then used to stop and close both services anyway —
+     * closing the loader while ranges were still streaming through it, and reporting exit 0. The
+     * round-1 test cancelled inside {@code awaitDecommissionReady}, the one phase that does honour
+     * cancellation, so it passed throughout.
+     *
+     * <p>What has to happen instead is what happens to any call that is still running when the
+     * supervisor gives up on it: the services are abandoned. The coordinator stops them itself
+     * when it finally returns, and that is the only stop they may get.
+     */
+    @Test
+    void aShutdownDuringTheUncancellablePhaseAbandonsTheServicesRatherThanClosingThem()
+            throws Exception {
+        Supervisor supervisor = supervisor();
+        // A minute in production; the test asserts what happens after it expires, not how long
+        // it is.
+        supervisor.decommissionCancelBudget(Duration.ofMillis(300));
+        supervisor.start();
+        CountDownLatch streaming = new CountDownLatch(1);
+        cassandra.decommissionGate = streaming;
+
+        List<Throwable> outcome = Collections.synchronizedList(new ArrayList<>());
+        Thread decommissioning = new Thread(() -> {
+            try {
+                supervisor.decommission(null, false);
+            } catch (Throwable e) {
+                outcome.add(e);
+            }
+        }, "test-decommission");
+        decommissioning.start();
+        awaitCall("cassandra.decommission");
+
+        // SIGTERM, arriving while Cassandra is streaming its ranges away.
+        Thread hook = supervisor.shutdownHook();
+        hook.run();
+
+        assertThat(streaming.getCount())
+                .as("the premise: the decommission is still inside the phase nothing can cancel")
+                .isEqualTo(1);
+        assertThat(calls)
+                .as("stopping takes the one stop() the coordinator still needs; closing pulls the"
+                        + " jars out from under a live decommission()")
+                .doesNotContain("cassandra.stop", "cassandra.close",
+                        "opensearch.stop", "opensearch.close");
+        assertThat(supervisor.state()).isEqualTo(SupervisorState.FAILED);
+        assertThat(supervisor.awaitShutdown())
+                .as("a node left mid-decommission has not stopped cleanly and must not say it did")
+                .isEqualTo(1);
+        assertThat(supervisor.failureMessage()).contains("abandoned");
+
+        streaming.countDown();
+        cassandra.decommissionGate = null;
+        decommissioning.join(TimeUnit.SECONDS.toMillis(60));
+        assertThat(outcome).isEmpty();
+        assertThat(calls)
+                .as("and the coordinator is still the one that stops them, when it gets there")
+                .contains("opensearch.stop", "cassandra.stop");
     }
 
     private void awaitRefusals(List<String> refusals, int expected) throws InterruptedException {

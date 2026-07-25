@@ -169,6 +169,13 @@ final class ProbeServiceCompiler {
                         ProbeService.<RuntimeException>sneakyThrow(
                                 new InterruptedException("interrupted inside " + key));
                     }
+                    if ("wrapped-interrupt".equals(mode)) {
+                        // The shape that actually turns up: the InterruptedException is a cause,
+                        // not the thing thrown. Both types here are ones the supervisor can load,
+                        // so this crosses the boundary untranslated with the interrupt inside it.
+                        throw new RuntimeException("wrapped",
+                                new InterruptedException("interrupted inside " + key));
+                    }
                     if ("lazy".equals(mode)) {
                         // Exactly what the JVM does when this loader has been closed and the
                         // class was never loaded: a resolution failure, and an Error, not an

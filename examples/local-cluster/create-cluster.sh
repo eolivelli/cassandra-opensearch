@@ -62,12 +62,50 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # In-place edit through a temp file. `rewrite <file> <command> [args...]` runs the command with
 # the file on stdin and replaces the file with what it printed.
+#
+# Three things a naive `cmd < f > f.tmp; mv f.tmp f` gets wrong, all of them silent:
+#
+#   1. The mode. A fresh temp file is created under the caller's umask, so an operator running
+#      with `umask 077` turned every 640 conf file into a 600 one - and a 644 into a 600, which
+#      is how a conf/ directory stops being readable by the account the node actually runs as.
+#      `cp -p` seeds the temp file from the original, and the redirection below truncates that
+#      file rather than creating a new one, so mode, ownership and acls come along.
+#   2. Symlinks. `mv` over a symlink replaces the link with a regular file, so a conf/ assembled
+#      by pointing at shared files silently forks from what it pointed at. Resolving the link
+#      first edits the thing the operator meant.
+#   3. The temp file. A sed that failed - a bad expression, a full disk - left `<file>.rewrite.<pid>`
+#      next to the original, inside the conf/ directory that is on the node's classpath.
 rewrite() { # rewrite <file> <command> [args...]
     local file=$1
+    local named=$1
     shift
+
+    # Follow the link chain by hand: `readlink -f` is GNU, and macOS only grew it in 12.3.
+    local hops=0
+    while [ -L "$file" ]; do
+        local link; link=$(readlink "$file")
+        case "$link" in
+            /*) file=$link ;;
+            *)  file="$(dirname "$file")/$link" ;;
+        esac
+        hops=$((hops + 1))
+        if [ "$hops" -gt 32 ]; then
+            echo "error: $named is a symlink loop" >&2
+            return 1
+        fi
+    done
+
     local tmp="$file.rewrite.$$"
-    "$@" < "$file" > "$tmp"
-    mv "$tmp" "$file"
+    cp -p "$file" "$tmp"
+    if ! "$@" < "$file" > "$tmp"; then
+        rm -f "$tmp"
+        echo "error: failed to rewrite $file" >&2
+        return 1
+    fi
+    if ! mv "$tmp" "$file"; then
+        rm -f "$tmp"
+        return 1
+    fi
 }
 
 # Single-quotes a string for the printed copy-paste commands, so that a -d directory containing a

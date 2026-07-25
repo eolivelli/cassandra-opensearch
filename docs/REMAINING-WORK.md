@@ -11,10 +11,51 @@ production, read that one.
 
 ## Where things stand
 
-Five reviewers examined the eighteen commits, each verifying findings by running code rather than
-by inspection — probe programs for the concurrency claims, and deliberately-planted defects to
-check the tests would catch them. They found **26 MAJOR issues**. All 26 are fixed, each pinned by
-a test confirmed to fail against the old code.
+Three rounds of review and fixes have run.
+
+**Round 1.** Five reviewers examined the eighteen commits, each verifying findings by running code
+rather than by inspection — probe programs for the concurrency claims, and deliberately-planted
+defects to check the tests would catch them. They found **26 MAJOR issues**, all fixed.
+
+**Round 2 reviewed those fixes**, and was the round that justified the exercise. Asked outright
+whether any round-1 fix had introduced a new defect or failed to do what it claimed, both reviewers
+answered **both**. It found **9 more MAJOR issues**:
+
+- A **new** lock-ordering jam, created by the `transitionLock` that round 1 added: shutdown could
+  make no progress *and could not free itself*, because it blocked on a lock held by the health
+  monitor's own victim.
+- The headline round-1 fix — "shutdown no longer closes the ClassLoaders under a live coordinator"
+  — **did not work**. It reproduced unchanged 60 seconds later, because the cancel budget's
+  rationale was factually wrong about how cancellation is observed, and the test that pinned it
+  only exercised the one phase that honours cancellation.
+- `shutdown()` had no `try/finally`, so any `Throwable` left the completion latch closed forever —
+  and because round 1 made the losing caller *block* rather than return, that turned a race into a
+  permanent wedge.
+- Two **regressions** against pre-fix behaviour: an unguarded pid-file write broke
+  `docker run --read-only`, and new strictness made `destroy` refuse an already-stopped cluster —
+  the normal case, and the one the README's own walkthrough leaves behind.
+- `AbandonedException`, introduced in round 1 to mean "never stop, never close", was honoured on
+  the start path and swallowed on the stop path, which then closed the loader under a running
+  `stop()` and reported exit code 0.
+
+**Round 3** fixed all nine. Every new test was verified against a scratch copy of the tree with the
+main sources reverted, so the tests are known to bite.
+
+**And round 3 introduced one of its own**, caught not by a reviewer but by the full build.
+`TwoNodeDecommissionIT` failed: the decommission ran correctly and the CLI reported the node gone
+*while it was still streaming*. Round 3 had bounded an unbounded JMX connect — a real problem — by
+setting `sun.rmi.transport.tcp.responseTimeout=10s`. That property does not bound the connect; it
+bounds how long a client waits for the **reply to a call**, and `decommission` blocks for as long
+as the operation takes. At ten seconds the transport tore the connection down mid-call, and the CLI
+read that as the connection loss a *completed* decommission produces.
+
+Notably, no unit test could have caught it — the defect only appears on a call that outlives the
+bound — and the unit test covering that code had pinned the *buggy* behaviour.
+
+The lesson worth carrying: **a fix is not done when it compiles and its test passes.** Three
+round-1 fixes had passing tests while the defect they targeted was still live; a round-3 fix had a
+passing test that asserted the bug. What caught them was reviewing each fix as if it were new code,
+reproducing the original failure against it, and running the whole suite rather than the module's.
 
 The fix round also turned up four defects nobody had reported, found because a new test failed for
 an unexpected reason. Two are worth naming:
@@ -35,11 +76,21 @@ trace — the code a script reads as "the node is broken" rather than "you typed
 
 ## P1 — do these before anyone relies on the thing
 
-### 1. A second review pass has not been run against the fixes
-One round of review and one round of fixes have happened. The fixes are individually tested, but
-nobody has reviewed *them*. The concurrency changes in `Supervisor` especially — a shutdown budget,
-a transition lock, a cancel-and-join — are exactly the kind of code that trades one race for
-another.
+### 1. The round-3 fixes have not themselves been reviewed
+Rounds 1 and 2 both found that fixes introduce defects — round 2 caught a *new* deadlock created by
+a round-1 fix. Round 3 changed the same concurrency code again: abandonment on the stop path, a
+registered-and-awaited external catch-up thread, per-path cycle tracking in `flatten`. By the
+evidence of the previous two rounds, some of that is wrong.
+
+Two residuals the round-3 agents named rather than papered over:
+
+- **An interrupt carried inside a wrapper whose type is only loadable inside the isolated loader is
+  still lost.** `ServiceException.flatten` rebuilds the chain as `RuntimeException`s before
+  `status()` can see the `InterruptedException`. Fixing it means restoring the interrupt inside
+  `translate()`, which would also set the flag on supervisor-owned threads for non-status calls.
+  Deliberately not done.
+- **`shutdown()`'s outer `catch (Throwable)` has no injectable path left** now that every call
+  inside it is individually guarded, so it is a safety net that is not directly tested.
 
 ### 2. `watch_external_decommission` still loses the race it was built for
 Implemented and tested, but it is a catch-up: by the time Cassandra reports `LEAVING` the ring

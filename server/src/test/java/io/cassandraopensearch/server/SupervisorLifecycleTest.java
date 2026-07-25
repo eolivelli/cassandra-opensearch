@@ -89,6 +89,10 @@ class SupervisorLifecycleTest {
     /** Startup limits a test can afford to let expire. */
     private static final String IMPATIENT = BOTH.replace("startup_timeout: 5s", "startup_timeout: 300ms");
 
+    /** Shutdown limits a test can afford to let expire, for the abandoned-stop case. */
+    private static final String IMPATIENT_SHUTDOWN =
+            BOTH.replace("shutdown_timeout: 5s", "shutdown_timeout: 300ms");
+
     /**
      * Shutdown limits long enough that a test can hold a {@code stop()} open without {@link
      * TimeLimited} giving up on it first — a drain that takes a while is not a drain that failed.
@@ -393,6 +397,155 @@ class SupervisorLifecycleTest {
         // is the whole point: it is still the only thread that could ever stop it.
         neverComesUp.countDown();
         opensearch.startGate = null;
+    }
+
+    /**
+     * R1. One {@code Throwable} out of a service's {@code stop()} used to wedge the process
+     * forever.
+     *
+     * <p>{@code terminated.countDown()}, {@code removeShutdownHook()} and the final state were all
+     * on the straight-line success path, and {@code stopService} caught {@code Exception} — so a
+     * {@code NoClassDefFoundError}, which is what a call into a loader that is on its way out
+     * actually produces, escaped past all three. The latch stayed closed, so {@code main} never
+     * returned and every other caller of {@code stop()} blocked on it for the whole shutdown
+     * budget; the shutdown hook stayed registered; the state stayed {@code STOPPING}; and the
+     * services after the failing one were never stopped at all.
+     */
+    @Test
+    void anErrorFromOneServiceStopStillTakesTheOthersDownAndLetsTheProcessExit() throws Exception {
+        Supervisor supervisor = supervisor(BOTH);
+        supervisor.start();
+        // Thrown by the service the shutdown reaches first, so "the rest of the walk still
+        // happens" is what the assertions below are about.
+        opensearch.stopFailure = new NoClassDefFoundError("org/opensearch/Whatever");
+
+        assertTimeoutPreemptively(Duration.ofSeconds(10), supervisor::stop);
+
+        assertThat(calls)
+                .as("a service that threw on the way out must not strand the ones behind it")
+                .containsExactly(
+                        "cassandra.start", "opensearch.start",
+                        "opensearch.stop", "opensearch.close",
+                        "cassandra.stop", "cassandra.close");
+        assertThat(supervisor.state()).isEqualTo(SupervisorState.STOPPED);
+        assertThat(assertTimeoutPreemptively(Duration.ofSeconds(5), supervisor::awaitShutdown))
+                .as("the latch has to be counted down whatever happened, or main never returns")
+                .isZero();
+        assertThat(supervisor.shutdownHook())
+                .as("and the hook has to be removed, or the JVM runs the whole shutdown again")
+                .isNull();
+    }
+
+    /**
+     * R1, the other half: the final {@code status()} the supervisor records for its own
+     * bookkeeping runs <i>after</i> {@code close()} has discarded the loader that answers it.
+     *
+     * <p>{@code IsolatedService.status()} is hardened against that, but the invariant belongs to
+     * the supervisor: an unguarded call here delegates the process's ability to exit to a service
+     * implementation, and a {@code null} return was on its own enough to abort the shutdown with
+     * an NPE out of {@code ConcurrentHashMap.put}.
+     */
+    @Test
+    void aFinalStatusThatThrowsOrReturnsNullDoesNotAbortTheShutdown() throws Exception {
+        Supervisor supervisor = supervisor(BOTH);
+        supervisor.start();
+        opensearch.nullStatusAfterStop = true;
+        cassandra.statusFailureAfterStop = new NoClassDefFoundError("org/apache/cassandra/Whatever");
+
+        assertTimeoutPreemptively(Duration.ofSeconds(10), supervisor::stop);
+
+        assertThat(calls).containsExactly(
+                "cassandra.start", "opensearch.start",
+                "opensearch.stop", "opensearch.close",
+                "cassandra.stop", "cassandra.close");
+        assertThat(supervisor.state()).isEqualTo(SupervisorState.STOPPED);
+        assertThat(assertTimeoutPreemptively(Duration.ofSeconds(5), supervisor::awaitShutdown)).isZero();
+        assertThat(supervisor.shutdownHook()).isNull();
+    }
+
+    /**
+     * R3. {@code AbandonedException} means the call is <i>still running</i>, and {@code
+     * stopService} treated it as an ordinary failure.
+     *
+     * <p>It is a {@code RuntimeException}, so {@code catch (Exception)} swallowed it and execution
+     * fell through to {@code close()} — closing the {@code URLClassLoader} out from under a live
+     * {@code drain()} — and then recorded a final status and reported exit code 0 for a service
+     * that had never stopped. {@code startService} had honoured the same exception since the day
+     * it was introduced; this is the same rule on the shutdown path.
+     */
+    @Test
+    void aStopThatOverranItsDeadlineIsAbandonedRatherThanClosed() throws Exception {
+        Supervisor supervisor = supervisor(IMPATIENT_SHUTDOWN);
+        supervisor.start();
+        CountDownLatch draining = new CountDownLatch(1);
+        cassandra.stopGate = draining;
+        // Ignores interrupts, like Cassandra's drain(): the deadline expiring does not end the
+        // call, it only ends the supervisor's willingness to wait for it.
+        cassandra.stopIgnoresInterrupts = true;
+
+        assertTimeoutPreemptively(Duration.ofSeconds(10), supervisor::stop);
+
+        assertThat(cassandra.stopReturned)
+                .as("the premise: stop() is still executing inside the service")
+                .isFalse();
+        assertThat(calls)
+                .as("closing its loader now would pull the jars out from under that thread")
+                .doesNotContain("cassandra.close");
+        assertThat(calls).contains("cassandra.stop");
+        assertThat(supervisor.state())
+                .as("a service that would not stop is not a clean shutdown")
+                .isEqualTo(SupervisorState.FAILED);
+        assertThat(assertTimeoutPreemptively(Duration.ofSeconds(5), supervisor::awaitShutdown))
+                .isEqualTo(1);
+        assertThat(supervisor.failureMessage()).contains("cassandra").contains("abandoned");
+
+        draining.countDown();
+    }
+
+    /**
+     * R-minor. {@code awaitShutdownInFlight} returned early on an interrupt, which is the one
+     * thing it exists to prevent.
+     *
+     * <p>The caller is usually the JVM's shutdown hook, and an interrupt during shutdown is
+     * ordinary — every executor being torn down sends some. Returning on one lets {@code
+     * Shutdown.runHooks()} halt the JVM while another thread is inside {@code drain()}, which is
+     * exactly the outcome this wait was added to stop.
+     */
+    @Test
+    void aWaitingCallerKeepsWaitingWhenItIsInterrupted() throws Exception {
+        Supervisor supervisor = supervisor(WEDGEABLE);
+        supervisor.start();
+        Thread hook = supervisor.shutdownHook();
+
+        CountDownLatch draining = new CountDownLatch(1);
+        cassandra.stopGate = draining;
+        Thread firstStopper = new Thread(supervisor::stop, "test-first-stopper");
+        firstStopper.start();
+        awaitCall("cassandra.stop");
+
+        AtomicReference<Boolean> interruptRestored = new AtomicReference<>();
+        Thread hookThread = new Thread(() -> {
+            hook.run();
+            interruptRestored.set(Thread.currentThread().isInterrupted());
+        }, "test-jvm-shutdown-hook");
+        hookThread.start();
+        Thread.sleep(200);
+
+        hookThread.interrupt();
+        Thread.sleep(300);
+        assertThat(hookThread.isAlive())
+                .as("an interrupt is not permission to halt the JVM on a live shutdown")
+                .isTrue();
+
+        draining.countDown();
+        hookThread.join(TimeUnit.SECONDS.toMillis(30));
+        firstStopper.join(TimeUnit.SECONDS.toMillis(30));
+
+        assertThat(hookThread.isAlive()).isFalse();
+        assertThat(supervisor.state()).isEqualTo(SupervisorState.STOPPED);
+        assertThat(interruptRestored)
+                .as("the interrupt was not obeyed, but it still belongs to that thread")
+                .hasValue(true);
     }
 
     @Test

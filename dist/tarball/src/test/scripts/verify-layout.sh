@@ -43,6 +43,11 @@ check() {
 
 rm -rf "$WORK"
 mkdir -p "$WORK"
+# Absolute from here on. `bin/cassandra-opensearch start` does `cd "$CO_HOME"` before it touches
+# anything, so a relative -p pidfile or a relative symlink target handed to it resolves against
+# the installation rather than against wherever this script was run from - which looks exactly
+# like the launcher being broken.
+WORK=$(cd "$WORK" && pwd)
 tar -xzf "$ARCHIVE" -C "$WORK"
 
 HOME_DIR=$(find "$WORK" -mindepth 1 -maxdepth 1 -type d | head -1)
@@ -262,6 +267,57 @@ if [ -x "$HOME_DIR/bin/cassandra-opensearch" ]; then
         fail "bin/cassandra-opensearch does not report an unusable JAVA_HOME clearly"
     fi
 
+    # No JAVA_HOME and no java on PATH: the other half of the same message, and the one that was
+    # silently broken. Every script in bin/ runs under `set -e`, and an assignment whose value is
+    # a command substitution takes that substitution's exit status - so `JAVA=$(command -v java)`
+    # with no java killed the script at rc=127 before it printed anything, leaving co_die
+    # unreachable. bin/cqlsh had this fixed with a comment explaining it; the shared include, 40
+    # lines away, did not.
+    #
+    # PATH is emptied of java only, not of everything: the launcher needs dirname, ls and sed
+    # before it ever looks for a JDK, and a PATH with none of those tests something else entirely.
+    NOJAVA_BIN="$WORK/bin-without-java"
+    rm -rf "$NOJAVA_BIN"
+    mkdir -p "$NOJAVA_BIN"
+    NOJAVA_TOOLS_OK=yes
+    for tool in dirname basename ls sed cat grep tr awk head uname mkdir rm; do
+        tool_path=$(command -v "$tool" 2> /dev/null || true)
+        if [ -n "$tool_path" ]; then
+            ln -sf "$tool_path" "$NOJAVA_BIN/$tool"
+        else
+            NOJAVA_TOOLS_OK=no
+        fi
+    done
+    if [ "$NOJAVA_TOOLS_OK" = no ]; then
+        skip "bin/cassandra-opensearch with no java on PATH: could not build a java-free PATH"
+    else
+        NOJAVA_RC=0
+        NOJAVA_OUT=$(env -u JAVA_HOME PATH="$NOJAVA_BIN" \
+            "$HOME_DIR/bin/cassandra-opensearch" status 2>&1) || NOJAVA_RC=$?
+        if [ "$NOJAVA_RC" -eq 0 ]; then
+            fail "bin/cassandra-opensearch exited 0 with no java anywhere"
+        elif echo "$NOJAVA_OUT" | grep -q 'no java on PATH'; then
+            pass "bin/cassandra-opensearch says so when there is no java and no JAVA_HOME"
+        else
+            fail "no java and no JAVA_HOME produced no message (exit $NOJAVA_RC): '$NOJAVA_OUT'"
+        fi
+    fi
+
+    # The one symlink this distribution documents. The include has to be found before it can say
+    # where anything is, so bin/cassandra-opensearch resolves $0 through its links by hand; with a
+    # plain `dirname "$0"` this dies looking for the include next to the symlink.
+    LINK_DIR="$WORK/symlinked-bin"
+    rm -rf "$LINK_DIR"
+    mkdir -p "$LINK_DIR"
+    ln -s "$HOME_DIR/bin/cassandra-opensearch" "$LINK_DIR/cassandra-opensearch"
+    LINK_RC=0
+    LINK_OUT=$("$LINK_DIR/cassandra-opensearch" --help 2>&1) || LINK_RC=$?
+    if [ "$LINK_RC" -eq 0 ] && echo "$LINK_OUT" | grep -q 'usage: cassandra-opensearch'; then
+        pass "bin/cassandra-opensearch works through a symlink on PATH"
+    else
+        fail "bin/cassandra-opensearch through a symlink exited $LINK_RC: $LINK_OUT"
+    fi
+
     # The JDK check runs before anything else in every script, and getting it wrong is how a
     # JDK 17 or a JDK 25 gets to fail later, somewhere much less legible. Which way round this
     # assertion goes depends on what JAVA_HOME actually is, so both directions get exercised
@@ -346,6 +402,85 @@ if [ -x "$HOME_DIR/bin/cassandra-opensearch" ]; then
         else
             pass "bin/nodetool does not enable incubator modules"
         fi
+    fi
+
+    # --- the pid file ------------------------------------------------------------------------
+    #
+    # A foreground start writes one, and it used to do so with a bare `echo "$$" > "$PIDFILE"`
+    # under `set -e`. An installation directory that is not writable then stopped the node from
+    # starting at all - with a shell error for a message and rc=2, which the CLI documents as "bad
+    # usage". That is not an exotic configuration: it is the whole premise of `docker run
+    # --read-only`, where the only writable paths are the data and logs volumes and where this
+    # exact command is the image's CMD.
+    #
+    # A fake JDK stands in for a real one so that the `exec` at the end of `start` returns instead
+    # of leaving this script with a node to shut down. It answers -version like a JDK 21 and exits
+    # 3 - "nothing is running" - for the CLI's `status`, which is what refuse_if_running polls.
+    FAKE_JDK="$WORK/fake-jdk"
+    rm -rf "$FAKE_JDK"
+    mkdir -p "$FAKE_JDK/bin"
+    cat > "$FAKE_JDK/bin/java" <<'FAKE_JDK_SCRIPT'
+#!/bin/sh
+for arg in "$@"; do
+    case "$arg" in
+        -version) echo 'openjdk version "21.0.0" 2000-01-01' >&2; exit 0 ;;
+        status) exit 3 ;;
+    esac
+done
+echo "fake-jdk: would have started the node"
+exit 0
+FAKE_JDK_SCRIPT
+    chmod +x "$FAKE_JDK/bin/java"
+
+    RO_HOME="$WORK/unwritable"
+    rm -rf "$RO_HOME"
+    mkdir -p "$RO_HOME"
+    chmod a-w "$RO_HOME"
+    if (: > "$RO_HOME/probe") 2> /dev/null; then
+        rm -f "$RO_HOME/probe"
+        skip "unwritable pid file: this account writes to a mode 555 directory anyway (root?)"
+    else
+        PID_RC=0
+        PID_OUT=$(JAVA_HOME="$FAKE_JDK" CASSANDRA_OPENSEARCH_JMX_PORT=1 \
+            "$HOME_DIR/bin/cassandra-opensearch" start \
+            -p "$RO_HOME/cassandra-opensearch.pid" 2>&1) || PID_RC=$?
+        if [ "$PID_RC" -ne 0 ]; then
+            fail "a foreground start refused to run over an unwritable pid file (exit $PID_RC): $PID_OUT"
+        elif ! echo "$PID_OUT" | grep -q 'would have started the node'; then
+            fail "a foreground start never reached the JVM: $PID_OUT"
+        elif ! echo "$PID_OUT" | grep -q 'cannot write'; then
+            fail "a foreground start skipped the pid file without saying so: $PID_OUT"
+        else
+            pass "a foreground start warns about an unwritable pid file and starts anyway"
+        fi
+    fi
+    chmod u+w "$RO_HOME" 2> /dev/null || true
+
+    # `stop` is the only command in bin/ that ever removes the pid file, and it returned 3 for
+    # "nothing is running" several lines before it got there. So the file a foreground start
+    # leaves behind survived every subsequent stop, until the kernel recycled that pid and
+    # refuse_if_running began blocking every start with a node that had not run for days.
+    if [ "${AMBIENT_JAVA:-}" = 21 ]; then
+        STALE_PID_FILE="$WORK/stale.pid"
+        rm -f "$STALE_PID_FILE"
+        # A pid that certainly named a process and certainly does not now.
+        (exit 0) &
+        STALE_PID=$!
+        wait "$STALE_PID" 2> /dev/null || true
+        echo "$STALE_PID" > "$STALE_PID_FILE"
+
+        STALE_RC=0
+        STALE_OUT=$(CASSANDRA_OPENSEARCH_JMX_PORT=1 \
+            "$HOME_DIR/bin/cassandra-opensearch" stop -p "$STALE_PID_FILE" 2>&1) || STALE_RC=$?
+        if [ "$STALE_RC" -ne 3 ]; then
+            fail "stop against a node that is not running exited $STALE_RC, not 3: $STALE_OUT"
+        elif [ -f "$STALE_PID_FILE" ]; then
+            fail "stop left the stale $STALE_PID_FILE behind; nothing else can remove it"
+        else
+            pass "stop clears a pid file whose process is gone, and still exits 3"
+        fi
+    else
+        skip "stale pid file: needs a JDK 21 in JAVA_HOME to reach the CLI"
     fi
 fi
 

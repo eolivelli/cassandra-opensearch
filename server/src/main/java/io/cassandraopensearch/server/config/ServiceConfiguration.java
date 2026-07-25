@@ -41,6 +41,13 @@ public final class ServiceConfiguration {
             "cassandra", "io.cassandraopensearch.runtime.cassandra.CassandraService",
             "opensearch", "io.cassandraopensearch.runtime.opensearch.OpenSearchService");
 
+    /**
+     * The {@code shutdown_timeout} a service gets when the YAML does not name one — and the
+     * fallback the supervisor uses if the configuration cannot be consulted at all, which is a
+     * situation that only arises while the process is already going down.
+     */
+    public static final Duration DEFAULT_SHUTDOWN_TIMEOUT = Duration.ofMinutes(2);
+
     private static final Map<String, String> DEFAULT_CONFIG_FILES = Map.of(
             "cassandra", "cassandra.yaml",
             "opensearch", "opensearch.yml");
@@ -80,7 +87,7 @@ public final class ServiceConfiguration {
         boolean enabled = yaml.bool("enabled", true);
         String configFileName = yaml.string("config", DEFAULT_CONFIG_FILES.get(name));
         Duration startupTimeout = yaml.duration("startup_timeout", Duration.ofMinutes(5));
-        Duration shutdownTimeout = yaml.duration("shutdown_timeout", Duration.ofMinutes(2));
+        Duration shutdownTimeout = yaml.duration("shutdown_timeout", DEFAULT_SHUTDOWN_TIMEOUT);
 
         Map<String, String> settings = new LinkedHashMap<>();
         List<String> known;

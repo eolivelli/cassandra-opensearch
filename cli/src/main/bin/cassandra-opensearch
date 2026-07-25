@@ -9,7 +9,21 @@
 
 set -e
 
-CO_INCLUDE=$(dirname "$0")/cassandra-opensearch.in.sh
+# The include has to be found before it can be asked where anything is, so the symlink resolution
+# it provides as co_resolve_bin_dir is repeated here, inline and by hand. Without this,
+# `ln -s .../bin/cassandra-opensearch /usr/local/bin/` - the one symlink this distribution
+# documents - looks for the include in /usr/local/bin and dies before reading a single setting.
+# The loop, rather than one hop, because a distribution symlinked into a versioned directory and
+# then onto PATH is two.
+_co_self="$0"
+while [ -h "$_co_self" ]; do
+    _co_link=$(ls -ld "$_co_self" | sed -e 's/.*-> //')
+    case "$_co_link" in
+        /*) _co_self="$_co_link" ;;
+        *)  _co_self="$(dirname "$_co_self")/$_co_link" ;;
+    esac
+done
+CO_INCLUDE=$(dirname "$_co_self")/cassandra-opensearch.in.sh
 [ -r "$CO_INCLUDE" ] || { echo "cassandra-opensearch: missing $CO_INCLUDE" >&2; exit 1; }
 # shellcheck source=cassandra-opensearch.in.sh
 . "$CO_INCLUDE"
@@ -46,6 +60,11 @@ environment:
   CASSANDRA_OPENSEARCH_CONF       default <home>/conf
   CASSANDRA_OPENSEARCH_LOGS       default <home>/logs
   JVM_EXTRA_OPTS                  appended to the JVM command line
+
+exit codes: 0 ok, 1 failed, 2 bad usage, 3 nothing running, 4 the MBean has no such operation
+  3 is the answer to \`stop\` on a node that is already down, and is not a failure. A script
+  stopping several nodes has to treat it as one of the successful outcomes; see
+  examples/local-cluster/cluster-control.sh.
 EOF
 }
 
@@ -178,7 +197,10 @@ refuse_if_running() {
     # Our own pid, from a foreground start that exited without clearing the file: `docker restart`
     # arrives here as pid 1 both times, so the file would otherwise name us.
     [ "$_co_recorded" != "$$" ] || return 0
-    if kill -0 "$_co_recorded" 2> /dev/null; then
+    # co_process_is_alive and not a bare `kill -0`: kill answers EPERM, not ESRCH, for a live
+    # process owned by another uid, and reading that as "not running" is what put a second JVM on
+    # one data directory. See the include.
+    if co_process_is_alive "$_co_recorded"; then
         co_die "already running as pid $_co_recorded (from $PIDFILE)"
     fi
 }
@@ -201,14 +223,34 @@ start() {
         # `status` usable. It is deliberately NOT removed on exit: exec means there is no shell
         # left to run a trap, so a foreground node that has exited leaves a stale file behind and
         # refuse_if_running is what has to cope with that.
-        echo "$$" > "$PIDFILE"
+        #
+        # Best-effort, and loudly so. The default PIDFILE is inside the installation directory,
+        # which a hardened deployment has every reason to make read-only - `docker run
+        # --read-only` mounts only data/ and logs/ writable, and this exact path is the image's
+        # CMD. A node that will not start because it could not write a convenience file is a much
+        # worse outcome than a node running without one, and everything the pid file buys back is
+        # named in the warning.
+        if ! echo "$$" > "$PIDFILE" 2> /dev/null; then
+            echo "cassandra-opensearch: cannot write $PIDFILE; starting anyway." >&2
+            echo "  \`$(basename "$0") stop\` from another shell needs that file to find this" >&2
+            echo "  process. Pass -p <pidfile> pointing somewhere writable, or stop the node" >&2
+            echo "  with SIGTERM - the supervisor's shutdown hook does the ordered teardown." >&2
+        fi
         eval "exec \"\$JAVA\" $JAVA_ARGUMENTS"
     fi
 
     _log="$CO_LOGS/cassandra-opensearch.log"
     eval "nohup \"\$JAVA\" $JAVA_ARGUMENTS >> \"\$_log\" 2>&1 &"
     _pid=$!
-    echo "$_pid" > "$PIDFILE"
+    # Same best-effort treatment as the foreground path, and for a sharper reason: the JVM is
+    # already running by the time this line executes. Dying here - which is what `set -e` did with
+    # the bare redirection - leaves it orphaned, unrecorded and holding the ports, with nothing
+    # left that knows its pid.
+    if ! echo "$_pid" > "$PIDFILE" 2> /dev/null; then
+        echo "cassandra-opensearch: cannot write $PIDFILE; the node is running as pid $_pid." >&2
+        echo "  \`$(basename "$0") stop\` will not find it. Note the pid, or restart with" >&2
+        echo "  -p <pidfile> pointing somewhere writable." >&2
+    fi
     echo "started pid $_pid, logging to $_log"
 
     # Waiting for the MBean rather than just for the process to survive: a node that is still
@@ -243,7 +285,7 @@ stop() {
     co_require_java_21
     _pid=""
     if [ -f "$PIDFILE" ]; then
-        _pid=$(cat "$PIDFILE")
+        _pid=$(cat "$PIDFILE" 2> /dev/null || true)
     fi
 
     # Ask the supervisor's MBean first. Exit code 4 means it answered but has no stop operation,
@@ -258,9 +300,24 @@ stop() {
         [ -n "$_pid" ] || co_die "no stop operation on the supervisor MBean and no pid in
   $PIDFILE. Send SIGTERM to the process yourself: the supervisor's shutdown hook drains
   Cassandra and closes the OpenSearch node in order."
-        kill -0 "$_pid" 2> /dev/null || co_die "pid $_pid from $PIDFILE is not running."
+        co_process_is_alive "$_pid" || co_die "pid $_pid from $PIDFILE is not running."
         echo "sending SIGTERM to pid $_pid"
         kill -TERM "$_pid"
+    elif [ "$_rc" -eq 3 ]; then
+        # Nothing is listening on the supervisor's JMX port. Before the foreground start began
+        # writing a pid file this could not leave anything behind; now it can, and this is the
+        # only command that ever looks at that file - `stop` returned 3 here without reaching the
+        # rm below, so a stale file survived every subsequent stop and eventually collided with a
+        # recycled pid, at which point refuse_if_running blocked every start.
+        #
+        # Only when the recorded process really is gone. A node that is still starting up has no
+        # JMX port yet and is very much running; deleting its pid file would be the same defect
+        # from the other end.
+        if [ -n "$_pid" ] && ! co_process_is_alive "$_pid"; then
+            rm -f "$PIDFILE"
+            echo "not running; removed the stale $PIDFILE (it named pid $_pid)" >&2
+        fi
+        exit 3
     elif [ "$_rc" -ne 0 ]; then
         exit "$_rc"
     fi
@@ -269,7 +326,7 @@ stop() {
     # node, which takes as long as it takes; waiting here is what makes `stop && start` safe.
     if [ -n "$_pid" ]; then
         _waited=0
-        while kill -0 "$_pid" 2> /dev/null; do
+        while co_process_is_alive "$_pid"; do
             if [ "$_waited" -ge "$STOP_TIMEOUT" ]; then
                 co_die "pid $_pid is still alive after ${_waited}s. Not killing it: a half-drained
   Cassandra node replays its commit log on the next start. See the log."
@@ -291,7 +348,7 @@ decommission() {
     co_require_java_21
     _pid=""
     if [ -f "$PIDFILE" ]; then
-        _pid=$(cat "$PIDFILE")
+        _pid=$(cat "$PIDFILE" 2> /dev/null || true)
     fi
 
     _rc=0
@@ -305,7 +362,7 @@ decommission() {
 
     [ -n "$_pid" ] || return 0
     _waited=0
-    while kill -0 "$_pid" 2> /dev/null; do
+    while co_process_is_alive "$_pid"; do
         if [ "$_waited" -ge "$STOP_TIMEOUT" ]; then
             co_die "the node left both clusters, but pid $_pid is still alive after ${_waited}s.
   Not killing it: the ordered shutdown is still running. See $CO_LOGS/cassandra-opensearch.log."

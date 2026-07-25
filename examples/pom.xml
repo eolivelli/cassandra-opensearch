@@ -22,6 +22,11 @@
     the build's tool contract (a Maven build has to work on a machine that has only a JDK), and a
     check that silently does nothing when the tool is absent is worse than one that is honest
     about its scope.
+
+    A parse is also not enough. src/test/scripts/cluster-control-check.sh runs cluster-control.sh
+    against a cluster of stub nodes and asserts what it does with their exit codes, which is
+    where the defects have actually been: a `destroy` that refused to delete a cluster whose
+    nodes were merely already stopped parsed perfectly well.
   </description>
 
   <build>
@@ -45,6 +50,30 @@
                   <fileset dir="${project.basedir}" includes="**/*.sh"/>
                 </apply>
               </target>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <!--
+        Behaviour, not syntax. The stub nodes it drives are the point: what is under test is how
+        cluster-control.sh reads a launcher exit code, and a real node would make that slower,
+        flakier and no more conclusive.
+      -->
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>check-example-scripts</id>
+            <phase>test</phase>
+            <goals><goal>exec</goal></goals>
+            <configuration>
+              <executable>${project.basedir}/src/test/scripts/cluster-control-check.sh</executable>
+              <arguments>
+                <argument>${project.basedir}/local-cluster</argument>
+                <argument>${project.build.directory}/script-check</argument>
+              </arguments>
             </configuration>
           </execution>
         </executions>

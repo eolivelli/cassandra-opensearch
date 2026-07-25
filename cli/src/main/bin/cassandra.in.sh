@@ -44,7 +44,11 @@ cassandra_storagedir="${CASSANDRA_OPENSEARCH_DATA:-$CO_HOME/data}/cassandra"
 if [ -n "$JAVA_HOME" ]; then
     JAVA="$JAVA_HOME/bin/java"
 else
-    JAVA=$(command -v java 2> /dev/null)
+    # `|| true` as in bin/cassandra-opensearch.in.sh: this file is sourced by bin/nodetool, which
+    # runs under `set -e`, and an assignment whose value is a command substitution takes that
+    # substitution's status. Without it a machine with no java lost nodetool at rc=127 with no
+    # output, and the message four lines down was unreachable.
+    JAVA=$(command -v java 2> /dev/null || true)
 fi
 if [ -z "$JAVA" ] || [ ! -x "$JAVA" ]; then
     echo "cassandra.in.sh: no java found. Set JAVA_HOME." >&2

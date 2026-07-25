@@ -98,15 +98,35 @@ public final class Supervisor implements AutoCloseable {
     private static final Duration DECOMMISSION_EXIT_GRACE = Duration.ofSeconds(2);
 
     /**
-     * How long a shutdown waits for an in-flight decommission to unwind after cancelling it.
+     * How long a shutdown waits for an in-flight decommission — the coordinated one, or the
+     * catch-up exclusion of {@link #onNodeLeavingTheRing} — to let go of the services after it has
+     * been cancelled.
      *
-     * <p>Not the decommission's own timeouts, which run to hours: cancellation is observed at the
-     * next poll and every phase after it is separately bounded by {@link TimeLimited}, so what is
-     * actually being waited for is one poll interval plus the compensating {@code
-     * abortDecommission} calls. A minute is generous for that and short enough that a SIGTERM
-     * still produces a process that goes away.
+     * <p>Cancellation is cooperative, and it is <b>not</b> observed everywhere. {@code
+     * awaitDecommissionReady} polls {@link DecommissionContext#isCancelled()}, and {@link
+     * DecommissionCoordinator} checks at every phase boundary — but a phase that has already begun
+     * never looks again, and the longest of them is past the last boundary: {@code
+     * decommission-cassandra} is bounded by {@code ring_streaming_timeout} plus a grace, an hour
+     * and a half by default, and {@code StorageService.decommission()} neither polls a cancellation
+     * flag nor honours an interrupt. A shutdown that arrives there will spend this whole budget and
+     * still find the coordinator running.
+     *
+     * <p>So this is a real deadline rather than a formality, and what happens when it expires is
+     * the point: those services are treated as {@link #abandon abandoned} — not stopped, not
+     * closed, exit code non-zero. Stopping a service whose {@code decommission()} is still
+     * streaming ranges takes the one {@code stop()} it will ever honour, and closing its
+     * ClassLoader pulls the jars out from under the thread that is executing them.
+     *
+     * <p>A minute is generous for the cases cancellation <i>is</i> observed in, and short enough
+     * that a SIGTERM still produces a process that goes away.
      */
     private static final Duration DECOMMISSION_CANCEL_BUDGET = Duration.ofMinutes(1);
+
+    /**
+     * Added to {@code shard_relocation_timeout} when bounding the catch-up exclusion from outside,
+     * for the same reason as {@link #STARTUP_GRACE}: the service's own message is the useful one.
+     */
+    private static final Duration EXTERNAL_EXCLUSION_GRACE = Duration.ofSeconds(30);
 
     /** Slack on top of the per-service limits, for the bookkeeping either side of them. */
     private static final Duration SHUTDOWN_BUDGET_SLACK = Duration.ofSeconds(30);
@@ -140,6 +160,17 @@ public final class Supervisor implements AutoCloseable {
 
     private final AtomicReference<DecommissionCoordinator> decommissionInFlight = new AtomicReference<>();
 
+    /**
+     * The catch-up exclusion started by {@link #onNodeLeavingTheRing}, while it is running.
+     *
+     * <p>Registered under {@link #transitionLock} by the thread that runs it, so a shutdown either
+     * sees it and waits for it or does not, in which case the exclusion sees {@code STOPPING} and
+     * never makes its call. Unregistered means "no thread of ours is inside OpenSearch"; anything
+     * weaker is a check-then-act, and the act is {@code stop()} plus {@code close()} on the loader
+     * that thread is executing out of.
+     */
+    private final AtomicReference<ExternalCatchUp> externalExclusion = new AtomicReference<>();
+
     private volatile SupervisorState state = SupervisorState.NEW;
     private volatile String failureMessage;
     private volatile Thread shutdownHook;
@@ -152,6 +183,12 @@ public final class Supervisor implements AutoCloseable {
      * start()} and cannot spend thirty seconds doing it.
      */
     private volatile Duration startupGrace = STARTUP_GRACE;
+
+    /**
+     * {@link #DECOMMISSION_CANCEL_BUDGET}, overridable for the same reason: the tests that pin
+     * what happens when it expires would otherwise each take a minute.
+     */
+    private volatile Duration decommissionCancelBudget = DECOMMISSION_CANCEL_BUDGET;
 
     public Supervisor(NodeConfiguration configuration) {
         this(configuration, ServiceFactory.isolated());
@@ -198,12 +235,17 @@ public final class Supervisor implements AutoCloseable {
             throw e;
         }
         state = SupervisorState.RUNNING;
-        LOG.info("cassandra-opensearch is RUNNING; services {}", started.keySet());
+        LOG.info("cassandra-opensearch is RUNNING; services {}", startedServices().keySet());
     }
 
     /** Test seam for {@link #STARTUP_GRACE}; see the field. */
     void startupGrace(Duration grace) {
         this.startupGrace = grace;
+    }
+
+    /** Test seam for {@link #DECOMMISSION_CANCEL_BUDGET}; see the field. */
+    void decommissionCancelBudget(Duration budget) {
+        this.decommissionCancelBudget = budget;
     }
 
     private void startService(ServiceConfiguration service) {
@@ -227,7 +269,7 @@ public final class Supervisor implements AutoCloseable {
             TimeLimited.run(service.name() + " startup",
                     service.startupTimeout().plus(startupGrace), () -> instance.start(context));
         } catch (TimeLimited.AbandonedException e) {
-            abandon(service.name(), e);
+            abandon(service.name(), "it did not finish starting: " + e.getMessage());
             throw new SupervisorException(
                     "Service '" + service.name() + "' failed to start: " + e.getMessage(), e);
         } catch (Exception e) {
@@ -240,28 +282,37 @@ public final class Supervisor implements AutoCloseable {
     }
 
     /**
-     * Records that a service's {@code start()} overran its deadline and is still running.
+     * Records that a call into a service overran its deadline and is still running.
      *
      * <p>The unwind that follows must not touch it. {@code stop()} on such a service latches — it
      * is a CAS in both runtimes — so an early {@code stop()} can win the latch while the abandoned
-     * {@code start()} is still inside code that ignores interrupts, and the late thread then
-     * finishes, publishes {@code RUNNING} and installs its background threads on top of a
-     * supervisor that has already declared the service stopped. Those threads can never be
-     * stopped afterwards, because {@code stop()} has already been used up.
+     * call is still inside code that ignores interrupts, and the late thread then finishes,
+     * publishes {@code RUNNING} and installs its background threads on top of a supervisor that has
+     * already declared the service stopped. Those threads can never be stopped afterwards, because
+     * {@code stop()} has already been used up.
      *
      * <p>Closing its ClassLoader would be worse still: the abandoned thread is executing classes
      * out of it.
+     *
+     * <p>Every caller is a place where a bounded call came back without its work having finished:
+     * an overrun {@code start()}, an overrun {@code stop()} or {@code close()}, a decommission that
+     * did not unwind inside {@link #DECOMMISSION_CANCEL_BUDGET}. All of them mean the same thing to
+     * the shutdown walk — see {@link #stopServicesInReverseOrder} — and all of them mean this JVM
+     * cannot exit cleanly, so all of them force a non-zero exit code.
+     *
+     * @param what what is still running, phrased to follow the service name in a sentence
      */
-    private void abandon(String serviceName, TimeLimited.AbandonedException cause) {
+    private void abandon(String serviceName, String what) {
         abandoned.add(serviceName);
-        LOG.error("Service '{}' did not finish starting and has been abandoned: {}."
+        escalate(1, "service '" + serviceName + "' was abandoned: " + what);
+        LOG.error("Service '{}' has been abandoned — {}."
                         + " It is still running on a thread this process cannot stop, so it will"
                         + " NOT be stopped and its ClassLoader will NOT be released during the"
-                        + " shutdown that follows — doing either would race the abandoned startup"
-                        + " and could leave threads behind that nothing can stop. This JVM cannot"
+                        + " shutdown that follows — doing either would race that thread and could"
+                        + " leave threads behind that nothing can stop. This JVM cannot"
                         + " shut down cleanly: kill it (SIGKILL) once the other services are down,"
                         + " and expect '{}' to recover on the next start as it would from a crash.",
-                serviceName, cause.getMessage(), serviceName);
+                serviceName, what, serviceName);
     }
 
     /**
@@ -356,6 +407,19 @@ public final class Supervisor implements AutoCloseable {
         return failureMessage;
     }
 
+    /**
+     * The one shutdown, run by whichever caller wins the CAS.
+     *
+     * <p>Everything from the CAS onwards is inside a {@code try}, and the {@code finally} does the
+     * two things nothing else can do afterwards: remove the hook and count {@link #terminated}
+     * down. The straight-line version of this method had them on the success path, which turned
+     * any throw — a {@code NoClassDefFoundError} out of a service whose loader is on its way out,
+     * an {@code OutOfMemoryError} from {@link TimeLimited}'s per-call thread, a {@code
+     * ConfigurationException} while looking up a timeout — into a process that never exits and
+     * cannot be made to: the latch stays closed, so {@code main} blocks forever and every other
+     * caller of {@link #stop()} blocks with it, while the CAS is already {@code true} so no one
+     * can retry the shutdown that failed.
+     */
     private void shutdown(int code, String reason) {
         if (!shuttingDown.compareAndSet(false, true)) {
             // Not our shutdown to run — but the reason we were called still has to be recorded,
@@ -364,20 +428,46 @@ public final class Supervisor implements AutoCloseable {
             awaitShutdownInFlight(reason);
             return;
         }
-        escalate(code, reason);
+        try {
+            escalate(code, reason);
+            runShutdown(reason);
+        } catch (Throwable t) {
+            // Not rethrown: the callers are a shutdown hook, a fatal-error thread and stop(), and
+            // none of them can do anything with it that the exit code does not already say. What
+            // matters is that the process can still leave, and that it does not claim it left
+            // cleanly.
+            escalate(1, "the shutdown itself failed: " + t);
+            state = SupervisorState.FAILED;
+            LOG.error("The shutdown did not run to completion. Services may still be holding"
+                    + " threads, sockets and mapped files; the process will exit non-zero and"
+                    + " whatever is left has to recover on the next start as it would from a"
+                    + " crash.", t);
+        } finally {
+            removeShutdownHook();
+            terminated.countDown();
+            LOG.info("Shutdown complete; exit code {}", exitCode.get());
+        }
+    }
+
+    private void runShutdown(String reason) {
         DecommissionCoordinator inFlight;
+        ExternalCatchUp exclusion;
         synchronized (transitionLock) {
             state = SupervisorState.STOPPING;
             inFlight = decommissionInFlight.get();
+            exclusion = externalExclusion.get();
         }
         LOG.info("Shutting down{}", reason == null ? "" : ": " + reason);
 
-        // Before anything is stopped. The coordinator drives the same two services this is about
-        // to stop and close the loaders of, and it does not read `cancelled` on its own — so
-        // cancelling without waiting used to let it call decommission(cassandra), streaming
+        // Before anything is stopped. Both of these drive the same services this is about to stop
+        // and close the loaders of, and neither reads `cancelled` on its own — so cancelling
+        // without waiting used to let the coordinator call decommission(cassandra), streaming
         // ranges through jars whose ClassLoader had already been closed.
         if (inFlight != null) {
             cancelDecommission(inFlight);
+        }
+        if (exclusion != null) {
+            cancelExternalExclusion(exclusion);
         }
         stopHealthMonitor();
         unregisterMBean();
@@ -385,11 +475,7 @@ public final class Supervisor implements AutoCloseable {
 
         // Re-read rather than trusting the local: a service may have reported a fatal error while
         // this shutdown was in flight, and that has to reach the exit code and the state.
-        int finalCode = exitCode.get();
-        state = finalCode == 0 ? SupervisorState.STOPPED : SupervisorState.FAILED;
-        removeShutdownHook();
-        terminated.countDown();
-        LOG.info("Shutdown complete; exit code {}", finalCode);
+        state = exitCode.get() == 0 ? SupervisorState.STOPPED : SupervisorState.FAILED;
     }
 
     /**
@@ -410,20 +496,56 @@ public final class Supervisor implements AutoCloseable {
         }
     }
 
-    /** Cancels an in-flight decommission and waits for it to let go of the services. */
+    /**
+     * Cancels an in-flight decommission and waits for it to let go of the services.
+     *
+     * <p>When it does not let go, the services it is driving are abandoned rather than stopped.
+     * The phase that cannot be cancelled is {@code decommission-cassandra} — see {@link
+     * #DECOMMISSION_CANCEL_BUDGET} — and it is the phase in which stopping and closing anyway does
+     * the most damage: the coordinator is inside {@code StorageService.decommission()}, streaming
+     * ranges, and {@code close()} would take the {@code URLClassLoader} out from under it. The
+     * coordinator stops both services itself when it finishes, which is the only stop they should
+     * get.
+     */
     private void cancelDecommission(DecommissionCoordinator inFlight) {
+        Duration budget = decommissionCancelBudget;
         LOG.warn("A decommission is in flight; cancelling it and waiting up to {} for it to unwind"
-                + " before any service is stopped", TimeLimited.format(DECOMMISSION_CANCEL_BUDGET));
+                + " before any service is stopped", TimeLimited.format(budget));
         inFlight.cancel();
-        if (inFlight.awaitCompletion(DECOMMISSION_CANCEL_BUDGET)) {
+        if (inFlight.awaitCompletion(budget)) {
             LOG.info("The decommission has unwound; continuing with the shutdown");
             return;
         }
-        LOG.error("The decommission did not unwind within {}. Continuing with the shutdown anyway,"
-                        + " but the coordinator is still driving these services: check `nodetool"
-                        + " netstats` and the OpenSearch allocation exclusions on this cluster"
-                        + " before treating this node as cleanly stopped.",
-                TimeLimited.format(DECOMMISSION_CANCEL_BUDGET));
+        LOG.error("The decommission did not unwind within {}: the coordinator is still driving"
+                        + " {}. Those services will NOT be stopped and their ClassLoaders will NOT"
+                        + " be released — the coordinator stops them itself when it finishes, and"
+                        + " a decommission phase that is still streaming must not have its jars"
+                        + " closed underneath it. Check `nodetool netstats` and the OpenSearch"
+                        + " allocation exclusions on this cluster before treating this node as"
+                        + " cleanly stopped.",
+                TimeLimited.format(budget), inFlight.serviceNames());
+        for (String serviceName : inFlight.serviceNames()) {
+            abandon(serviceName, "a decommission was still driving it " + TimeLimited.format(budget)
+                    + " after being cancelled");
+        }
+    }
+
+    /**
+     * Cancels the catch-up exclusion and waits for it, for the same reasons and with the same
+     * outcome: a call still inside OpenSearch when the budget expires means OpenSearch is
+     * abandoned, not stopped and closed around it.
+     */
+    private void cancelExternalExclusion(ExternalCatchUp exclusion) {
+        Duration budget = decommissionCancelBudget;
+        LOG.warn("A catch-up OpenSearch exclusion is in flight; cancelling it and waiting up to {}"
+                + " for it to return before any service is stopped", TimeLimited.format(budget));
+        exclusion.cancel();
+        if (exclusion.awaitCompletion(budget)) {
+            LOG.info("The catch-up exclusion has returned; continuing with the shutdown");
+            return;
+        }
+        abandon("opensearch", "a catch-up shard-allocation exclusion was still inside it "
+                + TimeLimited.format(budget) + " after being cancelled");
     }
 
     /**
@@ -437,14 +559,34 @@ public final class Supervisor implements AutoCloseable {
         Duration budget = shutdownBudget();
         LOG.info("A shutdown is already in flight{}; waiting up to {} for it to complete",
                 reason == null ? "" : " (" + reason + ")", TimeLimited.format(budget));
+        long deadline = System.nanoTime() + budget.toNanos();
+        boolean interrupted = false;
         try {
-            if (terminated.await(budget.toMillis(), TimeUnit.MILLISECONDS)) {
-                return;
+            while (true) {
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0) {
+                    break;
+                }
+                try {
+                    if (terminated.await(remaining, TimeUnit.NANOSECONDS)) {
+                        return;
+                    }
+                } catch (InterruptedException e) {
+                    // Remembered and put back at the end, but not obeyed: returning here is the
+                    // one thing this method exists to prevent. The caller is usually the JVM's
+                    // shutdown hook, an interrupt during shutdown is ordinary — every executor
+                    // being torn down sends some — and returning early halts the JVM on top of a
+                    // service that is still draining.
+                    interrupted = true;
+                    LOG.warn("Interrupted while waiting for the shutdown already in flight;"
+                            + " still waiting, because returning now would let the JVM halt on a"
+                            + " live shutdown");
+                }
             }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            LOG.warn("Interrupted while waiting for the shutdown already in flight");
-            return;
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
         LOG.error("The shutdown already in flight has not completed within {}. Whatever happens"
                         + " next — including the JVM halting — happens on top of it; a service"
@@ -454,22 +596,38 @@ public final class Supervisor implements AutoCloseable {
 
     /**
      * The longest a shutdown can legitimately take: every service's own limit, twice over for the
-     * {@code stop()} and the {@code close()} it gets, plus the decommission cancellation that may
-     * precede them and a little slack for the bookkeeping around both.
+     * {@code stop()} and the {@code close()} it gets, plus the cancellations that may precede them
+     * — a coordinated decommission and a catch-up exclusion can both be in flight, and each is
+     * waited for in turn — and a little slack for the bookkeeping around all of it.
      */
     private Duration shutdownBudget() {
-        Duration total = DECOMMISSION_CANCEL_BUDGET.plus(SHUTDOWN_BUDGET_SLACK);
+        Duration total = decommissionCancelBudget.multipliedBy(2).plus(SHUTDOWN_BUDGET_SLACK);
         for (ServiceConfiguration service : configuration.services().values()) {
             total = total.plus(service.shutdownTimeout().multipliedBy(2));
         }
         return total;
     }
 
-    private void stopServicesInReverseOrder() {
-        List<Map.Entry<String, EmbeddedService>> entries;
+    /**
+     * The started services, copied.
+     *
+     * <p>Copied, and never held: {@code started} is a {@code synchronizedMap}, so every traversal
+     * of it — {@code forEach} included — holds its monitor for the whole traversal. Holding that
+     * monitor across a call into an isolated loader is what wedged the process: the health monitor
+     * sat in {@code status()} inside a runtime that ignores interrupts, a decommission blocked
+     * behind it while holding {@link #transitionLock}, and the shutdown blocked on {@code
+     * transitionLock} before it ever reached {@link #stopHealthMonitor}. Nothing here may be
+     * called with {@code transitionLock} held.
+     */
+    private Map<String, EmbeddedService> startedServices() {
         synchronized (started) {
-            entries = new ArrayList<>(started.entrySet());
+            return new LinkedHashMap<>(started);
         }
+    }
+
+    private void stopServicesInReverseOrder() {
+        List<Map.Entry<String, EmbeddedService>> entries =
+                new ArrayList<>(startedServices().entrySet());
         Collections.reverse(entries);
         for (Map.Entry<String, EmbeddedService> entry : entries) {
             if (abandoned.contains(entry.getKey())) {
@@ -486,28 +644,73 @@ public final class Supervisor implements AutoCloseable {
     /**
      * Stops one service and discards its ClassLoader.
      *
-     * <p>A failure is logged and swallowed. The services after this one in the shutdown order are
-     * the ones still holding threads, sockets and mapped files, and stranding them because an
-     * earlier service threw on the way out is the worse outcome.
+     * <p>A failure is logged and swallowed — {@code Throwable}, because these calls cross into an
+     * isolated ClassLoader where {@code NoClassDefFoundError} and {@code LinkageError} are what
+     * actually turn up. The services after this one in the shutdown order are the ones still
+     * holding threads, sockets and mapped files, and stranding them because an earlier service
+     * threw on the way out is the worse outcome.
+     *
+     * <p>An {@link TimeLimited.AbandonedException} is the exception to all of that, and it is
+     * caught first. It does not mean "{@code stop()} failed"; it means {@code stop()} is
+     * <i>still running</i> inside the service, and the two things this method does next — {@code
+     * close()}, which closes the {@code URLClassLoader} that thread is executing out of, and a
+     * final {@code status()} that would be recorded as if the service had settled — are precisely
+     * what must not happen to it. Handling it as an ordinary failure produced a shutdown that
+     * closed a loader under a live {@code drain()} and then reported exit code 0.
      */
     private void stopService(String name, EmbeddedService service) {
-        Duration timeout = configuration.service(name).shutdownTimeout();
         LOG.info("Stopping service '{}'", name);
+        Duration timeout;
+        try {
+            timeout = configuration.service(name).shutdownTimeout();
+        } catch (RuntimeException e) {
+            LOG.warn("No shutdown timeout is configured for service '{}'; using the default", name, e);
+            timeout = ServiceConfiguration.DEFAULT_SHUTDOWN_TIMEOUT;
+        }
         try {
             TimeLimited.run("stop " + name, timeout, service::stop);
-        } catch (Exception e) {
-            LOG.warn("Service '{}' did not stop cleanly; continuing with the shutdown", name, e);
+        } catch (TimeLimited.AbandonedException e) {
+            abandon(name, "its stop() is still running: " + e.getMessage());
+            return;
+        } catch (Throwable t) {
+            LOG.warn("Service '{}' did not stop cleanly; continuing with the shutdown", name, t);
         }
         // close() releases the isolated loader, which stop() alone does not. It calls stop()
         // again on the way; the SPI requires that to be a no-op.
         if (service instanceof AutoCloseable closeable) {
             try {
                 TimeLimited.run("close " + name, timeout, closeable::close);
-            } catch (Exception e) {
-                LOG.warn("Could not release the ClassLoader for service '{}'", name, e);
+            } catch (TimeLimited.AbandonedException e) {
+                abandon(name, "its close() is still running: " + e.getMessage());
+                return;
+            } catch (Throwable t) {
+                LOG.warn("Could not release the ClassLoader for service '{}'", name, t);
             }
         }
-        lastSeenStatus.put(name, service.status());
+        recordFinalStatus(name, service);
+    }
+
+    /**
+     * Records what the service said on the way out, defensively.
+     *
+     * <p>This is the supervisor's own bookkeeping and it runs <i>after</i> {@code close()}, which
+     * is to say after the loader that answers the call has been discarded. {@code
+     * IsolatedService.status()} is hardened against exactly that, but the invariant is this
+     * class's: an unguarded call here delegates the whole shutdown's ability to finish to a
+     * service implementation, and a {@code null} return alone was enough to abort it with an NPE
+     * out of {@code ConcurrentHashMap.put}.
+     */
+    private void recordFinalStatus(String name, EmbeddedService service) {
+        try {
+            ServiceStatus finalStatus = service.status();
+            if (finalStatus != null) {
+                lastSeenStatus.put(name, finalStatus);
+            } else {
+                LOG.warn("Service '{}' reported a null status after being stopped", name);
+            }
+        } catch (Throwable t) {
+            LOG.warn("Could not read the final status of service '{}'", name, t);
+        }
     }
 
     private void installShutdownHook() {
@@ -569,15 +772,20 @@ public final class Supervisor implements AutoCloseable {
      * these calls cross into an isolated ClassLoader, where {@code NoClassDefFoundError} and
      * {@code LinkageError} are the errors that actually turn up, and an {@code Error} escaping
      * here would cancel the schedule just as permanently and just as silently.
+     *
+     * <p>Nothing here may hold a lock either. This polls both services on a fixed schedule, and
+     * {@code status()} on a runtime that is wedged does not return — it is not interruptible, so
+     * {@link #stopHealthMonitor} cannot free it. Holding the {@code started} monitor across the
+     * poll therefore blocked {@link #beginDecommission}, which held {@link #transitionLock} while
+     * it waited, which blocked the shutdown before it reached the code that would have stopped
+     * this monitor. Three threads, no deadline, and the process never went down.
      */
     private void checkHealth() {
         if (state != SupervisorState.RUNNING) {
             return;
         }
         try {
-            synchronized (started) {
-                started.forEach(this::checkService);
-            }
+            startedServices().forEach(this::checkService);
         } catch (Throwable e) {
             LOG.warn("Health check failed; will retry", e);
         }
@@ -660,10 +868,16 @@ public final class Supervisor implements AutoCloseable {
      * concurrently" contract was broken with two {@code StorageService.decommission()} calls in
      * flight over one node.
      *
+     * <p>The services are snapshotted <i>before</i> the lock is taken, and that is not a detail:
+     * every other lock in this class must be acquirable without {@code transitionLock}, or the
+     * shutdown — which needs {@code transitionLock} first — can be blocked behind a service call
+     * that has no deadline. See {@link #startedServices}.
+     *
      * @throws DecommissionException if a decommission is already running, or the supervisor is in
      *                               no state to start one
      */
     private DecommissionCoordinator beginDecommission() throws DecommissionException {
+        Map<String, EmbeddedService> services = startedServices();
         synchronized (transitionLock) {
             DecommissionCoordinator existing = decommissionInFlight.get();
             if (existing != null) {
@@ -676,10 +890,6 @@ public final class Supervisor implements AutoCloseable {
             if (state != SupervisorState.RUNNING) {
                 throw new DecommissionException(
                         "Cannot decommission: the supervisor is " + state + ", not RUNNING.");
-            }
-            Map<String, EmbeddedService> services;
-            synchronized (started) {
-                services = new LinkedHashMap<>(started);
             }
             DecommissionCoordinator coordinator = new DecommissionCoordinator(
                     configuration, services, this::onDecommissionProgress);
@@ -769,49 +979,96 @@ public final class Supervisor implements AutoCloseable {
         thread.start();
     }
 
+    /**
+     * The catch-up exclusion itself, on a thread of its own.
+     *
+     * <p>Two things have to be true before the call is made, and one of them is not a guard but a
+     * registration. The guard is that nothing else has taken over the OpenSearch node meanwhile —
+     * the decision to start this thread was taken on the reporting thread, and a supervisor-driven
+     * decommission or a shutdown may have begun since. The registration is what makes the guard
+     * worth anything: re-reading the state and then calling into OpenSearch is a check-then-act,
+     * and the act a shutdown would interleave is {@code stop()} followed by {@code close()} on the
+     * loader this thread is executing out of. So both happen under {@link #transitionLock}, which
+     * the shutdown also takes before it moves to {@code STOPPING}: either this thread registers
+     * first and the shutdown waits for it, or the shutdown wins and this thread sees {@code
+     * STOPPING} and never makes the call.
+     */
     private void excludeAfterExternalDecommission(String serviceName, RingStateEvent event) {
-        // The guard that let this thread start ran on the reporting thread; between that decision
-        // and this line a supervisor-driven decommission or a shutdown may have begun, and either
-        // one is already driving the OpenSearch node this method is about to touch.
-        if (decommissionInFlight.get() != null || state != SupervisorState.RUNNING) {
-            LOG.debug("Service '{}' reported {}, but the supervisor moved to {} before the"
-                            + " catch-up exclusion could start; leaving it to whatever is driving"
-                            + " this now", serviceName, event.state(), state);
-            return;
-        }
-        EmbeddedService opensearch = started.get("opensearch");
-        LOG.warn("Service '{}' is {}: Cassandra is leaving the ring but was not asked through the"
-                        + " supervisor; OpenSearch shard relocation may not complete before this"
-                        + " process exits — use `bin/cassandra-opensearch decommission`, which"
-                        + " relocates the shards before Cassandra gives its ranges back.",
-                serviceName, event.state());
-        if (opensearch == null) {
-            return;
-        }
-        LOG.warn("Excluding this node from OpenSearch shard allocation as a best-effort catch-up."
-                + " It is a catch-up and it may lose the race: watch `_cat/shards` and let this"
-                + " node empty before the process is stopped, or any shard with no other copy is"
-                + " lost with it.");
+        // Read outside transitionLock: `started` is a synchronizedMap whose monitor the health
+        // monitor competes for, and taking it under transitionLock is the lock ordering that
+        // wedged the shutdown. See startedServices().
+        EmbeddedService opensearch = startedServices().get("opensearch");
         Duration timeout = configuration.decommission().shardRelocationTimeout();
+        ExternalCatchUp exclusion = new ExternalCatchUp(timeout);
+        synchronized (transitionLock) {
+            if (decommissionInFlight.get() != null || state != SupervisorState.RUNNING) {
+                LOG.debug("Service '{}' reported {}, but the supervisor moved to {} before the"
+                                + " catch-up exclusion could start; leaving it to whatever is"
+                                + " driving this now", serviceName, event.state(), state);
+                return;
+            }
+            if (opensearch == null) {
+                LOG.warn("Service '{}' is {}: Cassandra is leaving the ring but was not asked"
+                                + " through the supervisor. No OpenSearch service is running here,"
+                                + " so there is nothing to exclude.", serviceName, event.state());
+                return;
+            }
+            externalExclusion.set(exclusion);
+        }
         try {
-            opensearch.prepareDecommission(new ExternalCatchUp(timeout));
+            LOG.warn("Service '{}' is {}: Cassandra is leaving the ring but was not asked through"
+                            + " the supervisor; OpenSearch shard relocation may not complete before"
+                            + " this process exits — use `bin/cassandra-opensearch decommission`,"
+                            + " which relocates the shards before Cassandra gives its ranges back.",
+                    serviceName, event.state());
+            LOG.warn("Excluding this node from OpenSearch shard allocation as a best-effort"
+                    + " catch-up. It is a catch-up and it may lose the race: watch `_cat/shards`"
+                    + " and let this node empty before the process is stopped, or any shard with"
+                    + " no other copy is lost with it.");
+            // Bounded like every other call into a service. It was the one that was not, and an
+            // exclusion that never returns is an exclusion nothing can wait for.
+            TimeLimited.run("external-exclusion opensearch", timeout.plus(EXTERNAL_EXCLUSION_GRACE),
+                    () -> opensearch.prepareDecommission(exclusion));
+        } catch (TimeLimited.AbandonedException e) {
+            abandon("opensearch", "a catch-up shard-allocation exclusion is still running inside"
+                    + " it: " + e.getMessage());
         } catch (Exception e) {
             LOG.error("Could not exclude this node from OpenSearch shard allocation after a"
                     + " decommission started outside the supervisor. Its shards will not relocate"
                     + " on their own; exclude the node by hand with a transient"
                     + " cluster.routing.allocation.exclude._name update.", e);
+        } finally {
+            exclusion.finish();
+            externalExclusion.compareAndSet(exclusion, null);
         }
     }
 
     /**
-     * The phase context for the catch-up exclusion.
+     * The phase context for the catch-up exclusion, and the handle a shutdown waits on.
      *
-     * <p>Never forced and never cancelled, because there is nothing here to force or to cancel:
-     * this makes one call, {@code prepareDecommission}, which neither waits for a hand-off nor
-     * decides whether data may be abandoned. The decision that {@code force} would answer was
-     * taken by whoever ran {@code nodetool decommission}.
+     * <p>Never forced, because there is nothing here to force: this makes one call, {@code
+     * prepareDecommission}, which does not decide whether data may be abandoned. The decision that
+     * {@code force} would answer was taken by whoever ran {@code nodetool decommission}.
+     *
+     * <p>Cancellable, though, and it has to be: a shutdown that arrives while this is in flight
+     * must be able to ask it to stop and then find out whether it did, which is what {@link
+     * #finished} is for. It used to answer {@code false} to {@code isCancelled()} forever and be
+     * registered nowhere, so a shutdown neither cancelled it nor waited for it.
      */
-    private record ExternalCatchUp(Duration timeout) implements DecommissionContext {
+    private static final class ExternalCatchUp implements DecommissionContext {
+
+        private final Duration timeout;
+        private final CountDownLatch finished = new CountDownLatch(1);
+        private volatile boolean cancelled;
+
+        private ExternalCatchUp(Duration timeout) {
+            this.timeout = timeout;
+        }
+
+        @Override
+        public Duration timeout() {
+            return timeout;
+        }
 
         @Override
         public boolean force() {
@@ -825,7 +1082,25 @@ public final class Supervisor implements AutoCloseable {
 
         @Override
         public boolean isCancelled() {
-            return false;
+            return cancelled;
+        }
+
+        void cancel() {
+            cancelled = true;
+        }
+
+        void finish() {
+            finished.countDown();
+        }
+
+        /** @return false if the call is still inside the service when the budget expires */
+        boolean awaitCompletion(Duration budget) {
+            try {
+                return finished.await(budget.toMillis(), TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return finished.getCount() == 0;
+            }
         }
     }
 
@@ -833,9 +1108,7 @@ public final class Supervisor implements AutoCloseable {
 
     /** The started services, in startup order. */
     public Map<String, EmbeddedService> services() {
-        synchronized (started) {
-            return Collections.unmodifiableMap(new LinkedHashMap<>(started));
-        }
+        return Collections.unmodifiableMap(startedServices());
     }
 
     public NodeConfiguration configuration() {

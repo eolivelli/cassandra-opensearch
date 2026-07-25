@@ -17,6 +17,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 
 import javax.management.MBeanServer;
 import javax.management.MBeanServerFactory;
@@ -91,6 +92,59 @@ class CassandraDecommissionTest {
     }
 
     /**
+     * The sibling of the test above, on the mode the fork leaves behind when the same sequence
+     * fails a little earlier: {@code DECOMMISSION_FAILED}.
+     *
+     * <p>{@code StorageService.decommission()} sets that mode from three catch blocks, all of them
+     * below {@code unbootstrap()} and one of them the bare {@code InterruptedException} exercised
+     * here. Every one of them describes a node that has stopped being a useful ring member — this
+     * one has already announced LEAVING to the cluster and abandoned the procedure half way — so
+     * reporting RUNNING is the same lie about the same code path that the DECOMMISSIONED branch was
+     * written to stop telling. FAILED is what says the node needs looking at, and it is what
+     * survives {@code stop()} to reach the operator after the supervisor's final teardown.
+     */
+    @Test
+    void aDecommissionThatFailedAfterAnnouncingItselfIsNotReportedAsRunning(@TempDir Path home)
+            throws Exception {
+        node = TestNode.started(home);
+        Cassandra cassandra = new Cassandra(node.isolatedLoader());
+        cassandra.dontStreamHintsOnDecommission();
+        cassandra.pretendThisNodeIsAlreadyLeaving();
+
+        // decommission() blocks for the whole procedure, so the interrupt has to come from
+        // somewhere else. The window is the fork's own `sleep(max(ring_delay, batchlog_timeout))`
+        // between startLeaving() and unbootstrap(), which is 5s here (cassandra.ring_delay_ms).
+        AtomicReference<Throwable> thrown = new AtomicReference<>();
+        Thread decommissioning = new Thread(() -> {
+            try {
+                node.service().decommission(new TestDecommissionContext(Duration.ofMinutes(5), false));
+            } catch (Throwable failure) {
+                thrown.set(failure);
+            }
+        }, "decommission-under-test");
+        decommissioning.start();
+        Thread.sleep(1500);
+        decommissioning.interrupt();
+        decommissioning.join(Duration.ofMinutes(2).toMillis());
+        assertThat(decommissioning.isAlive()).isFalse();
+
+        assertThat(thrown.get()).isInstanceOf(ServiceException.class);
+        assertThat(node.details())
+                .as("the fork records the abandoned attempt in the operation mode")
+                .containsEntry("operationMode", "DECOMMISSION_FAILED");
+        assertThat(node.service().status())
+                .as("the node announced LEAVING and then stopped; it is not RUNNING")
+                .isEqualTo(ServiceStatus.FAILED);
+
+        node.service().stop();
+
+        assertThat(node.service().status())
+                .as("FAILED is the post-mortem and stop() must not erase it")
+                .isEqualTo(ServiceStatus.FAILED);
+        assertThat(node.details()).containsEntry("status", "FAILED");
+    }
+
+    /**
      * The other state {@code stop()} must not erase, on the path that produces it: a start that
      * failed before the daemon existed. FAILED is the post-mortem — it says the node died rather
      * than being asked to leave — and the supervisor reads it after the final stop.
@@ -134,6 +188,57 @@ class CassandraDecommissionTest {
         assertThat(Thread.getDefaultUncaughtExceptionHandler())
                 .as("nothing of Cassandra's may be left installed process-wide")
                 .isSameAs(handlerBefore);
+    }
+
+    /**
+     * The same leak, on the failure that happens <i>before</i> a socket is ever asked for.
+     *
+     * <p>{@code NodeJmxServer.start()} touches {@code MBeanWrapper.instance} — which is what
+     * creates the private {@code MBeanServer} — and only then resolves the bind address and builds
+     * the RMI socket factory. A {@code cassandra.jmx.address} that does not resolve throws
+     * {@code UnknownHostException} from {@code InetAddress.getByName} at that point, which is two
+     * statements earlier than a port collision throws, and a compensation boundary drawn between
+     * the two catches one and leaks the other. Nothing else ever comes back for it: {@code stop()}
+     * takes the {@code daemon == null} / {@code jmx == null} branch, and {@code MBeanServerFactory}
+     * holds the server — and through it the isolated ClassLoader — for the life of the process.
+     *
+     * <p>{@code failedSurvivesStopAndTakesNoProcessWideStateWithIt} above covers the other side of
+     * the same boundary, and passed throughout the whole time this one did not.
+     */
+    @Test
+    void aJmxAddressThatDoesNotResolveLeavesNoMBeanServerBehind(@TempDir Path home) throws Exception {
+        // NodeJmxServer pins java.rmi.server.hostname from this value before anything can fail, and
+        // that property is JVM-global and cached by RMI on first use. Put it back, so that a node
+        // started later in this JVM is not handed "not a host name".
+        String rmiHostname = System.getProperty("java.rmi.server.hostname");
+        try {
+            // Spaces: no resolver anywhere will turn this into an address, whereas a name in a
+            // reserved TLD is at the mercy of a provider that answers NXDOMAIN with an ad server.
+            node = TestNode.create(home, "not a host name");
+            int mbeanServersBefore = privateMBeanServers();
+
+            // Not hasRootCauseInstanceOf: on JDK 21 the platform resolver rethrows the
+            // UnknownHostException wrapped in a RuntimeException that does not chain it, so the
+            // type is only in the message.
+            assertThatThrownBy(() -> node.service().start(node.context()))
+                    .isInstanceOf(ServiceException.class)
+                    .hasStackTraceContaining("UnknownHostException");
+
+            assertThat(node.service().status()).isEqualTo(ServiceStatus.FAILED);
+
+            node.service().stop();
+
+            assertThat(privateMBeanServers())
+                    .as("the private MBeanServer already existed when getByName threw; releasing it"
+                            + " is the only thing that lets the isolated ClassLoader be collected")
+                    .isEqualTo(mbeanServersBefore);
+        } finally {
+            if (rmiHostname == null) {
+                System.clearProperty("java.rmi.server.hostname");
+            } else {
+                System.setProperty("java.rmi.server.hostname", rmiHostname);
+            }
+        }
     }
 
     /**

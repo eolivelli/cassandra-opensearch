@@ -7,6 +7,7 @@
  */
 package io.cassandraopensearch.runtime.cassandra;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
 
@@ -55,6 +56,39 @@ class CassandraServiceStartStopTest {
 
         // details() stays cheap and answerable after a stop; it just has nothing left to report.
         assertThat(node.details()).containsEntry("status", "STOPPED");
+    }
+
+    /**
+     * The {@code GCInspector} comes off the platform garbage-collector MXBeans before {@code
+     * drain()} runs, and not merely at some point during the teardown.
+     *
+     * <p>Order is the whole content of the claim. The inspector is a notification listener on
+     * JVM-global beans, and on an old-generation collection it calls
+     * {@code LifecycleTransaction.rescheduleFailedDeletions()}, which submits to executors {@code
+     * drain()} has already stopped. The platform beans dispatch to their listeners in a bare loop
+     * with no per-listener {@code try}, so the {@code RejectedExecutionException} that follows also
+     * stops every listener registered behind it — in a process running a second node, that is the
+     * live node's inspector going quiet. Detaching from inside {@code jmx.stop()}, the third
+     * teardown step, left that window open for the whole of {@code drain()}.
+     *
+     * <p>Asserted through the node's own log because that is where the ordering is visible after
+     * the fact, and because both markers are written by the code whose order is in question.
+     */
+    @Test
+    void theGcInspectorIsDetachedBeforeDrainShutsTheExecutorsDown(@TempDir Path home) throws Exception {
+        node = TestNode.started(home);
+
+        node.service().stop();
+
+        String log = Files.readString(node.logFile());
+        int detached = log.indexOf("detached from the platform garbage-collector MXBeans");
+        int draining = log.indexOf("DRAINING: starting drain process");
+        assertThat(detached).as("the detach is not logged at all; see NodeMBeanWrapper").isNotNegative();
+        assertThat(draining).as("drain() did not run; the teardown changed shape").isNotNegative();
+        assertThat(detached)
+                .as("the GCInspector must be off the platform beans before drain() stops the"
+                        + " executor its notification handler submits to")
+                .isLessThan(draining);
     }
 
     @Test
