@@ -49,9 +49,14 @@ import javax.management.remote.JMXServiceURL;
  *   <li>an MBean in domain {@code io.cassandraopensearch}, by preference
  *       {@code io.cassandraopensearch:type=Supervisor};</li>
  *   <li>readable attributes describing the process — printed as-is by {@code status};</li>
- *   <li>an operation {@code stop()} or {@code shutdown()};</li>
- *   <li>an operation {@code decommission(long timeoutMillis, boolean force)}, or one of the
- *       simpler shapes listed in {@link #DECOMMISSION_SIGNATURES}.</li>
+ *   <li>an operation {@code decommission(long timeoutSeconds, boolean force)}, or one of the
+ *       simpler shapes listed in {@link #DECOMMISSION_SIGNATURES};</li>
+ *   <li>optionally {@code Map serviceDetails(String)} and a {@code DecommissionProgress}
+ *       attribute, both of which the CLI renders when they are there and skips when they are not;</li>
+ *   <li>optionally an operation {@code stop()} or {@code shutdown()}. There is none today —
+ *       the supervisor owns the JVM's only shutdown hook, so a signal is the stop mechanism and
+ *       the launcher falls back to one. The lookup stays because a stop operation is the more
+ *       precise instrument if one is ever added.</li>
  * </ul>
  *
  * <p>When an expectation is not met the failure names the MBean and lists what it did find,
@@ -178,19 +183,45 @@ final class SupervisorMBeanClient implements AutoCloseable {
                 .filter(candidate -> STOP_OPERATIONS.contains(candidate.getName()))
                 .filter(candidate -> candidate.getSignature().length == 0)
                 .findFirst()
-                .orElseThrow(() -> new CliException(CliException.FAILED,
-                        "No no-argument stop operation on " + supervisor + "; it declares "
-                                + operationSummary()));
+                .orElseThrow(() -> new CliException(CliException.NO_SUCH_OPERATION,
+                        "the supervisor MBean exposes no stop operation"));
         invoke(operation.getName(), new Object[0], new String[0]);
     }
 
+    /** The last thing a running decommission said about itself, or null if it says nothing. */
+    String decommissionProgress() {
+        try {
+            Object value = connection.getAttribute(supervisor, "DecommissionProgress");
+            return value == null ? null : String.valueOf(value);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Whatever {@code serviceDetails(name)} returns, or an empty map if there is no such operation. */
+    Map<String, String> serviceDetails(String service) {
+        boolean supported = operations().stream()
+                .anyMatch(candidate -> "serviceDetails".equals(candidate.getName())
+                        && Arrays.equals(new String[] {"java.lang.String"}, parameterTypes(candidate)));
+        if (!supported) {
+            return Map.of();
+        }
+        Object result = invoke("serviceDetails", new Object[] {service}, new String[] {"java.lang.String"});
+        Map<String, String> details = new LinkedHashMap<>();
+        if (result instanceof Map<?, ?> map) {
+            map.forEach((key, value) -> details.put(String.valueOf(key), String.valueOf(value)));
+        }
+        return details;
+    }
+
     /**
-     * @param timeoutMillis bound on each waiting phase of the decommission
-     * @param force         proceed even with shards or ranges still outstanding
-     * @return the name of the operation that was invoked, for the operator's benefit — the
-     *         supervisor may not support every argument that was asked for
+     * @param timeoutSeconds bound on each waiting phase of the decommission; {@code 0} means use
+     *                       the limits from {@code conf/cassandra-opensearch.yaml}
+     * @param force          proceed even with shards or ranges still outstanding
+     * @return whatever the operation returned, prefixed by the signature that was called — the
+     *         supervisor may not accept every argument that was asked for
      */
-    String decommission(long timeoutMillis, boolean force) {
+    String decommission(long timeoutSeconds, boolean force) {
         List<MBeanOperationInfo> candidates = operations().stream()
                 .filter(candidate -> "decommission".equals(candidate.getName()))
                 .toList();
@@ -206,10 +237,10 @@ final class SupervisorMBeanClient implements AutoCloseable {
                 }
                 Object[] arguments = new Object[actual.length];
                 for (int i = 0; i < actual.length; i++) {
-                    arguments[i] = "boolean".equals(actual[i]) ? Boolean.valueOf(force) : Long.valueOf(timeoutMillis);
+                    arguments[i] = "boolean".equals(actual[i]) ? Boolean.valueOf(force) : Long.valueOf(timeoutSeconds);
                 }
-                invoke(candidate.getName(), arguments, actual);
-                return describe(candidate);
+                Object result = invoke(candidate.getName(), arguments, actual);
+                return describe(candidate) + (result == null ? "" : ": " + result);
             }
         }
         throw new CliException(CliException.FAILED,

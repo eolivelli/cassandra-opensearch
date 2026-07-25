@@ -195,9 +195,24 @@ stop() {
         _pid=$(cat "$PIDFILE")
     fi
 
+    # Ask the supervisor's MBean first. Exit code 4 means it answered but has no stop operation,
+    # which is the situation today: the supervisor owns the JVM's only shutdown hook, so SIGTERM
+    # is the ordered-teardown path and a signal is the more honest instrument. Any other non-zero
+    # code is a real failure and must not be papered over with a kill.
+    _rc=0
     # shellcheck disable=SC2086
     "$JAVA" -cp "$BOOT_CLASSPATH" "$CLI_CLASS" stop \
-        --jmx-host "$CO_JMX_HOST" --jmx-port "$CO_JMX_PORT" $CLI_ARGS
+        --jmx-host "$CO_JMX_HOST" --jmx-port "$CO_JMX_PORT" $CLI_ARGS || _rc=$?
+    if [ "$_rc" -eq 4 ]; then
+        [ -n "$_pid" ] || co_die "no stop operation on the supervisor MBean and no pid in
+  $PIDFILE. Send SIGTERM to the process yourself: the supervisor's shutdown hook drains
+  Cassandra and closes the OpenSearch node in order."
+        kill -0 "$_pid" 2> /dev/null || co_die "pid $_pid from $PIDFILE is not running."
+        echo "sending SIGTERM to pid $_pid"
+        kill -TERM "$_pid"
+    elif [ "$_rc" -ne 0 ]; then
+        exit "$_rc"
+    fi
 
     # The MBean call only asks. The shutdown itself drains Cassandra and closes the OpenSearch
     # node, which takes as long as it takes; waiting here is what makes `stop && start` safe.

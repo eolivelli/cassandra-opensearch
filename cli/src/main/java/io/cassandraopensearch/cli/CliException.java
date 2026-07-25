@@ -25,6 +25,12 @@ final class CliException extends RuntimeException {
     static final int FAILED = 1;
     /** Nothing is listening on the supervisor's JMX port. */
     static final int NOT_RUNNING = 3;
+    /**
+     * The process answered, but its MBean does not offer the operation that was asked for. The
+     * launcher branches on this to fall back to a signal for {@code stop}, so it has to be
+     * distinguishable from a stop that was attempted and failed.
+     */
+    static final int NO_SUCH_OPERATION = 4;
 
     private final int exitCode;
 

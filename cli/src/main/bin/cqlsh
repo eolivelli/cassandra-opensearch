@@ -16,12 +16,14 @@ CO_INCLUDE=$(dirname "$0")/cassandra-opensearch.in.sh
 # shellcheck source=cassandra-opensearch.in.sh
 . "$CO_INCLUDE"
 
-# The one native_transport_port: in conf/cassandra-opensearch.yaml is Cassandra's.
-CQL_PORT=$(sed -n 's/^[[:space:]]*native_transport_port:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
-    "$CO_CONF/cassandra-opensearch.yaml" 2> /dev/null | head -1)
+# From conf/cassandra.yaml, not conf/cassandra-opensearch.yaml. The supervisor's file carries a
+# native_transport_port too, but it is documentation: Cassandra parses cassandra.yaml itself and
+# binds what it finds there. See docs/KNOWN-GAPS.md.
+CQL_PORT=$(sed -n 's/^native_transport_port:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+    "$CO_CONF/cassandra.yaml" 2> /dev/null | head -1)
 CQL_PORT="${CQL_PORT:-9042}"
-CQL_HOST=$(sed -n 's/^[[:space:]]*listen_address:[[:space:]]*\([^ #]*\).*/\1/p' \
-    "$CO_CONF/cassandra-opensearch.yaml" 2> /dev/null | head -1)
+CQL_HOST=$(sed -n 's/^rpc_address:[[:space:]]*\([^ #]*\).*/\1/p' \
+    "$CO_CONF/cassandra.yaml" 2> /dev/null | head -1)
 CQL_HOST="${CQL_HOST:-127.0.0.1}"
 
 if [ -z "$CASSANDRA_TOOLS_HOME" ] || [ ! -x "$CASSANDRA_TOOLS_HOME/bin/cqlsh" ]; then

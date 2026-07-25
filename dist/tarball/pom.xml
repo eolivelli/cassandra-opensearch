@@ -72,7 +72,11 @@
     <dependency>
       <groupId>org.slf4j</groupId>
       <artifactId>slf4j-simple</artifactId>
-      <version>${slf4j.version}</version>
+      <!-- The parent manages this to `test`, which is right for every module that only wants a
+           binding while its tests run. Here it is the product's binding, and `runtime` is what
+           it is: the supervisor compiles against slf4j-api and must not see the binding at
+           compile time. -->
+      <scope>runtime</scope>
     </dependency>
     <dependency>
       <groupId>org.yaml</groupId>

@@ -30,7 +30,17 @@ public final class CassandraOpenSearchCli {
 
     private static final String DEFAULT_JMX_HOST = "127.0.0.1";
     private static final int DEFAULT_JMX_PORT = 7299;
-    private static final Duration DEFAULT_DECOMMISSION_TIMEOUT = Duration.ofMinutes(30);
+
+    /**
+     * Zero means "use the timeouts in conf/cassandra-opensearch.yaml", which is the right
+     * default: {@code shard_relocation_timeout} and {@code ring_streaming_timeout} are sized for
+     * how much data this node holds, and the operator typing the command usually knows less
+     * about that than the file does.
+     */
+    private static final Duration DEFAULT_DECOMMISSION_TIMEOUT = Duration.ZERO;
+
+    /** How often the progress watcher polls while the decommission call is blocked. */
+    private static final Duration PROGRESS_INTERVAL = Duration.ofSeconds(5);
 
     private CassandraOpenSearchCli() {
     }
@@ -121,8 +131,35 @@ public final class CassandraOpenSearchCli {
                 System.out.printf("  %-" + width + "s : %s%n", attribute.getKey(),
                         format(attribute.getValue()));
             }
+            // The per-service detail is where the useful part is — ring state, shard counts,
+            // listen addresses — and it is an operation rather than an attribute, so the generic
+            // dump above cannot reach it.
+            for (String service : serviceNames(attributes)) {
+                Map<String, String> details = client.serviceDetails(service);
+                if (details.isEmpty()) {
+                    continue;
+                }
+                System.out.println();
+                System.out.println("  " + service);
+                int detailWidth = details.keySet().stream().mapToInt(String::length).max().orElse(0);
+                for (Map.Entry<String, String> detail : details.entrySet()) {
+                    System.out.printf("    %-" + detailWidth + "s : %s%n",
+                            detail.getKey(), detail.getValue());
+                }
+            }
             return 0;
         }
+    }
+
+    private static List<String> serviceNames(Map<String, Object> attributes) {
+        Object names = attributes.get("ServiceNames");
+        if (names instanceof String[] array) {
+            return List.of(array);
+        }
+        if (names instanceof Object[] array) {
+            return Arrays.stream(array).map(String::valueOf).toList();
+        }
+        return List.of();
     }
 
     private static int stop(String serviceUrl, boolean quiet) {
@@ -132,6 +169,15 @@ public final class CassandraOpenSearchCli {
             }
             client.stop();
         } catch (CliException e) {
+            if (e.exitCode() == CliException.NO_SUCH_OPERATION) {
+                // Not a defect: the supervisor owns the JVM's only shutdown hook, so SIGTERM is
+                // the ordered-teardown path. bin/cassandra-opensearch branches on exit code 4
+                // and sends the signal; say so, for anyone who ran this command directly.
+                System.err.println("the supervisor MBean exposes no stop operation; send SIGTERM"
+                        + " to the process instead (bin/cassandra-opensearch stop does this for"
+                        + " you when it can read the pid file)");
+                return CliException.NO_SUCH_OPERATION;
+            }
             // The connection dying underneath a stop is the expected outcome, not a failure: the
             // supervisor tears down its own JMX connector on the way out, so the RMI call often
             // never gets to return.
@@ -152,11 +198,19 @@ public final class CassandraOpenSearchCli {
     private static int decommission(String serviceUrl, Duration timeout, boolean force) {
         try (SupervisorMBeanClient client = SupervisorMBeanClient.connect(serviceUrl)) {
             System.out.println("decommissioning " + client.objectName()
-                    + " (timeout " + timeout + (force ? ", forced" : "") + ") ...");
+                    + (timeout.isZero() ? " (timeouts from conf/cassandra-opensearch.yaml"
+                                        : " (timeout " + timeout)
+                    + (force ? ", forced" : "") + ") ...");
             System.out.println("this relocates every OpenSearch shard off this node before"
-                    + " Cassandra leaves the ring, and can take a long time");
-            String invoked = client.decommission(timeout.toMillis(), force);
-            System.out.println("supervisor accepted " + invoked);
+                    + " Cassandra leaves the ring, and can legitimately take an hour");
+            Thread watcher = startProgressWatcher(serviceUrl);
+            try {
+                // Blocks for the whole procedure; the watcher above is on its own connection
+                // precisely so that something can be printed while it does.
+                System.out.println(client.decommission(timeout.toSeconds(), force));
+            } finally {
+                watcher.interrupt();
+            }
             return 0;
         } catch (CliException e) {
             if (e.exitCode() == CliException.FAILED && isConnectionLoss(e)) {
@@ -168,6 +222,37 @@ public final class CassandraOpenSearchCli {
             }
             throw e;
         }
+    }
+
+    /**
+     * Follows {@code DecommissionProgress} on a second connection and prints it as it changes.
+     *
+     * <p>A daemon thread with its own connector: the JMX call carrying the decommission is
+     * blocked for the duration, and an RMI connection cannot carry a second call while it is.
+     * Failures here are swallowed — losing sight of the progress is not a reason to fail a
+     * decommission that is otherwise going fine.
+     */
+    private static Thread startProgressWatcher(String serviceUrl) {
+        Thread watcher = new Thread(() -> {
+            String last = null;
+            try (SupervisorMBeanClient client = SupervisorMBeanClient.connect(serviceUrl)) {
+                while (!Thread.currentThread().isInterrupted()) {
+                    String progress = client.decommissionProgress();
+                    if (progress != null && !progress.isBlank() && !progress.equals(last)) {
+                        last = progress;
+                        System.out.println("  " + progress);
+                    }
+                    Thread.sleep(PROGRESS_INTERVAL.toMillis());
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } catch (RuntimeException e) {
+                // No progress reporting; the decommission itself is unaffected.
+            }
+        }, "decommission-progress");
+        watcher.setDaemon(true);
+        watcher.start();
+        return watcher;
     }
 
     private static boolean isConnectionLoss(Throwable failure) {
@@ -182,6 +267,12 @@ public final class CassandraOpenSearchCli {
     private static String format(Object value) {
         if (value instanceof Object[] array) {
             return Arrays.toString(array);
+        }
+        if (value instanceof Map<?, ?> map) {
+            StringBuilder rendered = new StringBuilder();
+            map.forEach((key, entry) -> rendered.append(rendered.isEmpty() ? "" : ", ")
+                    .append(key).append('=').append(entry));
+            return rendered.toString();
         }
         if (value instanceof javax.management.openmbean.TabularData tabular) {
             StringBuilder rendered = new StringBuilder();
@@ -257,11 +348,13 @@ public final class CassandraOpenSearchCli {
                   --jmx-host <host>   supervisor JMX host (default 127.0.0.1, or CASSANDRA_OPENSEARCH_JMX_HOST)
                   --jmx-port <port>   supervisor JMX port (default 7299, or CASSANDRA_OPENSEARCH_JMX_PORT)
                   --jmx-url <url>     full service:jmx: URL, instead of host and port
-                  --timeout <90s|30m> bound on each waiting phase of a decommission (default 30m)
+                  --timeout <90s|30m> bound on each waiting phase of a decommission; the default
+                                      uses the limits in conf/cassandra-opensearch.yaml
                   --force             decommission even with shards or ranges still outstanding;
                                       anything on this node without another copy is lost
                   -q, --quiet         no output, exit code only
 
-                exit codes: 0 ok, 1 failed, 2 bad usage, 3 nothing running""");
+                exit codes: 0 ok, 1 failed, 2 bad usage, 3 nothing running,
+                            4 the MBean has no such operation""");
     }
 }

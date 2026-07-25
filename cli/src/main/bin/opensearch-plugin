@@ -1,0 +1,65 @@
+#!/bin/sh
+#
+# opensearch-plugin against this installation.
+#
+# Read this before using it. Installing a plugin into <home>/plugins does NOT make it available
+# to the embedded node, and can stop the node starting.
+#
+# OpenSearch's PluginsService scans <home>/plugins and <home>/modules and, for every bundle it
+# finds, runs a jar-hell check against System.getProperty("java.class.path"). In this process
+# that property describes lib/boot - the supervisor's classpath - and not the OpenSearch child
+# ClassLoader's, so the check both misses real conflicts and invents ones that are not there,
+# failing startup with "IllegalStateException: jar hell!". OpenSearchService therefore passes
+# transport-netty4 as a classpath plugin (PluginInfo) and never populates those directories.
+#
+# The supported way to add a plugin to this distribution is to put its jars in lib/opensearch/,
+# where the child ClassLoader picks them up like every other jar, and to have the runtime pass
+# the plugin class as a classpath plugin. That is a change to runtime-opensearch, not something
+# this tool can do.
+#
+# What remains useful is `list` and `remove` against an OpenSearch installation, and inspecting
+# a plugin zip before deciding to unpack it into lib/opensearch. The plugin CLI itself ships in
+# OpenSearch's distribution/tools/plugin-cli, which is not part of the dependency closure that
+# lib/opensearch is assembled from, so this is a passthrough.
+
+set -e
+
+CO_INCLUDE=$(dirname "$0")/cassandra-opensearch.in.sh
+[ -r "$CO_INCLUDE" ] || { echo "opensearch-plugin: missing $CO_INCLUDE" >&2; exit 1; }
+# shellcheck source=cassandra-opensearch.in.sh
+. "$CO_INCLUDE"
+
+co_require_java_21
+
+case "$1" in
+    install)
+        cat >&2 <<EOF
+opensearch-plugin: refusing to install into $CO_HOME/plugins.
+
+The embedded node never reads that directory, and if it exists PluginsService runs a jar-hell
+check against the supervisor's classpath rather than OpenSearch's - which fails startup with
+"jar hell!" for conflicts that are not real.
+
+To add a plugin here, put its jars in $CO_HOME/lib/opensearch/ and have runtime-opensearch pass
+the plugin class as a classpath plugin. See docs/spikes/opensearch-embedding.md.
+EOF
+        exit 1
+        ;;
+esac
+
+if [ -n "$OPENSEARCH_TOOLS_HOME" ] && [ -x "$OPENSEARCH_TOOLS_HOME/bin/opensearch-plugin" ]; then
+    OPENSEARCH_PATH_CONF="$CO_CONF"
+    export OPENSEARCH_PATH_CONF
+    exec "$OPENSEARCH_TOOLS_HOME/bin/opensearch-plugin" "$@"
+fi
+
+cat >&2 <<EOF
+opensearch-plugin: not available in this distribution.
+
+The plugin CLI ships in OpenSearch's distribution/tools/plugin-cli, which is not part of the
+org.opensearch:opensearch dependency closure that lib/opensearch is assembled from, so there is
+no jar here to run. Point OPENSEARCH_TOOLS_HOME at an OpenSearch installation of the same
+version as $(basename "$(ls "$CO_HOME"/lib/opensearch/opensearch-[0-9]*.jar 2> /dev/null | head -1)")
+if you need it.
+EOF
+exit 1
