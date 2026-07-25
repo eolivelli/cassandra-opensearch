@@ -10,7 +10,105 @@
   </parent>
   <artifactId>cassandra-opensearch-integration-tests</artifactId>
   <name>Cassandra + OpenSearch :: Integration Tests</name>
+
+  <description>
+    Failsafe ITs that unpack the assembled tarball into a temporary directory and drive it
+    through bin/ as a real external process, the way an operator would.
+
+    Nothing here embeds the supervisor. The point of these tests is the shipped artifact: the
+    jars the assembly collected, the scripts' JVM flags and CASSANDRA_INCLUDE shim, the pid
+    file, the management agent and the two isolated ClassLoaders the launcher builds. A test
+    that constructed its own classpath would exercise none of it.
+  </description>
+
+  <properties>
+    <!-- Built by ../dist/tarball, which the reactor completes before this module starts. -->
+    <dist.archive>${project.basedir}/../dist/tarball/target/cassandra-opensearch-${project.version}-bin.tar.gz</dist.archive>
+    <it.work.directory>${project.build.directory}/it-nodes</it.work.directory>
+  </properties>
+
   <dependencies>
-    <dependency><groupId>io.cassandraopensearch</groupId><artifactId>cassandra-opensearch-spi</artifactId></dependency>
+    <!--
+      For NodeConfiguration only, so that the ITs can parse the tarball's own
+      conf/cassandra-opensearch.yaml with the parser the supervisor uses and compare the result
+      with what the running process reports. Nothing here starts a supervisor in this JVM.
+    -->
+    <dependency>
+      <groupId>io.cassandraopensearch</groupId>
+      <artifactId>cassandra-opensearch-server</artifactId>
+      <scope>test</scope>
+    </dependency>
+
+    <!-- A real client: the driver's Netty and the node's Netty are different versions in
+         different processes here, exactly as they are for any application. -->
+    <dependency>
+      <groupId>org.apache.cassandra</groupId>
+      <artifactId>java-driver-core</artifactId>
+      <scope>test</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-simple</artifactId>
+    </dependency>
   </dependencies>
+
+  <build>
+    <plugins>
+      <!--
+        Decides whether the ITs run in this invocation, and it has to be decided from the goals
+        the operator typed: `install` runs every phase `verify` runs, so a phase binding cannot
+        tell the two apart, and the project's contract is that `mvn install` is the fast build
+        and `mvn verify` is the gate.
+
+        Any value that is not literally "true" is false to Maven's boolean converter, so the
+        unmatched case - a goal list with neither "install" nor an explicit -DskipITs=true -
+        falls through to running them.
+      -->
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>build-helper-maven-plugin</artifactId>
+        <version>${build.helper.version}</version>
+        <executions>
+          <execution>
+            <id>decide-whether-to-run-the-its</id>
+            <phase>validate</phase>
+            <goals><goal>regex-property</goal></goals>
+            <configuration>
+              <name>it.skip</name>
+              <value>${skipITs} ${session.goals}</value>
+              <regex>.*(true|install).*</regex>
+              <replacement>true</replacement>
+              <failIfNoMatch>false</failIfNoMatch>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-failsafe-plugin</artifactId>
+        <configuration>
+          <skipITs>${it.skip}</skipITs>
+          <trimStackTrace>false</trimStackTrace>
+          <!-- Not redirected to a file: when an IT fails it prints the node's own logs, and
+               those belong in the build output where whoever reads the failure will see them. -->
+          <redirectTestOutputToFile>false</redirectTestOutputToFile>
+          <systemPropertyVariables>
+            <dist.archive>${dist.archive}</dist.archive>
+            <it.work.directory>${it.work.directory}</it.work.directory>
+          </systemPropertyVariables>
+        </configuration>
+        <executions>
+          <execution>
+            <id>integration-tests</id>
+            <goals>
+              <goal>integration-test</goal>
+              <goal>verify</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
 </project>

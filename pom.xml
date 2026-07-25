@@ -54,6 +54,9 @@
     <snakeyaml.version>2.2</snakeyaml.version>
     <picocli.version>4.7.6</picocli.version>
 
+    <!-- The CQL client the runtime-cassandra tests and the ITs both drive a node with. -->
+    <cassandra.driver.version>4.18.1</cassandra.driver.version>
+
     <junit.version>5.10.2</junit.version>
     <assertj.version>3.25.3</assertj.version>
     <awaitility.version>4.2.1</awaitility.version>
@@ -66,6 +69,7 @@
     <shade.version>3.5.3</shade.version>
     <enforcer.version>3.4.1</enforcer.version>
     <exec.plugin.version>3.2.0</exec.plugin.version>
+    <build.helper.version>3.6.0</build.helper.version>
 
     <!-- Integration tests are skipped by default; the `it` profile / -DskipITs=false enables them -->
     <skipITs>false</skipITs>
@@ -144,6 +148,15 @@
         <groupId>info.picocli</groupId>
         <artifactId>picocli</artifactId>
         <version>${picocli.version}</version>
+      </dependency>
+
+      <!-- Test-scoped everywhere it is used: it is how a test talks to a node over the native
+           protocol, and it must never reach the supervisor's or a runtime's classpath. -->
+      <dependency>
+        <groupId>org.apache.cassandra</groupId>
+        <artifactId>java-driver-core</artifactId>
+        <version>${cassandra.driver.version}</version>
+        <scope>test</scope>
       </dependency>
 
       <dependency>
