@@ -146,6 +146,21 @@ class IsolatedClassLoaderTest {
     }
 
     @Test
+    void closeStopsAServiceThatHasAlreadyReachedATerminalState() throws Exception {
+        IsolatedService service = IsolatedService.create("probe", IMPL, classpath());
+        service.start(new RecordingServiceContext());
+        service.decommission(new ImmediateDecommissionContext());
+        assertThat(service.status()).isEqualTo(ServiceStatus.DECOMMISSIONED);
+
+        service.close();
+
+        // DECOMMISSIONED is terminal, but a decommissioned service has only left the cluster —
+        // its node, threads and sockets are still open. Treating "terminal" as "nothing left to
+        // release" leaked all of it.
+        assertThat(service.details()).containsEntry("stopped", "true");
+    }
+
+    @Test
     void applicationClasspathIsInvisibleToTheIsolatedLoader() throws Exception {
         try (IsolatedService service = IsolatedService.create("probe", IMPL, classpath())) {
             // ClasspathResolver sits on the application classpath and is not in the probe jar.

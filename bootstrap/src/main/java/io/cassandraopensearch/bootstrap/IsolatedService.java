@@ -163,9 +163,13 @@ public final class IsolatedService implements EmbeddedService, AutoCloseable {
     @Override
     public void close() throws Exception {
         try {
-            if (!delegate.status().isTerminal()) {
-                stop();
-            }
+            // stop() unconditionally, relying on the idempotency the SPI requires. Skipping it
+            // for terminal states looks like an optimisation but leaks: DECOMMISSIONED and
+            // FAILED are both terminal, and both describe a service that still holds an open
+            // node — a decommissioned OpenSearch node has left the cluster but its Node object,
+            // threads and sockets are all still live, and a service that failed during start
+            // may hold whatever it managed to allocate first.
+            stop();
         } finally {
             loader.close();
         }

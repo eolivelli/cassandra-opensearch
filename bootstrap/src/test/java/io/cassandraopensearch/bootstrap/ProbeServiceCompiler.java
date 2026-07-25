@@ -56,6 +56,7 @@ final class ProbeServiceCompiler {
 
                 private volatile ServiceStatus status = ServiceStatus.NEW;
                 private volatile String observedTccl = "<none>";
+                private volatile boolean stopped = false;
 
                 @Override
                 public String name() { return "probe"; }
@@ -81,6 +82,7 @@ final class ProbeServiceCompiler {
                     details.put("name", name());
                     details.put("tccl", observedTccl);
                     details.put("loader", String.valueOf(getClass().getClassLoader().getName()));
+                    details.put("stopped", String.valueOf(stopped));
                     return details;
                 }
 
@@ -98,7 +100,14 @@ final class ProbeServiceCompiler {
                 }
 
                 @Override
-                public void stop() { status = ServiceStatus.STOPPED; }
+                public void stop() {
+                    stopped = true;
+                    // Mirrors the real services: a decommissioned node stays DECOMMISSIONED
+                    // after stop(), because that is the state the operator asked for.
+                    if (status != ServiceStatus.DECOMMISSIONED) {
+                        status = ServiceStatus.STOPPED;
+                    }
+                }
             }
             """;
 

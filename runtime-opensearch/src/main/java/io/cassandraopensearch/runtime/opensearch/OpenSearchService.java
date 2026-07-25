@@ -32,7 +32,6 @@ import java.net.InetAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -52,10 +51,10 @@ import java.util.concurrent.atomic.AtomicReference;
  * org.opensearch.bootstrap.Bootstrap}, which is what makes co-hosting with Cassandra safe.
  * {@code Bootstrap} owns all the process-wide behaviour we must not inherit: it installs the
  * java agent and its JVM-wide policy, registers shutdown hooks, sets a default uncaught
- * exception handler that calls {@link System#exit}, loads JNA natives, and runs
- * {@code LogConfigurator}, which hijacks {@code java.util.logging} for the whole JVM and would
- * drag Cassandra's logging into OpenSearch's log4j2 configuration. None of it fires when the
- * node is constructed by hand.
+ * exception handler that calls {@link System#exit}, memory-locks and initialises JNA natives,
+ * and runs {@code LogConfigurator}, which hijacks {@code java.util.logging} for the whole JVM
+ * and redirects {@code System.out} and {@code System.err} into log4j2 — swallowing Cassandra's
+ * console output along the way. None of it fires when the node is constructed by hand.
  *
  * <p>For the same reason no {@code io.netty.*} system property is set here even though
  * OpenSearch's own launcher sets several: those are read by Cassandra's Netty out of the same
@@ -243,9 +242,9 @@ public final class OpenSearchService implements EmbeddedService {
     @Override
     public void stop() throws Exception {
         Node stopping = node;
-        // Drop every reference first: after this returns the supervisor discards the isolated
-        // ClassLoader, and anything still reachable from here pins it and leaks a whole server
-        // worth of classes and static state.
+        // Drop every reference first, and make the second call a no-op while doing it: a stale
+        // Node kept alive by this object would hold its thread pools, page caches and mapped
+        // files long after the supervisor believes the service is gone.
         node = null;
         client = null;
         clusterService = null;
