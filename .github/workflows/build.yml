@@ -1,0 +1,46 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          # Not 17, and not 25. OpenSearch 3.x jars are Java 21 bytecode, so a 17 JVM cannot
+          # load them at all; the Cassandra fork does not support 25. maven-enforcer-plugin
+          # fails the build on anything but 21. See docs/JDK.md.
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      # The Cassandra half of this project depends on com.datastax.dse:dse-db-all, which is not
+      # published to Maven Central — see the README. CI therefore builds every module that does
+      # not need it, which is most of them: the SPI, the ClassLoader isolation, the supervisor,
+      # the CLI, and the whole OpenSearch runtime including the tests that start a real node.
+      #
+      # Not covered here, and covered only by a local `mvn verify`: runtime-cassandra,
+      # dist (the tarball and Docker image) and the integration tests. That gap is real and is
+      # recorded in docs/REMAINING-WORK.md rather than papered over with a green badge.
+      - name: Build and test the modules that do not need the Cassandra fork
+        run: >
+          mvn -B -ntp
+          -pl spi,bootstrap,runtime-opensearch,server,cli,examples
+          install
+
+      - name: Publish test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: '**/target/surefire-reports/*.xml'
+          if-no-files-found: ignore

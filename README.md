@@ -167,6 +167,23 @@ Shutdown reverses it — OpenSearch first, then Cassandra — then the JVM exits
 - Maven 3.9+
 - Linux or macOS (multi-node on one machine needs loopback aliases; see below)
 
+> ### ⚠️ You probably cannot build this as-is
+>
+> The Cassandra half depends on **`com.datastax.dse:dse-db-all:5.0.7.0-SNAPSHOT`**, which is not
+> published to Maven Central. It is built from a private fork and installed into the local
+> repository (see [Build](#build)). Without it, `runtime-cassandra`, `dist` and the integration
+> tests will not resolve.
+>
+> Everything else does build from public artifacts: the SPI, the ClassLoader isolation, the
+> supervisor, the CLI, and the entire OpenSearch runtime including tests that start a real node.
+> That is what CI covers — see [`.github/workflows/build.yml`](.github/workflows/build.yml).
+>
+> Substituting `org.apache.cassandra:cassandra-all` for the fork is untried. The two spike
+> documents record several places where this code depends on **fork-specific** behaviour —
+> `org.apache.cassandra.nodes.Nodes`, which does not exist upstream, and a `StorageService`
+> that completes a decommission and then throws — so expect that swap to be work, not a
+> one-line change.
+
 ### Why JDK 21 and not 17
 
 OpenSearch 3.x jars are compiled to **Java 21 bytecode**, verified directly rather than taken from

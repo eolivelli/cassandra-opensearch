@@ -1,3 +1,12 @@
 target/
 *.iml
 .idea/
+.vscode/
+*.log
+.DS_Store
+
+# A cluster created by examples/local-cluster/create-cluster.sh with the default -d.
+/cluster/
+
+# The README's quick start unpacks the tarball into the repository root.
+/cassandra-opensearch-*/
