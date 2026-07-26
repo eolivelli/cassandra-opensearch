@@ -29,6 +29,7 @@ import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * What the supervisor does when Cassandra leaves the ring without being asked.
@@ -281,6 +282,157 @@ class ExternalDecommissionTest {
 
         excluding.countDown();
         opensearch.prepareGate = null;
+    }
+
+    /** A relocation limit short enough that the catch-up exclusion's outer bound can expire. */
+    private static final String IMPATIENT = WATCHING.replace(
+            "shard_relocation_timeout: 30s", "shard_relocation_timeout: 100ms");
+
+    /**
+     * Provokes the one abandonment that happens while the supervisor stays {@code RUNNING}: the
+     * catch-up exclusion overrunning the bound round-3 put on it.
+     *
+     * @return the gate the exclusion is still parked on, for the caller to open
+     */
+    private CountDownLatch abandonOpenSearchInsideACatchUpExclusion(Supervisor supervisor)
+            throws Exception {
+        supervisor.externalExclusionGrace(Duration.ofMillis(100));
+        supervisor.start();
+        CountDownLatch excluding = new CountDownLatch(1);
+        opensearch.prepareGate = excluding;
+        // Ignores the interrupt TimeLimited sends when it gives up: the deadline expiring ends the
+        // supervisor's willingness to wait, not the call.
+        opensearch.prepareIgnoresInterrupts = true;
+
+        reportLeaving();
+        awaitCall("opensearch.prepareDecommission");
+        // 100ms + 100ms of grace from the moment the call was made, which was before the line
+        // above returned.
+        Thread.sleep(1000);
+        return excluding;
+    }
+
+    /**
+     * R4-3. Round 3's bound on the catch-up exclusion made {@code abandon()} reachable for the
+     * first time while the supervisor is {@code RUNNING} — every round-1 caller was on a path that
+     * unwound immediately — and nothing but the shutdown walk had ever read the record.
+     *
+     * <p>So the supported {@code bin/cassandra-opensearch decommission} ran every phase against a
+     * service with a live call inside it and finished by calling {@code stop()} on it, taking the
+     * one {@code stop()} it will ever honour: precisely what {@code abandon()}'s own javadoc says
+     * must never happen to such a service.
+     */
+    @Test
+    void aDecommissionIsRefusedWhileACallIsStillRunningInsideAService() throws Exception {
+        Supervisor supervisor = supervisor(IMPATIENT);
+        CountDownLatch excluding = abandonOpenSearchInsideACatchUpExclusion(supervisor);
+
+        assertThatThrownBy(() -> supervisor.decommission(Duration.ofSeconds(5), false))
+                .isInstanceOf(DecommissionException.class)
+                .hasMessageContaining("opensearch")
+                .as("the reason is carried per service, not assumed to be a start() that overran")
+                .hasMessageContaining("a catch-up shard-allocation exclusion is still running")
+                .hasMessageContaining("stop()");
+
+        assertThat(calls)
+                .as("no phase of it may have run, and above all not the stop() at the end")
+                .containsExactly("cassandra.start", "opensearch.start",
+                        "opensearch.prepareDecommission");
+        assertThat(supervisor.state())
+                .as("a refused decommission leaves the node exactly as it was")
+                .isEqualTo(SupervisorState.RUNNING);
+
+        excluding.countDown();
+        opensearch.prepareGate = null;
+    }
+
+    /**
+     * The remaining route to the same place, closed at the other end.
+     *
+     * <p>{@code excludeAfterExternalDecommission} refuses to start while a decommission is in
+     * flight; nothing refused the reverse. So a decommission could begin alongside a catch-up
+     * exclusion — two threads driving one OpenSearch node — and then the exclusion's bound could
+     * expire and abandon OpenSearch <i>underneath</i> a coordinator that had already read the
+     * record and would never read it again.
+     */
+    @Test
+    void aDecommissionIsRefusedWhileACatchUpExclusionIsStillInFlight() throws Exception {
+        Supervisor supervisor = supervisor(WATCHING);
+        supervisor.start();
+        // Held open, and well inside the exclusion's bound: nothing is abandoned here, the call is
+        // simply still in progress.
+        CountDownLatch excluding = new CountDownLatch(1);
+        opensearch.prepareGate = excluding;
+
+        reportLeaving();
+        awaitCall("opensearch.prepareDecommission");
+
+        assertThatThrownBy(() -> supervisor.decommission(Duration.ofSeconds(5), false))
+                .isInstanceOf(DecommissionException.class)
+                .hasMessageContaining("catch-up shard-allocation exclusion is already in flight");
+
+        assertThat(calls).containsExactly("cassandra.start", "opensearch.start",
+                "opensearch.prepareDecommission");
+        assertThat(supervisor.state()).isEqualTo(SupervisorState.RUNNING);
+
+        excluding.countDown();
+        opensearch.prepareGate = null;
+    }
+
+    /**
+     * The other half of the same defect: this is a path the process is expected to survive, so it
+     * must not poison the exit code on its way through.
+     *
+     * <p>{@code abandon()} escalated unconditionally, so a best-effort catch-up that lost its race
+     * left a node serving indefinitely with {@code exitCode} 1 and a failure message set — and its
+     * eventual, entirely clean shutdown reporting {@code FAILED}. Compare {@code
+     * aFailedExclusionLeavesBothServicesAlone}: an exclusion that fails outright already leaves the
+     * node alone, and one that overruns is the same class of event.
+     */
+    @Test
+    void anOverrunningCatchUpExclusionDoesNotCondemnANodeThatGoesOnServing() throws Exception {
+        Supervisor supervisor = supervisor(IMPATIENT);
+        CountDownLatch excluding = abandonOpenSearchInsideACatchUpExclusion(supervisor);
+
+        assertThat(supervisor.state()).isEqualTo(SupervisorState.RUNNING);
+        assertThat(supervisor.failureMessage())
+                .as("the node is still serving both clusters; nothing has failed yet")
+                .isNull();
+
+        // And when the exclusion finally does return, the record goes with it: the thread it was
+        // about has left the service, so nothing is being raced any more.
+        excluding.countDown();
+        opensearch.prepareGate = null;
+        awaitExclusionToLeaveOpenSearch();
+
+        supervisor.stop();
+
+        assertThat(calls)
+                .as("a service nothing is inside any more is a service the shutdown stops")
+                .containsExactly("cassandra.start", "opensearch.start",
+                        "opensearch.prepareDecommission",
+                        "opensearch.stop", "opensearch.close",
+                        "cassandra.stop", "cassandra.close");
+        assertThat(supervisor.state()).isEqualTo(SupervisorState.STOPPED);
+        assertThat(supervisor.awaitShutdown()).isZero();
+    }
+
+    /**
+     * The exclusion is the only thread that knows it has left OpenSearch, and it says so by
+     * letting {@code prepareDecommission} return. There is no call to wait on, so this waits for
+     * the service to be quiet again.
+     */
+    private void awaitExclusionToLeaveOpenSearch() throws InterruptedException {
+        // prepareDecommission sets the status as its last act before returning.
+        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+        while (opensearch.status() != ServiceStatus.DECOMMISSIONING) {
+            if (System.nanoTime() - deadline > 0) {
+                throw new AssertionError("the catch-up exclusion never left OpenSearch");
+            }
+            Thread.sleep(20);
+        }
+        // The supervisor's own bookkeeping runs immediately after; give it the same instant.
+        Thread.sleep(200);
     }
 
     /**

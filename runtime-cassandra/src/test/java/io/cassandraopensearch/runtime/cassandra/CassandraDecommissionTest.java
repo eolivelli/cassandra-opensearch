@@ -17,6 +17,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 
 import javax.management.MBeanServer;
@@ -31,6 +32,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowable;
 
 /**
  * What the service reports once leaving the ring has gone one way or the other. Every test here
@@ -92,19 +94,25 @@ class CassandraDecommissionTest {
     }
 
     /**
-     * The sibling of the test above, on the mode the fork leaves behind when the same sequence
-     * fails a little earlier: {@code DECOMMISSION_FAILED}.
+     * The operation mode does not say whether the node left, and this is the test that holds the
+     * two halves of that against each other: one node, one mode string —
+     * {@code DECOMMISSION_FAILED} — and opposite conclusions, because ring membership differs.
      *
-     * <p>{@code StorageService.decommission()} sets that mode from three catch blocks, all of them
-     * below {@code unbootstrap()} and one of them the bare {@code InterruptedException} exercised
-     * here. Every one of them describes a node that has stopped being a useful ring member — this
-     * one has already announced LEAVING to the cluster and abandoned the procedure half way — so
-     * reporting RUNNING is the same lie about the same code path that the DECOMMISSIONED branch was
-     * written to stop telling. FAILED is what says the node needs looking at, and it is what
-     * survives {@code stop()} to reach the operator after the supervisor's final teardown.
+     * <p>The fork sets that mode from catch blocks that wrap the <i>whole</i> body of
+     * {@code StorageService.decommission()}, and the body begins long before {@code unbootstrap()}
+     * calls {@code leaveRing()}. The interrupt below lands in the {@code RING_DELAY} sleep between
+     * {@code startLeaving()} and {@code unbootstrap()}: nothing has streamed, no range has moved,
+     * and the node is still in {@code TokenMetadata} serving every one of them. Calling that FAILED
+     * costs the operator the process — the supervisor's health monitor turns FAILED into
+     * {@code onFatalError} and exits 1 — and blocks the retry the fork explicitly re-admits from
+     * this very mode.
+     *
+     * <p>The second half fakes what {@code leaveRing()} does to the token metadata and asks again.
+     * Same mode, and now the node really has left, so DECOMMISSIONED is the answer: reporting
+     * RUNNING there would tell the operator this node is still serving a ring it is out of.
      */
     @Test
-    void aDecommissionThatFailedAfterAnnouncingItselfIsNotReportedAsRunning(@TempDir Path home)
+    void whatAFailedDecommissionReportsFollowsRingMembershipNotTheModeString(@TempDir Path home)
             throws Exception {
         node = TestNode.started(home);
         Cassandra cassandra = new Cassandra(node.isolatedLoader());
@@ -128,20 +136,96 @@ class CassandraDecommissionTest {
         decommissioning.join(Duration.ofMinutes(2).toMillis());
         assertThat(decommissioning.isAlive()).isFalse();
 
-        assertThat(thrown.get()).isInstanceOf(ServiceException.class);
         assertThat(node.details())
                 .as("the fork records the abandoned attempt in the operation mode")
-                .containsEntry("operationMode", "DECOMMISSION_FAILED");
+                .containsEntry("operationMode", "DECOMMISSION_FAILED")
+                .as("and it never got as far as leaveRing(), so the ranges are all still here")
+                .containsEntry("joined", "true");
         assertThat(node.service().status())
-                .as("the node announced LEAVING and then stopped; it is not RUNNING")
-                .isEqualTo(ServiceStatus.FAILED);
+                .as("the node holds every range it held before and is still serving them;"
+                        + " FAILED here is what the health monitor turns into an exit(1)")
+                .isEqualTo(ServiceStatus.RUNNING);
+        assertThat(thrown.get())
+                .isInstanceOf(ServiceException.class)
+                .hasMessageContaining("still a member of the ring");
+
+        // Now the other half: the same mode, on a node that really has left the ring.
+        cassandra.pretendThisNodeHasLeftTheRing();
+
+        assertThatThrownBy(() -> node.service().decommission(
+                new TestDecommissionContext(Duration.ofMinutes(5), false)))
+                .isInstanceOf(ServiceException.class)
+                .hasMessageContaining("already left the ring");
+
+        assertThat(node.details())
+                .as("unchanged; it is the ring membership below that decides, not this")
+                .containsEntry("operationMode", "DECOMMISSION_FAILED")
+                .containsEntry("joined", "false");
+        assertThat(node.service().status())
+                .as("out of the ring: RUNNING would say it is still serving one it has left")
+                .isEqualTo(ServiceStatus.DECOMMISSIONED);
 
         node.service().stop();
 
         assertThat(node.service().status())
-                .as("FAILED is the post-mortem and stop() must not erase it")
-                .isEqualTo(ServiceStatus.FAILED);
-        assertThat(node.details()).containsEntry("status", "FAILED");
+                .as("a node that left is not one that merely stopped; stop() must not erase it")
+                .isEqualTo(ServiceStatus.DECOMMISSIONED);
+        assertThat(node.details()).containsEntry("status", "DECOMMISSIONED");
+    }
+
+    /**
+     * The refusal an operator meets on an ordinary cluster, and the one the round-3 mapping turned
+     * into a process kill.
+     *
+     * <p>{@code system_distributed} is RF 3 by default, so on a ring of fewer than four nodes
+     * {@code StorageService.decommission(force=false)} throws {@code UnsupportedOperationException}
+     * — "Not enough live nodes to maintain replication factor … Perform a forceful decommission to
+     * ignore" — from inside the try that sets {@code DECOMMISSION_FAILED}, having done nothing at
+     * all. {@code examples/local-cluster/cluster-control.sh} documents this as the normal state of
+     * a two- or three-node cluster and passes {@code --force} for it.
+     *
+     * <p>So the node must still be RUNNING: it never left, the supervisor puts its own state back
+     * to RUNNING so the operator can retry, and a service reporting FAILED at that point takes the
+     * whole process down through the health monitor. The retry has to be admitted too — the fork
+     * re-admits a decommission whose mode is {@code DECOMMISSION_FAILED}, and
+     * {@code requireRunning} would refuse it for any other status.
+     */
+    @Test
+    void aDecommissionRefusedOverTheReplicationFactorLeavesTheNodeRunningAndRetryable(
+            @TempDir Path home) throws Exception {
+        node = TestNode.started(home);
+        Cassandra cassandra = new Cassandra(node.isolatedLoader());
+        // Two endpoints, which is what gets past both this service's sole-member guard and the
+        // fork's, and is still below the RF of system_distributed.
+        cassandra.pretendAnotherNodeIsInTheRing("127.0.0.9");
+
+        Throwable refusal = catchThrowable(() -> node.service().decommission(
+                new TestDecommissionContext(Duration.ofMinutes(5), false)));
+
+        assertThat(node.details())
+                .containsEntry("operationMode", "DECOMMISSION_FAILED")
+                .as("the refusal is evaluated before anything moves")
+                .containsEntry("joined", "true");
+        assertThat(node.service().status())
+                .as("a refused decommission is not a broken node")
+                .isEqualTo(ServiceStatus.RUNNING);
+        assertThat(refusal)
+                .isInstanceOf(ServiceException.class)
+                .hasMessageContaining("still a member of the ring")
+                .hasStackTraceContaining("Not enough live nodes to maintain replication factor");
+
+        // And the retry the fork allows reaches Cassandra rather than being refused here.
+        assertThatThrownBy(() -> node.service().decommission(
+                new TestDecommissionContext(Duration.ofMinutes(5), false)))
+                .isInstanceOf(ServiceException.class)
+                .hasMessageNotContaining("requires a running node")
+                .hasStackTraceContaining("Not enough live nodes to maintain replication factor");
+
+        node.service().stop();
+
+        assertThat(node.service().status())
+                .as("nothing failed and nothing left; this node was stopped")
+                .isEqualTo(ServiceStatus.STOPPED);
     }
 
     /**
@@ -374,6 +458,45 @@ class CassandraDecommissionTest {
             tokenMetadata.getClass().getMethod("addLeavingEndpoint", endpointType)
                     .invoke(tokenMetadata, localEndpoint);
             setMode("LEAVING");
+        }
+
+        /**
+         * Puts a second endpoint in the token metadata, with a token, exactly as gossip would on
+         * a node that has a peer.
+         *
+         * <p>Two endpoints is the smallest ring in which a decommission is neither refused as
+         * pointless — by {@code rejectSoleRingMember} here or by the fork's own equivalent — nor
+         * allowed unforced, since {@code system_distributed} is RF 3. That is the shape of every
+         * two- and three-node cluster, which is what makes the refusal it produces routine.
+         */
+        void pretendAnotherNodeIsInTheRing(String address) throws Exception {
+            Class<?> endpointType = load("org.apache.cassandra.locator.InetAddressAndPort");
+            Object peer = endpointType.getMethod("getByName", String.class).invoke(null, address);
+            Object tokenMetadata = storageServiceType.getMethod("getTokenMetadata").invoke(storageService);
+            Object partitioner = tokenMetadata.getClass().getField("partitioner").get(tokenMetadata);
+            Object token = partitioner.getClass().getMethod("getRandomToken").invoke(partitioner);
+            Class<?> tokenType = load("org.apache.cassandra.dht.Token");
+            tokenMetadata.getClass().getMethod("updateNormalToken", tokenType, endpointType)
+                    .invoke(tokenMetadata, token, peer);
+            // Both halves, because they are different maps and both are read here: the tokens
+            // decide who owns what, and getAllEndpoints() — which is what every "how many nodes
+            // are there" check in the decommission path calls — reads the host id map.
+            tokenMetadata.getClass().getMethod("updateHostId", UUID.class, endpointType)
+                    .invoke(tokenMetadata, UUID.randomUUID(), peer);
+        }
+
+        /**
+         * What {@code leaveRing()} does to the token metadata, and only that: take this endpoint
+         * out of it. The mode is deliberately left alone — the point of the test that calls this
+         * is that the mode string is the same on both sides of the departure.
+         */
+        void pretendThisNodeHasLeftTheRing() throws Exception {
+            Class<?> fbUtilities = load("org.apache.cassandra.utils.FBUtilities");
+            Object localEndpoint = fbUtilities.getMethod("getBroadcastAddressAndPort").invoke(null);
+            Class<?> endpointType = load("org.apache.cassandra.locator.InetAddressAndPort");
+            Object tokenMetadata = storageServiceType.getMethod("getTokenMetadata").invoke(storageService);
+            tokenMetadata.getClass().getMethod("removeEndpoint", endpointType)
+                    .invoke(tokenMetadata, localEndpoint);
         }
 
         /** {@code setMode} is private; it assigns a field and logs, and has no other effect. */

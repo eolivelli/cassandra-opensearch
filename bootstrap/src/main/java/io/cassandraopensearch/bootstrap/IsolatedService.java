@@ -77,7 +77,8 @@ public final class IsolatedService implements EmbeddedService, AutoCloseable {
     private volatile ServiceStatus lastObservedStatus = ServiceStatus.NEW;
 
     /**
-     * How many {@link #status()} calls in a row have failed, reset by the first that succeeds.
+     * How many {@link #status()} calls in a row have failed to produce a status — by throwing, or
+     * by returning null — reset by the first that produces one.
      *
      * <p>The stale-status fallback above is deliberate — reporting {@code FAILED} because a status
      * could not be read would take the whole JVM down — but on its own it leaves an operator with
@@ -170,21 +171,35 @@ public final class IsolatedService implements EmbeddedService, AutoCloseable {
      * state, removes the shutdown hook or counts the process down, and the JVM hangs on exit.
      * Hence {@link Throwable}.
      *
+     * <p>A {@code null} from the delegate is one of the ways the question goes unanswered, not an
+     * answer: the SPI has no null status, the supervisor's own {@code recordFinalStatus} guards
+     * against one, and a delegate that has lost track of its state is exactly the case the stale
+     * fallback exists for. Counting it as a success reset {@code consecutiveStatusFailures} to zero
+     * on every call and then returned the stale value anyway — so a delegate returning null forever
+     * reported {@code RUNNING} to JMX and to the CLI with nothing anywhere saying it was stale,
+     * which is the one thing {@code status_stale} was added to make impossible.
+     *
      * @return the delegate's status, or the last one it managed to report. Never
      *         {@link ServiceStatus#FAILED} merely because the status could not be determined:
      *         {@code FAILED} means "this service has failed", the supervisor shuts the process
      *         down on it, and "we could not ask" is not that. {@link #details()} says which of the
-     *         two this was.
+     *         two this was. Never null.
      */
     @Override
     public ServiceStatus status() {
         try {
             ServiceStatus current = callWithContextLoader(loader, delegate::status);
-            if (current != null) {
-                lastObservedStatus = current;
+            if (current == null) {
+                ServiceStatus last = lastObservedStatus;
+                int failures = consecutiveStatusFailures.incrementAndGet();
+                LOG.error("Service '{}' reported a null status ({} consecutive failures to read"
+                        + " one); reporting the last observed status {} instead",
+                        serviceName, failures, last);
+                return last;
             }
+            lastObservedStatus = current;
             consecutiveStatusFailures.set(0);
-            return lastObservedStatus;
+            return current;
         } catch (Throwable t) {
             restoreInterruptIfInterrupted(t);
             ServiceStatus last = lastObservedStatus;

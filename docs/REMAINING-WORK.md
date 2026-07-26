@@ -52,10 +52,35 @@ read that as the connection loss a *completed* decommission produces.
 Notably, no unit test could have caught it — the defect only appears on a call that outlives the
 bound — and the unit test covering that code had pinned the *buggy* behaviour.
 
+**Round 4 reviewed the round-3 fixes and again found defects on both counts** — 6 MAJOR. Three
+shared one root cause: `TimeLimited` had two ways of returning while the call was still running
+inside a service (timeout and interrupt), and round 3 hardened only the first. The others:
+
+- A **regression that shut down healthy nodes.** Round 3 mapped Cassandra's
+  `DECOMMISSION_FAILED` to `FAILED` on the premise that the mode is only set after the node has
+  left the ring. It is not: the fork's `catch` wraps the *whole* decommission, including the
+  routine "Not enough live nodes to maintain replication factor" refusal that any 2–3 node
+  cluster hits. A refused decommission therefore reported `FAILED`, the health monitor turned
+  that into `onFatalError`, and a node that had touched nothing was shut down. It also blocked a
+  retry the fork explicitly allows. Status is now derived from ring membership, not a mode string.
+- **`destroy` deleted a live node's directory** — reproduced, exit 0, no warning. The launcher
+  returns 3 for "nothing answers on JMX", which includes a node still starting; round 3 read 3 as
+  "was not running".
+- `shutdown()`'s `try/finally` guaranteed the latch against *throws* but not against *blocks*:
+  `recordFinalStatus()` called `status()` unbounded, and a wedged runtime's `status()` never
+  returns.
+
+Round 4's fixes were verified the same way, against a scratch tree with the sources reverted.
+
 The lesson worth carrying: **a fix is not done when it compiles and its test passes.** Three
 round-1 fixes had passing tests while the defect they targeted was still live; a round-3 fix had a
 passing test that asserted the bug. What caught them was reviewing each fix as if it were new code,
 reproducing the original failure against it, and running the whole suite rather than the module's.
+
+A second lesson, from the `DECOMMISSION_FAILED` regression: **a finding is not a fix.** That one
+entered as a correct round-2 observation, was relayed into round 3's brief without its premise
+being checked against the fork's source, and became a worse bug than the one it replaced. Round 4
+was told explicitly to verify rather than trust the brief, and did.
 
 The fix round also turned up four defects nobody had reported, found because a new test failed for
 an unexpected reason. Two are worth naming:
@@ -76,13 +101,18 @@ trace — the code a script reads as "the node is broken" rather than "you typed
 
 ## P1 — do these before anyone relies on the thing
 
-### 1. The round-3 fixes have not themselves been reviewed
-Rounds 1 and 2 both found that fixes introduce defects — round 2 caught a *new* deadlock created by
-a round-1 fix. Round 3 changed the same concurrency code again: abandonment on the stop path, a
-registered-and-awaited external catch-up thread, per-path cycle tracking in `flatten`. By the
-evidence of the previous two rounds, some of that is wrong.
+### 1. The round-4 fixes have not themselves been reviewed
+Four rounds have run. **Every one found defects in the round before it**, including two regressions
+against previously-working behaviour and one fix whose commit message claimed a success the code
+did not deliver. Round 4 changed the same concurrency code again — `TimeLimited` no longer obeys an
+interrupt at all, abandonment became reversible and stopped escalating on the survivable path,
+`recordFinalStatus` became bounded — and rewrote how Cassandra derives status from ring membership.
 
-Two residuals the round-3 agents named rather than papered over:
+On the evidence of rounds 1–4, assume some of that is wrong. The rate is falling (26 → 9 → 6) but
+it has not reached zero, and the two most expensive findings in the whole exercise were both in
+*fixes*, not in the original code.
+
+Residuals the fix agents named rather than papered over:
 
 - **An interrupt carried inside a wrapper whose type is only loadable inside the isolated loader is
   still lost.** `ServiceException.flatten` rebuilds the chain as `RuntimeException`s before
@@ -91,6 +121,11 @@ Two residuals the round-3 agents named rather than papered over:
   Deliberately not done.
 - **`shutdown()`'s outer `catch (Throwable)` has no injectable path left** now that every call
   inside it is individually guarded, so it is a safety net that is not directly tested.
+- **A `FederatedMBeanServer.federate` failure cannot be injected** without a test seam judged worse
+  than the defect, so the constructor's release-on-failure path is reasoned, not tested.
+- Three test seams now exist on `Supervisor` purely to make failures reachable (`startupGrace`,
+  `decommissionCancelBudget`, `externalExclusionGrace`, `hookRemoval`). They are documented as
+  seams, but they are production fields that only tests move.
 
 ### 2. `watch_external_decommission` still loses the race it was built for
 Implemented and tested, but it is a catch-up: by the time Cassandra reports `LEAVING` the ring

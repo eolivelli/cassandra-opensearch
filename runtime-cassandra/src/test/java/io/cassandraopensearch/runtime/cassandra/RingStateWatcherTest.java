@@ -106,6 +106,32 @@ class RingStateWatcherTest {
         assertThat(ringEvents().get(0).level()).isEqualTo("INFO");
     }
 
+    /**
+     * {@code DECOMMISSION_FAILED} says a decommission ended badly. It does not say the node left.
+     *
+     * <p>The fork sets that mode from catch blocks around the whole of
+     * {@code StorageService.decommission()}, and the ordinary way to reach it is a refusal
+     * evaluated before anything moves — an unforced decommission that would drop
+     * {@code system_distributed} below RF 3, which is every cluster of fewer than four nodes. The
+     * node is then a full ring member with the mode string as the only trace, and reporting a
+     * departure would have the supervisor exclude its OpenSearch half from shard allocation and
+     * relocate every shard off a node that is not going anywhere.
+     */
+    @Test
+    void reportsAFailedDecommissionAsInformationOnly() throws Exception {
+        watching();
+
+        mode.set("DECOMMISSION_FAILED");
+
+        RingStateEvent event = awaitRingEvent();
+        assertThat(event.state()).isEqualTo("DECOMMISSION_FAILED");
+        assertThat(event.leaving())
+                .as("the mode does not say whether leaveRing() ran; CassandraService asks"
+                        + " TokenMetadata instead")
+                .isFalse();
+        assertThat(ringEvents().get(0).level()).isEqualTo("INFO");
+    }
+
     @Test
     void saysNothingWhileTheModeDoesNotMove() throws Exception {
         watching();

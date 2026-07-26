@@ -128,6 +128,14 @@ final class ProbeServiceCompiler {
 
                 @Override
                 public ServiceStatus status() {
+                    ServiceContext seen = context;
+                    String mode = seen == null ? null : seen.settings().get("probe.statusMode");
+                    if ("null".equals(mode)) {
+                        // A delegate that can no longer work its state out. There is no null in
+                        // ServiceStatus, so this is not an answer — it is another way of failing
+                        // to give one, and it does not announce itself the way a throw does.
+                        return null;
+                    }
                     failIfAsked("probe.statusMode");
                     return status;
                 }

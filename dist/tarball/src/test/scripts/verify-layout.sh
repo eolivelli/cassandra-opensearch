@@ -450,6 +450,11 @@ FAKE_JDK_SCRIPT
             fail "a foreground start never reached the JVM: $PID_OUT"
         elif ! echo "$PID_OUT" | grep -q 'cannot write'; then
             fail "a foreground start skipped the pid file without saying so: $PID_OUT"
+        elif echo "$PID_OUT" | grep -qi 'permission denied'; then
+            # `echo "$$" > "$PIDFILE" 2> /dev/null` does not suppress this: redirections are
+            # applied left to right, so the shell reports the failing open on the stderr it had at
+            # that moment, and the careful explanation lands underneath a raw shell error.
+            fail "the shell's own redirection error escaped ahead of the explanation: $PID_OUT"
         else
             pass "a foreground start warns about an unwritable pid file and starts anyway"
         fi
@@ -479,8 +484,127 @@ FAKE_JDK_SCRIPT
         else
             pass "stop clears a pid file whose process is gone, and still exits 3"
         fi
+
+        # The other half of that branch, and the dangerous one. Exit code 3 is documented as
+        # "nothing running" and is not a failure, so a caller that stops several nodes treats it
+        # as success - examples/local-cluster/cluster-control.sh prints "was not running" and its
+        # `destroy` deletes the node's directory next. A node whose JVM is alive but whose JMX
+        # connector is not up yet (a `start -d` that timed out, one interrupted, one replaying a
+        # long commit log) must therefore NOT produce 3, or its data directory is deleted out from
+        # under a running JVM that carries on writing into unlinked inodes.
+        LIVE_PID_FILE="$WORK/live.pid"
+        rm -f "$LIVE_PID_FILE"
+        sleep 120 &
+        LIVE_PID=$!
+        echo "$LIVE_PID" > "$LIVE_PID_FILE"
+
+        LIVE_RC=0
+        LIVE_OUT=$(CASSANDRA_OPENSEARCH_JMX_PORT=1 \
+            "$HOME_DIR/bin/cassandra-opensearch" stop -p "$LIVE_PID_FILE" 2>&1) || LIVE_RC=$?
+        if [ "$LIVE_RC" -eq 3 ]; then
+            fail "stop reported 3 (nothing running) for live pid $LIVE_PID: $LIVE_OUT"
+        elif [ "$LIVE_RC" -eq 0 ]; then
+            fail "stop reported success without stopping live pid $LIVE_PID: $LIVE_OUT"
+        elif [ ! -f "$LIVE_PID_FILE" ]; then
+            fail "stop removed the pid file of live pid $LIVE_PID"
+        elif ! echo "$LIVE_OUT" | grep -q "$LIVE_PID"; then
+            fail "stop did not name the live process it declined to report as stopped: $LIVE_OUT"
+        else
+            pass "stop refuses to call a live process with a silent JMX port 'not running'"
+        fi
+        kill "$LIVE_PID" 2> /dev/null || true
+        wait "$LIVE_PID" 2> /dev/null || true
+        rm -f "$LIVE_PID_FILE"
     else
         skip "stale pid file: needs a JDK 21 in JAVA_HOME to reach the CLI"
+    fi
+
+    # --- what `stop` is willing to signal -----------------------------------------------------
+    #
+    # Exit code 4 - the MBean has no stop operation - is the NORMAL path today, and it ends in
+    # `kill -TERM "$_pid"` with whatever the pid file happened to hold. `kill -TERM -1` signals
+    # every process the user owns and `kill -TERM 0` signals the caller's whole process group, so
+    # a truncated, appended-to or hand-edited pid file is a way to take down far more than one
+    # node. The check below uses a non-numeric value rather than -1 deliberately: it exercises the
+    # same guard, and a test that reproduced the real thing on a launcher that had regressed would
+    # kill the build that ran it.
+    KILL_JDK="$WORK/fake-jdk-no-stop-operation"
+    rm -rf "$KILL_JDK"
+    mkdir -p "$KILL_JDK/bin"
+    cat > "$KILL_JDK/bin/java" <<'NO_STOP_JDK'
+#!/bin/sh
+# Answers -version like a JDK 21, and exits 4 (NO_SUCH_OPERATION) for the CLI's `stop`, which is
+# what the real supervisor MBean does today.
+for arg in "$@"; do
+    case "$arg" in
+        -version) echo 'openjdk version "21.0.0" 2000-01-01' >&2; exit 0 ;;
+        stop) exit 4 ;;
+    esac
+done
+exit 0
+NO_STOP_JDK
+    chmod +x "$KILL_JDK/bin/java"
+
+    BAD_PID_FILE="$WORK/corrupt.pid"
+    printf 'not-a-pid\n' > "$BAD_PID_FILE"
+    BAD_RC=0
+    BAD_OUT=$(JAVA_HOME="$KILL_JDK" "$HOME_DIR/bin/cassandra-opensearch" \
+        stop -p "$BAD_PID_FILE" 2>&1) || BAD_RC=$?
+    if [ "$BAD_RC" -eq 0 ]; then
+        fail "stop reported success on a pid file holding 'not-a-pid': $BAD_OUT"
+    elif echo "$BAD_OUT" | grep -q 'sending SIGTERM'; then
+        fail "stop signalled 'not-a-pid' instead of rejecting it: $BAD_OUT"
+    elif ! echo "$BAD_OUT" | grep -q 'is not a pid'; then
+        fail "stop did not say the pid file holds no pid (exit $BAD_RC): $BAD_OUT"
+    else
+        pass "stop refuses to signal a pid file that does not hold a pid"
+    fi
+    rm -f "$BAD_PID_FILE"
+
+    # --- co_process_is_alive where ps has no -p ------------------------------------------------
+    #
+    # `ps -p` is an XSI option: busybox does not have it. `command -v ps` still succeeds there, so
+    # a ps that fails because it did not understand the option used to be read as "the process is
+    # gone" - inverting a function whose stated invariant is that every fallback errs towards
+    # alive, on exactly the stripped images the fallback was written for. Only visible for a
+    # process this account cannot signal, since `kill -0` answers first for anything it can.
+    if kill -0 1 2> /dev/null; then
+        skip "co_process_is_alive with a ps that has no -p: this account can signal pid 1 (root?)"
+    else
+        BUSYBOX_PS="$WORK/busybox-ps"
+        rm -rf "$BUSYBOX_PS"
+        mkdir -p "$BUSYBOX_PS"
+        cat > "$BUSYBOX_PS/ps" <<'BUSYBOX_PS_SCRIPT'
+#!/bin/sh
+# busybox ps: no -p, and it says so on stderr rather than answering about a pid.
+for arg in "$@"; do
+    case "$arg" in
+        -p) echo "ps: unrecognized option: p" >&2; exit 1 ;;
+    esac
+done
+exit 0
+BUSYBOX_PS_SCRIPT
+        chmod +x "$BUSYBOX_PS/ps"
+
+        # A subshell: the include ends in co_die if it cannot find a java, and that would take
+        # this script with it. `set +u` because the include is written for the `set -e` its
+        # callers use, and reads $JAVA_HOME without a default.
+        ALIVE_RC=0
+        ALIVE_ANSWER=$(
+            set +u
+            PATH="$BUSYBOX_PS:$PATH"
+            export PATH
+            # shellcheck disable=SC1091
+            . "$HOME_DIR/bin/cassandra-opensearch.in.sh"
+            if co_process_is_alive 1; then echo ALIVE; else echo DEAD; fi
+        ) || ALIVE_RC=$?
+        if [ "$ALIVE_RC" -ne 0 ]; then
+            skip "co_process_is_alive with a ps that has no -p: the include would not load here"
+        elif [ "$ALIVE_ANSWER" = ALIVE ]; then
+            pass "co_process_is_alive falls through a ps that does not understand -p"
+        else
+            fail "co_process_is_alive answered '$ALIVE_ANSWER' for root-owned pid 1 under a busybox ps"
+        fi
     fi
 fi
 

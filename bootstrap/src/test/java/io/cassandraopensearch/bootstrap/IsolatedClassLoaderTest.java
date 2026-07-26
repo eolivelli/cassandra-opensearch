@@ -405,6 +405,43 @@ class IsolatedClassLoaderTest {
     }
 
     /**
+     * A {@code null} from the delegate is the one way of not answering that did not count as one.
+     *
+     * <p>{@code consecutiveStatusFailures} was reset to zero on every call that did not throw, and
+     * the stale value was returned regardless — so a delegate returning null forever reported
+     * {@code RUNNING} to JMX and to {@code bin/cassandra-opensearch status} with no {@code
+     * status_stale} key anywhere, which is the single case that signal was added to make
+     * impossible. The project treats a null status as a real thing elsewhere: {@code
+     * Supervisor.recordFinalStatus} guards against one, and {@code RecordingService} has a switch
+     * for producing it.
+     */
+    @Test
+    void aNullStatusCountsAsAStatusThatCouldNotBeRead() throws Exception {
+        try (IsolatedService service = IsolatedService.create("probe", IMPL, classpath())) {
+            RecordingServiceContext context = new RecordingServiceContext();
+            service.start(context);
+            assertThat(service.status()).isEqualTo(ServiceStatus.RUNNING);
+            assertThat(service.details()).doesNotContainKey("status_stale");
+
+            context.settings().put("probe.statusMode", "null");
+            assertThat(service.status())
+                    .as("never null to the supervisor: it feeds a ConcurrentHashMap and a health"
+                            + " check that would rather have the last value actually observed")
+                    .isEqualTo(ServiceStatus.RUNNING);
+            assertThat(service.status()).isEqualTo(ServiceStatus.RUNNING);
+
+            assertThat(service.details())
+                    .as("and the operator has to be able to tell this from a healthy node")
+                    .containsEntry("status_stale", "true")
+                    .containsEntry("status_read_failures", "2");
+
+            context.settings().remove("probe.statusMode");
+            assertThat(service.status()).isEqualTo(ServiceStatus.RUNNING);
+            assertThat(service.details()).doesNotContainKey("status_stale");
+        }
+    }
+
+    /**
      * {@code details()} used to hand the supervisor the delegate's own Map instance. Its class
      * belongs to the isolated loader, so every consumer that keeps a status response keeps the
      * loader.

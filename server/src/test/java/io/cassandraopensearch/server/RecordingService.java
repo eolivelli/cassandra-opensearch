@@ -58,6 +58,13 @@ final class RecordingService implements EmbeddedService, AutoCloseable {
     /** When set, {@code prepareDecommission} blocks on it until a test opens it. */
     volatile CountDownLatch prepareGate;
     /**
+     * When true, the {@link #prepareGate} wait <b>ignores interrupts</b>, the way an OpenSearch
+     * cluster-state update does. This is what makes an exclusion that overran its deadline
+     * genuinely still inside the service when the supervisor gives up on it, rather than unwinding
+     * on the interrupt {@code TimeLimited} sends and leaving nothing to be abandoned.
+     */
+    volatile boolean prepareIgnoresInterrupts;
+    /**
      * When set, {@code awaitDecommissionReady} blocks on it. Holds a decommission open in the
      * phase it spends nearly all its time in, so a test can observe what happens meanwhile.
      */
@@ -227,7 +234,11 @@ final class RecordingService implements EmbeddedService, AutoCloseable {
         if (onEntry != null) {
             onEntry.run();
         }
-        awaitGate(prepareGate);
+        if (prepareIgnoresInterrupts) {
+            awaitUninterruptibly(prepareGate);
+        } else {
+            awaitGate(prepareGate);
+        }
         status = ServiceStatus.DECOMMISSIONING;
         if (prepareFailure != null) {
             throw prepareFailure;

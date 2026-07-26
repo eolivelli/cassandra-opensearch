@@ -79,9 +79,11 @@ final class NodeJmxServer {
         MBeanServer federated = MBeanWrapper.instance.getMBeanServer();
         NodeMBeanWrapper wrapper = NodeMBeanWrapper.current();
         if (wrapper == null) {
-            // Outside the compensation below on purpose: no NodeMBeanWrapper was constructed, so no
-            // private MBeanServer was created either — whatever MBeanWrapper.instance resolved to
-            // is using the platform server, which is not ours to release.
+            // Outside the compensation below on purpose: there is no private MBeanServer to give
+            // back. Either MBeanWrapper.instance resolved to something that is not ours — in which
+            // case it is using the platform server, which is not ours to release — or a
+            // NodeMBeanWrapper constructor failed, and that constructor releases the server it had
+            // created before it throws, precisely so that this branch can say this.
             throw new IllegalStateException(
                     "MBeanWrapper.instance resolved to " + MBeanWrapper.instance.getClass().getName()
                             + " instead of " + NodeMBeanWrapper.class.getName()

@@ -64,9 +64,24 @@ public final class NodeMBeanWrapper implements MBeanWrapper {
      */
     private volatile Object gcInspector;
 
+    /**
+     * Creates the private server and publishes this wrapper as {@link #current()}.
+     *
+     * <p>The two are not one statement apart by accident: {@code createMBeanServer} adds the server
+     * to {@code MBeanServerFactory}'s JVM-global list on the first line, and {@code current = this}
+     * — the only handle anything else ever gets — is assigned on the last. A throw in between would
+     * leave a server nobody can name and nobody can release, holding the isolated ClassLoader for
+     * the life of the process, so the window is closed here rather than described.
+     */
     public NodeMBeanWrapper() {
-        this.nodeServer = MBeanServerFactory.createMBeanServer(DEFAULT_DOMAIN);
-        this.federated = FederatedMBeanServer.federate(nodeServer);
+        MBeanServer server = MBeanServerFactory.createMBeanServer(DEFAULT_DOMAIN);
+        try {
+            this.federated = FederatedMBeanServer.federate(server);
+        } catch (Throwable t) {
+            MBeanServerFactory.releaseMBeanServer(server);
+            throw t;
+        }
+        this.nodeServer = server;
         current = this;
     }
 
@@ -139,20 +154,30 @@ public final class NodeMBeanWrapper implements MBeanWrapper {
         if (closed) {
             return;
         }
+        // Set before the work, not after: from here on Cassandra keeps registering and
+        // unregistering metrics MBeans in a server that is on its way out, and those calls have to
+        // become no-ops immediately. The release below is therefore in a finally — an idempotence
+        // flag set before the work makes the retry its own contract offers unreachable, and
+        // MBeanServerFactory holds this server, and through it the isolated ClassLoader, until
+        // somebody releases it. Nobody comes back for it: NodeJmxServer.releaseQuietly swallows
+        // what this throws, and CassandraService.stop() runs every step exactly once.
         closed = true;
-        detachGcInspector();
-        for (ObjectName name : nodeServer.queryNames(null, null)) {
-            try {
-                if (!name.getCanonicalName().contains("MBeanServerDelegate")) {
-                    nodeServer.unregisterMBean(name);
+        try {
+            detachGcInspector();
+            for (ObjectName name : nodeServer.queryNames(null, null)) {
+                try {
+                    if (!name.getCanonicalName().contains("MBeanServerDelegate")) {
+                        nodeServer.unregisterMBean(name);
+                    }
+                } catch (Exception ignored) {
+                    // A concurrent Cassandra shutdown may already have removed it.
                 }
-            } catch (Exception ignored) {
-                // A concurrent Cassandra shutdown may already have removed it.
             }
-        }
-        MBeanServerFactory.releaseMBeanServer(nodeServer);
-        if (current == this) {
-            current = null;
+        } finally {
+            MBeanServerFactory.releaseMBeanServer(nodeServer);
+            if (current == this) {
+                current = null;
+            }
         }
     }
 
@@ -178,19 +203,30 @@ public final class NodeMBeanWrapper implements MBeanWrapper {
      *       {@code GCInspector} silently stops working.</li>
      * </ul>
      *
-     * <p>Package-private and idempotent — {@code gcInspector} is cleared on the way through — so
-     * that {@link CassandraService#stop()} can run it as its <i>first</i> teardown step, before
-     * {@code drain()} shuts down the executor {@code rescheduleFailedDeletions()} submits to.
-     * {@link #close()} calls it again for the paths that never get that far.
+     * <p>Package-private and idempotent, so that {@link CassandraService#stop()} can run it as its
+     * <i>first</i> teardown step, before {@code drain()} shuts down the executor
+     * {@code rescheduleFailedDeletions()} submits to. {@link #close()} calls it again for the
+     * paths that never get that far — and that second call is the whole reason the reference is
+     * dropped only once the listener is off. Clearing it first makes the idempotence real and the
+     * retry theatre: a throw from the platform query would leave the listener attached with
+     * nothing left that knows which object to remove, which is the ClassLoader pin this module
+     * exists to prevent.
      */
     void detachGcInspector() {
+        detachGcInspectorFrom(ManagementFactory.getPlatformMBeanServer());
+    }
+
+    /**
+     * @param platform the server the garbage-collector MXBeans live in — always the platform one
+     *                 in production. A parameter so that the test can hand in a server that fails,
+     *                 which is the only way to exercise the retry described above.
+     */
+    void detachGcInspectorFrom(MBeanServer platform) {
         Object registered = gcInspector;
-        gcInspector = null;
         if (!(registered instanceof NotificationListener listener)) {
             return;
         }
         try {
-            MBeanServer platform = ManagementFactory.getPlatformMBeanServer();
             ObjectName garbageCollectors =
                     new ObjectName(ManagementFactory.GARBAGE_COLLECTOR_MXBEAN_DOMAIN_TYPE + ",*");
             for (ObjectName name : platform.queryNames(garbageCollectors, null)) {
@@ -201,6 +237,8 @@ public final class NodeMBeanWrapper implements MBeanWrapper {
                     // collector; one this inspector never subscribed to is not a problem.
                 }
             }
+            // Only now. Everything above has run, so there is nothing left to retry.
+            gcInspector = null;
             // Logged, and named, because when this runs is the whole point: it has to be before
             // drain(), and the node's own log is where that ordering is visible after the fact.
             // Resolved on demand rather than held in a static field, as CassandraService does, so
@@ -209,6 +247,7 @@ public final class NodeMBeanWrapper implements MBeanWrapper {
                     .info("{} detached from the platform garbage-collector MXBeans", GC_INSPECTOR);
         } catch (Exception ignored) {
             // Best effort, like the rest of close(): a teardown must not fail on its own cleanup.
+            // The reference is kept on this path on purpose — see the javadoc above.
         }
     }
 }

@@ -217,7 +217,7 @@ cd ~/dev/cassandra && JAVA_HOME=~/.sdkman/candidates/java/17.0.19-tem ant mvn-in
 
 cd ~/dev/cassandra-opensearch
 mvn clean install          # unit tests            (~70 s)
-mvn clean verify           # + integration tests   (~10.5 min)
+mvn clean verify           # + integration tests   (~11 min)
 mvn verify -Pdocker        # + builds the Docker image
 ```
 
@@ -455,8 +455,8 @@ seconds on an idle single node, uncomfortably close to Docker's 10-second SIGKIL
 ## Testing
 
 ```bash
-mvn test      # 229 unit tests
-mvn verify    # + 22 integration tests   (~10.5 min total)
+mvn test      # 269 unit tests
+mvn verify    # + 22 integration tests   (~11 min total)
 ```
 
 Integration tests unpack the tarball and drive it as a **real external process** — the shipped

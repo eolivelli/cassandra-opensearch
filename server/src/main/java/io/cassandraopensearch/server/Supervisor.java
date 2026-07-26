@@ -27,7 +27,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -35,6 +34,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 
 import javax.management.MBeanServer;
 import javax.management.ObjectName;
@@ -139,10 +139,16 @@ public final class Supervisor implements AutoCloseable {
     private final Map<String, ServiceStatus> lastSeenStatus = new ConcurrentHashMap<>();
 
     /**
-     * Services whose {@code start()} overran its deadline and is still running on a thread nobody
-     * can stop. The shutdown walk skips them: see {@link #stopServicesInReverseOrder}.
+     * Services with a call still running inside them on a thread nobody can stop, mapped to why.
+     *
+     * <p>The shutdown walk skips them ({@link #stopServicesInReverseOrder}) and a decommission is
+     * refused while any of the services it would drive is in here ({@link #beginDecommission}).
+     * The reason is carried rather than reconstructed because there are four ways in: an overrun
+     * {@code start()}, an overrun {@code stop()} or {@code close()}, a cancelled decommission that
+     * would not let go, and a catch-up exclusion that would not return. The log line an operator
+     * reads at the end of a shutdown used to name all four "its start() was abandoned".
      */
-    private final Set<String> abandoned = new CopyOnWriteArraySet<>();
+    private final Map<String, String> abandoned = new ConcurrentHashMap<>();
 
     private final AtomicBoolean shuttingDown = new AtomicBoolean();
     private final AtomicBoolean fatal = new AtomicBoolean();
@@ -189,6 +195,25 @@ public final class Supervisor implements AutoCloseable {
      * what happens when it expires would otherwise each take a minute.
      */
     private volatile Duration decommissionCancelBudget = DECOMMISSION_CANCEL_BUDGET;
+
+    /**
+     * {@link #EXTERNAL_EXCLUSION_GRACE}, overridable for the same reason as {@link #startupGrace}:
+     * a test that has to provoke an overrunning catch-up exclusion cannot spend thirty seconds
+     * waiting for the grace on top of the configured relocation timeout.
+     */
+    private volatile Duration externalExclusionGrace = EXTERNAL_EXCLUSION_GRACE;
+
+    /**
+     * How {@link #removeShutdownHook} hands the hook back to the JVM.
+     *
+     * <p>A field only so a test can make it fail. {@code Runtime.removeShutdownHook} throws two
+     * things: {@code IllegalStateException} when the JVM is already exiting, which is expected and
+     * caught at the call site, and {@code SecurityException} under a security manager that refuses
+     * the {@code shutdownHooks} permission, which is not catchable from a test any other way — and
+     * what has to survive it is {@link #terminated} being counted down.
+     */
+    private volatile Consumer<Thread> hookRemoval =
+            hook -> Runtime.getRuntime().removeShutdownHook(hook);
 
     public Supervisor(NodeConfiguration configuration) {
         this(configuration, ServiceFactory.isolated());
@@ -248,6 +273,16 @@ public final class Supervisor implements AutoCloseable {
         this.decommissionCancelBudget = budget;
     }
 
+    /** Test seam for {@link #EXTERNAL_EXCLUSION_GRACE}; see the field. */
+    void externalExclusionGrace(Duration grace) {
+        this.externalExclusionGrace = grace;
+    }
+
+    /** Test seam for {@link #hookRemoval}; see the field. */
+    void hookRemoval(Consumer<Thread> removal) {
+        this.hookRemoval = removal;
+    }
+
     private void startService(ServiceConfiguration service) {
         LOG.info("Starting service '{}'", service.name());
         EmbeddedService instance;
@@ -269,7 +304,7 @@ public final class Supervisor implements AutoCloseable {
             TimeLimited.run(service.name() + " startup",
                     service.startupTimeout().plus(startupGrace), () -> instance.start(context));
         } catch (TimeLimited.AbandonedException e) {
-            abandon(service.name(), "it did not finish starting: " + e.getMessage());
+            abandonDuringShutdown(service.name(), "it did not finish starting: " + e.getMessage());
             throw new SupervisorException(
                     "Service '" + service.name() + "' failed to start: " + e.getMessage(), e);
         } catch (Exception e) {
@@ -284,27 +319,34 @@ public final class Supervisor implements AutoCloseable {
     /**
      * Records that a call into a service overran its deadline and is still running.
      *
-     * <p>The unwind that follows must not touch it. {@code stop()} on such a service latches — it
-     * is a CAS in both runtimes — so an early {@code stop()} can win the latch while the abandoned
-     * call is still inside code that ignores interrupts, and the late thread then finishes,
-     * publishes {@code RUNNING} and installs its background threads on top of a supervisor that has
-     * already declared the service stopped. Those threads can never be stopped afterwards, because
-     * {@code stop()} has already been used up.
+     * <p>Nothing may touch that service afterwards. {@code stop()} on it latches — it is a CAS in
+     * both runtimes — so an early {@code stop()} can win the latch while the abandoned call is
+     * still inside code that ignores interrupts, and the late thread then finishes, publishes
+     * {@code RUNNING} and installs its background threads on top of a supervisor that has already
+     * declared the service stopped. Those threads can never be stopped afterwards, because {@code
+     * stop()} has already been used up.
      *
      * <p>Closing its ClassLoader would be worse still: the abandoned thread is executing classes
      * out of it.
      *
-     * <p>Every caller is a place where a bounded call came back without its work having finished:
-     * an overrun {@code start()}, an overrun {@code stop()} or {@code close()}, a decommission that
-     * did not unwind inside {@link #DECOMMISSION_CANCEL_BUDGET}. All of them mean the same thing to
-     * the shutdown walk — see {@link #stopServicesInReverseOrder} — and all of them mean this JVM
-     * cannot exit cleanly, so all of them force a non-zero exit code.
+     * <p>"Nothing" is wider than the shutdown walk, and used to be read as if it were not. A
+     * decommission drives every phase through the same {@code stop()} and the same loader, and
+     * {@link #beginDecommission} now refuses one over an abandoned service for exactly the reason
+     * the shutdown walk skips it.
+     *
+     * <p>This records and warns; it does not decide the exit code. Most callers are on a path that
+     * is already unwinding and pair this with {@link #escalate} through {@link
+     * #abandonDuringShutdown} — but one is not: the catch-up exclusion of {@link
+     * #excludeAfterExternalDecommission} overruns while the supervisor stays {@code RUNNING} and
+     * the process goes on serving, possibly for weeks. Poisoning the exit code there condemned a
+     * healthy node's eventual clean shutdown to report {@code FAILED}. What settles it is whether
+     * the service is still abandoned when the shutdown walk reaches it — see {@link
+     * #stopServicesInReverseOrder}.
      *
      * @param what what is still running, phrased to follow the service name in a sentence
      */
     private void abandon(String serviceName, String what) {
-        abandoned.add(serviceName);
-        escalate(1, "service '" + serviceName + "' was abandoned: " + what);
+        abandoned.put(serviceName, what);
         LOG.error("Service '{}' has been abandoned — {}."
                         + " It is still running on a thread this process cannot stop, so it will"
                         + " NOT be stopped and its ClassLoader will NOT be released during the"
@@ -313,6 +355,20 @@ public final class Supervisor implements AutoCloseable {
                         + " shut down cleanly: kill it (SIGKILL) once the other services are down,"
                         + " and expect '{}' to recover on the next start as it would from a crash.",
                 serviceName, what, serviceName);
+    }
+
+    /**
+     * {@link #abandon} on a path that is already on its way out of the process, which is every
+     * caller but one: the exit code and the failure message have to say that a service was left
+     * running, because nothing after this point is going to get another chance to say it.
+     */
+    private void abandonDuringShutdown(String serviceName, String what) {
+        abandon(serviceName, what);
+        escalate(1, abandonmentFailureMessage(serviceName, what));
+    }
+
+    private static String abandonmentFailureMessage(String serviceName, String what) {
+        return "service '" + serviceName + "' was abandoned: " + what;
     }
 
     /**
@@ -443,8 +499,22 @@ public final class Supervisor implements AutoCloseable {
                     + " whatever is left has to recover on the next start as it would from a"
                     + " crash.", t);
         } finally {
-            removeShutdownHook();
+            // The latch first, and the removal inside a catch of its own. The two lines are not
+            // equally important and used to be written as if they were: the hook staying
+            // registered costs a second, harmless run of an idempotent shutdown, while the latch
+            // staying closed is a process that never exits and cannot be made to — main blocks
+            // forever, every other caller of stop() blocks with it, and the CAS above is already
+            // true so nobody can retry. removeShutdownHook() swallows the IllegalStateException
+            // the JVM throws when it is already exiting, but a SecurityException from a security
+            // manager that refuses the "shutdownHooks" permission escaped it and took the
+            // countDown() with it.
             terminated.countDown();
+            try {
+                removeShutdownHook();
+            } catch (Throwable t) {
+                LOG.warn("Could not remove the shutdown hook; it will run again on JVM exit,"
+                        + " where it has nothing left to do", t);
+            }
             LOG.info("Shutdown complete; exit code {}", exitCode.get());
         }
     }
@@ -525,8 +595,8 @@ public final class Supervisor implements AutoCloseable {
                         + " cleanly stopped.",
                 TimeLimited.format(budget), inFlight.serviceNames());
         for (String serviceName : inFlight.serviceNames()) {
-            abandon(serviceName, "a decommission was still driving it " + TimeLimited.format(budget)
-                    + " after being cancelled");
+            abandonDuringShutdown(serviceName, "a decommission was still driving it "
+                    + TimeLimited.format(budget) + " after being cancelled");
         }
     }
 
@@ -544,8 +614,8 @@ public final class Supervisor implements AutoCloseable {
             LOG.info("The catch-up exclusion has returned; continuing with the shutdown");
             return;
         }
-        abandon("opensearch", "a catch-up shard-allocation exclusion was still inside it "
-                + TimeLimited.format(budget) + " after being cancelled");
+        abandonDuringShutdown("opensearch", "a catch-up shard-allocation exclusion was still inside"
+                + " it " + TimeLimited.format(budget) + " after being cancelled");
     }
 
     /**
@@ -595,15 +665,21 @@ public final class Supervisor implements AutoCloseable {
     }
 
     /**
-     * The longest a shutdown can legitimately take: every service's own limit, twice over for the
-     * {@code stop()} and the {@code close()} it gets, plus the cancellations that may precede them
-     * — a coordinated decommission and a catch-up exclusion can both be in flight, and each is
-     * waited for in turn — and a little slack for the bookkeeping around all of it.
+     * The longest a shutdown can legitimately take: every service's own limit, three times over
+     * for the {@code stop()}, the {@code close()} and the final {@code status()} it gets, plus the
+     * cancellations that may precede them — a coordinated decommission and a catch-up exclusion can
+     * both be in flight, and each is waited for in turn — and a little slack for the bookkeeping
+     * around all of it.
+     *
+     * <p>The multiplier is the count of bounded calls per service, and it has to stay that. This
+     * number is what {@link #awaitShutdownInFlight} promises a losing caller — the JVM's own
+     * shutdown hook, usually — and a budget that undercounts the work is a hook that gives up on a
+     * shutdown that was still making progress.
      */
     private Duration shutdownBudget() {
         Duration total = decommissionCancelBudget.multipliedBy(2).plus(SHUTDOWN_BUDGET_SLACK);
         for (ServiceConfiguration service : configuration.services().values()) {
-            total = total.plus(service.shutdownTimeout().multipliedBy(2));
+            total = total.plus(service.shutdownTimeout().multipliedBy(3));
         }
         return total;
     }
@@ -625,16 +701,29 @@ public final class Supervisor implements AutoCloseable {
         }
     }
 
+    /**
+     * Stops the services, latest first, skipping the abandoned ones.
+     *
+     * <p>A skip is also where an abandonment becomes the process's problem. Being abandoned while
+     * the supervisor is {@code RUNNING} is survivable — the catch-up exclusion overruns, the call
+     * later returns, {@link #excludeAfterExternalDecommission} takes the record back off — and a
+     * node that survives it must not carry a poisoned exit code around for the rest of its life.
+     * Reaching this line is the moment that stops being true: the service is still abandoned, so
+     * it is going to be left running with its threads, sockets and mapped files, and this JVM
+     * cannot exit cleanly.
+     */
     private void stopServicesInReverseOrder() {
         List<Map.Entry<String, EmbeddedService>> entries =
                 new ArrayList<>(startedServices().entrySet());
         Collections.reverse(entries);
         for (Map.Entry<String, EmbeddedService> entry : entries) {
-            if (abandoned.contains(entry.getKey())) {
-                LOG.error("Not stopping service '{}': its start() was abandoned and is still"
-                                + " running. Stopping it now would race that thread for the one"
-                                + " stop() it gets. This JVM will not exit on its own; kill it.",
-                        entry.getKey());
+            String reason = abandoned.get(entry.getKey());
+            if (reason != null) {
+                escalate(1, abandonmentFailureMessage(entry.getKey(), reason));
+                LOG.error("Not stopping service '{}': {}, and the call is still running."
+                                + " Stopping it now would race that thread for the one stop() it"
+                                + " gets. This JVM will not exit on its own; kill it.",
+                        entry.getKey(), reason);
                 continue;
             }
             stopService(entry.getKey(), entry.getValue());
@@ -670,7 +759,7 @@ public final class Supervisor implements AutoCloseable {
         try {
             TimeLimited.run("stop " + name, timeout, service::stop);
         } catch (TimeLimited.AbandonedException e) {
-            abandon(name, "its stop() is still running: " + e.getMessage());
+            abandonDuringShutdown(name, "its stop() is still running: " + e.getMessage());
             return;
         } catch (Throwable t) {
             LOG.warn("Service '{}' did not stop cleanly; continuing with the shutdown", name, t);
@@ -681,13 +770,13 @@ public final class Supervisor implements AutoCloseable {
             try {
                 TimeLimited.run("close " + name, timeout, closeable::close);
             } catch (TimeLimited.AbandonedException e) {
-                abandon(name, "its close() is still running: " + e.getMessage());
+                abandonDuringShutdown(name, "its close() is still running: " + e.getMessage());
                 return;
             } catch (Throwable t) {
                 LOG.warn("Could not release the ClassLoader for service '{}'", name, t);
             }
         }
-        recordFinalStatus(name, service);
+        recordFinalStatus(name, service, timeout);
     }
 
     /**
@@ -699,10 +788,19 @@ public final class Supervisor implements AutoCloseable {
      * class's: an unguarded call here delegates the whole shutdown's ability to finish to a
      * service implementation, and a {@code null} return alone was enough to abort it with an NPE
      * out of {@code ConcurrentHashMap.put}.
+     *
+     * <p>Bounded for the same reason, and it is the {@code try/catch} that cannot supply it:
+     * {@code status()} on a wedged runtime does not return and is not interruptible — {@link
+     * #checkHealth} says so in as many words — and a call that never returns is not something a
+     * {@code catch} or a {@code finally} ever sees. It was the last unbounded call on the shutdown
+     * path, so it was the last one that could leave {@link #terminated} closed forever, with
+     * {@code main} and every caller of {@link #stop()} blocked behind it and the shutdown hook
+     * still registered. It is also the only call here whose result nothing depends on, so an
+     * {@link TimeLimited.AbandonedException} costs one line of bookkeeping and nothing else.
      */
-    private void recordFinalStatus(String name, EmbeddedService service) {
+    private void recordFinalStatus(String name, EmbeddedService service, Duration timeout) {
         try {
-            ServiceStatus finalStatus = service.status();
+            ServiceStatus finalStatus = TimeLimited.call("final-status " + name, timeout, service::status);
             if (finalStatus != null) {
                 lastSeenStatus.put(name, finalStatus);
             } else {
@@ -727,7 +825,7 @@ public final class Supervisor implements AutoCloseable {
             return;
         }
         try {
-            Runtime.getRuntime().removeShutdownHook(hook);
+            hookRemoval.accept(hook);
         } catch (IllegalStateException alreadyExiting) {
             // The JVM is already running its hooks; ours has nothing left to do either way.
         }
@@ -873,8 +971,9 @@ public final class Supervisor implements AutoCloseable {
      * shutdown — which needs {@code transitionLock} first — can be blocked behind a service call
      * that has no deadline. See {@link #startedServices}.
      *
-     * @throws DecommissionException if a decommission is already running, or the supervisor is in
-     *                               no state to start one
+     * @throws DecommissionException if a decommission is already running, the supervisor is in no
+     *                               state to start one, or one of the services it would drive has
+     *                               been abandoned
      */
     private DecommissionCoordinator beginDecommission() throws DecommissionException {
         Map<String, EmbeddedService> services = startedServices();
@@ -891,11 +990,64 @@ public final class Supervisor implements AutoCloseable {
                 throw new DecommissionException(
                         "Cannot decommission: the supervisor is " + state + ", not RUNNING.");
             }
+            refuseIfAnyServiceIsAbandoned(services.keySet());
+            // The mirror of the guard excludeAfterExternalDecommission already applies in the
+            // other direction, and the reason it has to exist here too is what happens next: that
+            // exclusion is bounded, and when its bound expires OpenSearch is abandoned — which
+            // would put a coordinator that had already started into exactly the state the check
+            // above exists to prevent, with nothing left to re-read it. Two threads driving one
+            // OpenSearch node is not something to allow in the meantime either.
+            ExternalCatchUp exclusion = externalExclusion.get();
+            if (exclusion != null && !exclusion.isFinished()) {
+                throw new DecommissionException(
+                        "Cannot decommission: a catch-up shard-allocation exclusion is already in"
+                                + " flight on this node, because Cassandra was seen leaving the"
+                                + " ring without being asked through the supervisor. This node is"
+                                + " already on its way out of both clusters; watch `_cat/shards`"
+                                + " and let it empty rather than starting a second exclusion"
+                                + " against the same OpenSearch node.");
+            }
             DecommissionCoordinator coordinator = new DecommissionCoordinator(
                     configuration, services, this::onDecommissionProgress);
             decommissionInFlight.set(coordinator);
             state = SupervisorState.DECOMMISSIONING;
             return coordinator;
+        }
+    }
+
+    /**
+     * Refuses a decommission over a service that has a call still running inside it.
+     *
+     * <p>{@link #abandon} says what may not be done to such a service, and until now only the
+     * shutdown walk read it. A decommission does every one of those things: it drives four phases
+     * through the service and finishes by calling {@code stop()} on it — the one {@code stop()} a
+     * runtime will ever honour, taken while an earlier call is still inside. The supported {@code
+     * bin/cassandra-opensearch decommission} was therefore the one caller that could walk straight
+     * past an abandonment, and the first way to reach that state without the process unwinding —
+     * the catch-up exclusion overrunning while the supervisor is {@code RUNNING} — arrived without
+     * anything else learning to read it.
+     *
+     * <p>Refused rather than run over the remaining services: with OpenSearch abandoned there is
+     * nothing that can relocate its shards, and a Cassandra-only decommission on a node whose
+     * shards have not moved is precisely the silent data loss {@link DecommissionCoordinator}'s
+     * ordering exists to prevent.
+     */
+    private void refuseIfAnyServiceIsAbandoned(Set<String> serviceNames) throws DecommissionException {
+        StringBuilder stuck = new StringBuilder();
+        for (String name : serviceNames) {
+            String reason = abandoned.get(name);
+            if (reason != null) {
+                stuck.append(stuck.isEmpty() ? "" : "; ").append('\'').append(name)
+                        .append("': ").append(reason);
+            }
+        }
+        if (!stuck.isEmpty()) {
+            throw new DecommissionException(
+                    "Cannot decommission: a call is still running inside " + stuck
+                            + ". Decommissioning drives every phase through that service and ends"
+                            + " by stopping it, which would take the one stop() it will ever"
+                            + " honour while that call is still inside it. Wait for it to return,"
+                            + " or restart this node and decommission it from a clean start.");
         }
     }
 
@@ -1015,6 +1167,8 @@ public final class Supervisor implements AutoCloseable {
             }
             externalExclusion.set(exclusion);
         }
+        String abandonReason = "a catch-up shard-allocation exclusion is still running inside it";
+        boolean abandonedHere = false;
         try {
             LOG.warn("Service '{}' is {}: Cassandra is leaving the ring but was not asked through"
                             + " the supervisor; OpenSearch shard relocation may not complete before"
@@ -1027,19 +1181,49 @@ public final class Supervisor implements AutoCloseable {
                     + " no other copy is lost with it.");
             // Bounded like every other call into a service. It was the one that was not, and an
             // exclusion that never returns is an exclusion nothing can wait for.
-            TimeLimited.run("external-exclusion opensearch", timeout.plus(EXTERNAL_EXCLUSION_GRACE),
-                    () -> opensearch.prepareDecommission(exclusion));
+            TimeLimited.run("external-exclusion opensearch", timeout.plus(externalExclusionGrace),
+                    () -> {
+                        try {
+                            opensearch.prepareDecommission(exclusion);
+                        } finally {
+                            // On the worker's own thread, which is the only thread that knows. The
+                            // finish() below used to run on this thread instead — publishing "no
+                            // call of ours is inside OpenSearch" at the moment the outer bound gave
+                            // up, which is exactly when one still is — so a shutdown arriving next
+                            // found nothing registered and closed the loader under a live call.
+                            exclusion.finish();
+                            // And this is where an abandonment stops being true: whatever the
+                            // supervisor concluded when it gave up waiting, the thread it was about
+                            // has now left the service. Conditional on the reason, so an
+                            // abandonment recorded meanwhile for something else is left alone.
+                            abandoned.remove("opensearch", abandonReason);
+                            externalExclusion.compareAndSet(exclusion, null);
+                        }
+                    });
         } catch (TimeLimited.AbandonedException e) {
-            abandon("opensearch", "a catch-up shard-allocation exclusion is still running inside"
-                    + " it: " + e.getMessage());
+            // Not abandonDuringShutdown: this process is expected to survive this. The node goes
+            // on serving, the record stops the shutdown walk closing a loader out from under the
+            // call, and the exit code is settled later — by whether the call has come back by the
+            // time that walk reaches OpenSearch.
+            abandon("opensearch", abandonReason);
+            if (exclusion.isFinished()) {
+                // It returned between the deadline expiring and the record being written, so the
+                // worker's own remove() above ran against an entry that did not exist yet.
+                abandoned.remove("opensearch", abandonReason);
+            }
+            abandonedHere = true;
         } catch (Exception e) {
             LOG.error("Could not exclude this node from OpenSearch shard allocation after a"
                     + " decommission started outside the supervisor. Its shards will not relocate"
                     + " on their own; exclude the node by hand with a transient"
                     + " cluster.routing.allocation.exclude._name update.", e);
         } finally {
-            exclusion.finish();
-            externalExclusion.compareAndSet(exclusion, null);
+            if (!abandonedHere) {
+                externalExclusion.compareAndSet(exclusion, null);
+            }
+            // Left registered when it was abandoned, deliberately: the call is still inside
+            // OpenSearch, and a shutdown that arrives later must cancel it and wait for it rather
+            // than walk past a handle that says nothing is happening.
         }
     }
 
@@ -1093,14 +1277,17 @@ public final class Supervisor implements AutoCloseable {
             finished.countDown();
         }
 
-        /** @return false if the call is still inside the service when the budget expires */
+        boolean isFinished() {
+            return finished.getCount() == 0;
+        }
+
+        /**
+         * @return false if the call is still inside the service when the budget expires. An
+         *         interrupt is not that — see {@link TimeLimited#await}; answering false to one
+         *         abandons OpenSearch on the strength of an interrupt that arrived instantly.
+         */
         boolean awaitCompletion(Duration budget) {
-            try {
-                return finished.await(budget.toMillis(), TimeUnit.MILLISECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return finished.getCount() == 0;
-            }
+            return TimeLimited.await(finished, budget);
         }
     }
 

@@ -65,19 +65,22 @@ CO_JMX_PORT="${CASSANDRA_OPENSEARCH_JMX_PORT:-7299}"
 # installed deployment and in any container that drops privileges. Reading that as "not running"
 # is what let `start -d` launch a second JVM onto a data directory another JVM already had open.
 #
-# `ps -p` answers regardless of ownership and is POSIX, so it is the second opinion. Where there is
-# no ps - a stripped container image - the last resort is kill's own message: ESRCH is the only
-# failure that means the process is gone, so anything else is read as "still there". Every fallback
-# errs towards "alive", because refusing to start is recoverable and starting twice is not.
+# `ps -p` answers regardless of ownership, so it is the second opinion - and only ever a positive
+# one. `ps -p` failing does NOT mean the process is gone: busybox ps takes no -p at all (it is an
+# XSI option, not base POSIX), so on a stripped container image the command fails for a reason that
+# has nothing to do with the pid, and reading that as "not running" inverts the whole function on
+# exactly the images it was written for. Its failure is therefore inconclusive and falls through.
+#
+# The last resort is kill's own message: ESRCH is the only failure that means the process is gone,
+# so anything else - EPERM, a ps that does not exist, a ps that does not understand -p - is read as
+# "still there". Every fallback errs towards "alive", because refusing to start is recoverable and
+# starting twice is not.
 co_process_is_alive() { # co_process_is_alive <pid>
     if kill -0 "$1" 2> /dev/null; then
         return 0
     fi
-    if command -v ps > /dev/null 2>&1; then
-        if ps -p "$1" > /dev/null 2>&1; then
-            return 0
-        fi
-        return 1
+    if command -v ps > /dev/null 2>&1 && ps -p "$1" > /dev/null 2>&1; then
+        return 0
     fi
     case "$(kill -0 "$1" 2>&1 || true)" in
         *'o such process'*) return 1 ;;

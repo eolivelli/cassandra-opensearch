@@ -47,9 +47,15 @@ import org.opensearch.cluster.routing.ShardRoutingState;
  * </ul>
  *
  * <p>Two states that differ in nothing but their blocks — a read-only index block, say — still
- * share a key and still serve the older snapshot. That costs nothing here, because none of the
- * fields below is derived from {@code blocks()}; it is recorded so that the next field added to
- * this record is added knowing it.
+ * share a key and still serve the older snapshot. That is safe today, but not because the fields
+ * below ignore {@code blocks()}: {@link #healthStatus} is derived from them. {@code
+ * ClusterStateHealth} reports RED for any state whose {@code blocks()} carries a global block with
+ * {@code RestStatus.SERVICE_UNAVAILABLE}, and in a running cluster the no-cluster-manager block is
+ * the only such block — which is exactly the one the third component of the key covers, because it
+ * is the only one added without a version bump. Every other block arrives on a state the cluster
+ * manager published with an incremented version, so the key has already changed by the time it is
+ * applied. Anything added to this record that reads {@code blocks()} outside that guarantee needs a
+ * fourth key component, not a comment.
  */
 record ClusterSnapshot(
         String key,

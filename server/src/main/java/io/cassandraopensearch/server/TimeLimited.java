@@ -7,8 +7,12 @@
  */
 package io.cassandraopensearch.server;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.time.Duration;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
@@ -27,8 +31,20 @@ import java.util.concurrent.TimeoutException;
  * thread is a daemon so the corpse cannot by itself keep the JVM alive; a service that has
  * already spawned non-daemon threads of its own is a separate problem, which is why the
  * supervisor still walks the ordered shutdown afterwards.
+ *
+ * <h2>Interrupts belong to the caller, not to the call</h2>
+ *
+ * The deadline is the only thing that ends a wait here. An interrupt of the <i>waiting</i> thread
+ * is remembered and put back, never obeyed, for the same reason {@code
+ * Supervisor.awaitShutdownInFlight} does the same: the callers are shutdown paths, an interrupt
+ * during shutdown is ordinary — every executor being torn down sends some — and there is nothing
+ * useful to do with one. Returning on it would report a call as over while it is still inside the
+ * service, and re-asserting the flag before the next call in the same walk would make {@code
+ * FutureTask.get} fail at its entry check, collapsing an entire ordered shutdown in milliseconds.
  */
 final class TimeLimited {
+
+    private static final Logger LOG = LoggerFactory.getLogger(TimeLimited.class);
 
     private TimeLimited() {
     }
@@ -64,28 +80,96 @@ final class TimeLimited {
         });
     }
 
+    /**
+     * Runs {@code action} on a thread of its own and waits {@code timeout} for it.
+     *
+     * @return whatever the call returned
+     * @throws AbandonedException if the deadline expired with the call still running. This is the
+     *                            <b>only</b> way this method returns while the call is still inside
+     *                            the service, and the distinction is the whole reason the class
+     *                            exists: everything else that comes out of here is a call that is
+     *                            over.
+     */
     static <T> T call(String description, Duration timeout, Callable<T> action) throws Exception {
         FutureTask<T> task = new FutureTask<>(action);
         Thread worker = new Thread(task, "supervisor-" + description.replace(' ', '-'));
         worker.setDaemon(true);
         worker.start();
+        long deadline = System.nanoTime() + timeout.toNanos();
+        boolean interrupted = false;
         try {
-            return task.get(timeout.toMillis(), TimeUnit.MILLISECONDS);
-        } catch (ExecutionException e) {
-            Throwable cause = e.getCause();
-            if (cause instanceof Exception checked) {
-                throw checked;
+            while (true) {
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0) {
+                    break;
+                }
+                try {
+                    return task.get(remaining, TimeUnit.NANOSECONDS);
+                } catch (ExecutionException e) {
+                    Throwable cause = e.getCause();
+                    if (cause instanceof Exception checked) {
+                        throw checked;
+                    }
+                    throw new SupervisorException(description + " failed: " + cause, cause);
+                } catch (TimeoutException e) {
+                    break;
+                } catch (InterruptedException e) {
+                    // Remembered and put back below, but not obeyed; see the class comment. Note
+                    // that an interrupt already pending when this method was entered lands here
+                    // too, on the first get() — and clears the flag, so the wait that follows is
+                    // the real one rather than another instant failure.
+                    interrupted = true;
+                    LOG.warn("Interrupted while waiting for {}; still waiting, because returning"
+                            + " now would report a call as finished while it is still running"
+                            + " inside the service", description);
+                }
             }
-            throw new SupervisorException(description + " failed: " + cause, cause);
-        } catch (TimeoutException e) {
             worker.interrupt();
             throw new AbandonedException(
                     description + " did not complete within " + format(timeout)
                             + "; the call has been interrupted and abandoned");
-        } catch (InterruptedException e) {
-            worker.interrupt();
-            Thread.currentThread().interrupt();
-            throw new SupervisorException(description + " was interrupted", e);
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    /**
+     * Waits up to {@code budget} for a latch, treating an interrupt the way {@link #call} does:
+     * remembered, put back on the way out, never obeyed.
+     *
+     * <p>The callers wait on latches that say "the thread that was driving these services has let
+     * go of them", and what they do when the wait comes back false is abandon those services —
+     * never stopped, never closed, exit code non-zero, the operator told to SIGKILL. Returning
+     * false because the waiter was interrupted, rather than because the budget expired, therefore
+     * turns an ordinary interrupt into a permanently broken node, and does it after 0 ms while the
+     * message says the whole budget elapsed.
+     *
+     * @return true if the latch opened within the budget
+     */
+    static boolean await(CountDownLatch latch, Duration budget) {
+        long deadline = System.nanoTime() + budget.toNanos();
+        boolean interrupted = false;
+        try {
+            while (true) {
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0) {
+                    return latch.getCount() == 0;
+                }
+                try {
+                    return latch.await(remaining, TimeUnit.NANOSECONDS);
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                    LOG.warn("Interrupted while waiting up to {} for an in-flight call to let go of"
+                            + " the services; still waiting, because giving up here abandons them",
+                            format(budget));
+                }
+            }
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 

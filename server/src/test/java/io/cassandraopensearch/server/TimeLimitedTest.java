@@ -95,6 +95,138 @@ class TimeLimitedTest {
         release.countDown();
     }
 
+    /**
+     * The interrupt path used to be the second way this method returned while the call was still
+     * running inside the service — and the only one that did not say so. It threw a plain {@code
+     * SupervisorException}, which {@code Supervisor.stopService} funnels into its {@code catch
+     * (Throwable)}: "did not stop cleanly", then {@code close()} on the loader that live call is
+     * executing out of, then a final status recorded as if the service had settled, then exit 0.
+     *
+     * <p>The deadline is now the only thing that ends the wait. An interrupt is remembered, logged
+     * and put back; the call is waited for as before.
+     */
+    @Test
+    void anInterruptDoesNotEndTheWaitAndIsPutBackAfterwards() throws Exception {
+        CountDownLatch inside = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        Thread caller = Thread.currentThread();
+
+        Thread interrupter = new Thread(() -> {
+            try {
+                assertThat(inside.await(10, TimeUnit.SECONDS)).isTrue();
+                caller.interrupt();
+                // Long enough that a wait which obeyed the interrupt would already have returned.
+                Thread.sleep(200);
+                release.countDown();
+            } catch (InterruptedException e) {
+                throw new AssertionError(e);
+            }
+        }, "test-interrupter");
+        interrupter.start();
+
+        try {
+            String result = TimeLimited.call("drain", Duration.ofSeconds(30), () -> {
+                inside.countDown();
+                release.await(10, TimeUnit.SECONDS);
+                return "drained";
+            });
+
+            assertThat(result)
+                    .as("the call finished; an interrupt of the waiter is not a failure of it")
+                    .isEqualTo("drained");
+            assertThat(Thread.currentThread().isInterrupted())
+                    .as("not obeyed, but it still belongs to this thread")
+                    .isTrue();
+        } finally {
+            Thread.interrupted();
+            interrupter.join(TimeUnit.SECONDS.toMillis(30));
+        }
+    }
+
+    /**
+     * The cascade. {@code FutureTask.get} checks the flag on entry, so once one call had re-set it
+     * every later call in the same shutdown failed instantly — the whole ordered walk collapsed in
+     * milliseconds, every service "did not stop cleanly", every loader closed under a live call. The
+     * production path that does exactly this is {@code CassandraOpenSearchServer.run}: {@code
+     * Thread.currentThread().interrupt(); supervisor.stop();}.
+     */
+    @Test
+    void anInterruptAlreadyPendingDoesNotCollapseTheCall() throws Exception {
+        Thread.currentThread().interrupt();
+        try {
+            assertThat(TimeLimited.call("stop cassandra", Duration.ofSeconds(30), () -> {
+                Thread.sleep(50);
+                return "stopped";
+            })).isEqualTo("stopped");
+            assertThat(Thread.currentThread().isInterrupted()).isTrue();
+        } finally {
+            Thread.interrupted();
+        }
+    }
+
+    /**
+     * And when the deadline does expire on an interrupted waiter, the answer is the same as for
+     * any other overrun: abandoned, because the call is still running.
+     */
+    @Test
+    void anOverrunIsStillAbandonedWhenTheWaiterWasAlsoInterrupted() {
+        Thread.currentThread().interrupt();
+        try {
+            assertThatThrownBy(() -> TimeLimited.run("slow stop", Duration.ofMillis(200),
+                    () -> Thread.sleep(TimeUnit.MINUTES.toMillis(1))))
+                    .isInstanceOf(TimeLimited.AbandonedException.class)
+                    .hasMessageContaining("did not complete within 200ms");
+            assertThat(Thread.currentThread().isInterrupted()).isTrue();
+        } finally {
+            Thread.interrupted();
+        }
+    }
+
+    /**
+     * {@code await} is the same policy for the latches that say "the thread driving these services
+     * has let go of them". A {@code false} there is answered by abandoning both services, so an
+     * interrupt must not be able to produce one — the shutdown reported "the coordinator burned its
+     * whole 1m budget" 4 ms after being asked.
+     */
+    @Test
+    void awaitKeepsWaitingWhenInterruptedAndReportsTheLatchNotTheInterrupt() throws Exception {
+        CountDownLatch finished = new CountDownLatch(1);
+        Thread caller = Thread.currentThread();
+        Thread interrupter = new Thread(() -> {
+            try {
+                Thread.sleep(100);
+                caller.interrupt();
+                Thread.sleep(200);
+                finished.countDown();
+            } catch (InterruptedException e) {
+                throw new AssertionError(e);
+            }
+        }, "test-interrupter");
+        interrupter.start();
+
+        try {
+            long start = System.nanoTime();
+            boolean opened = TimeLimited.await(finished, Duration.ofSeconds(30));
+            Duration waited = Duration.ofNanos(System.nanoTime() - start);
+
+            assertThat(opened)
+                    .as("the latch did open, well inside the budget; the interrupt was not an answer")
+                    .isTrue();
+            assertThat(waited).isGreaterThan(Duration.ofMillis(200));
+            assertThat(Thread.currentThread().isInterrupted()).isTrue();
+        } finally {
+            Thread.interrupted();
+            interrupter.join(TimeUnit.SECONDS.toMillis(30));
+        }
+    }
+
+    /** And the budget still ends it, with the latch's own verdict. */
+    @Test
+    void awaitReportsFalseWhenTheBudgetGenuinelyExpires() {
+        assertThat(TimeLimited.await(new CountDownLatch(1), Duration.ofMillis(100))).isFalse();
+        assertThat(TimeLimited.await(new CountDownLatch(0), Duration.ofMillis(100))).isTrue();
+    }
+
     @Test
     void formatsDurationsTheWayTheConfigurationFileWritesThem() {
         assertThat(TimeLimited.format(Duration.ZERO)).isEqualTo("0s");

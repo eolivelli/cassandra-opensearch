@@ -128,6 +128,47 @@ else
 fi
 rm -rf "$CLUSTER"
 
+# --- a node that is up but not answering -------------------------------------------------------
+#
+# The launcher separates two things that both look like "no answer on the JMX port": a node that is
+# genuinely gone (exit 3, not a failure) and a node whose JVM is alive but whose supervisor MBean
+# is not up yet - a `start -d` that timed out, one interrupted, one replaying a long commit log.
+# The second exits 1 with a message naming the pid, precisely so that this script cannot read it as
+# "was not running" and delete a live node's data directory. That contract is what is asserted
+# here: anything other than 0 or 3 must stop `destroy`.
+
+CLUSTER="$WORK/alive-but-silent"
+make_cluster "$CLUSTER" 2 1
+for n in 1 2; do
+    cat > "$CLUSTER/node$n/bin/cassandra-opensearch" <<'ALIVE_BUT_SILENT'
+#!/bin/sh
+# Stub node standing in for a JVM that is up while its JMX port is still silent. This is what the
+# launcher does with that state: exit 1, naming the pid, rather than the 3 that means "gone".
+case "$1" in
+    stop)
+        echo "cassandra-opensearch: pid 4242 (from cassandra-opensearch.pid) is alive, but" >&2
+        echo "  nothing is answering on 127.0.0.1:7299. This node is NOT stopped." >&2
+        exit 1
+        ;;
+    *) exit 0 ;;
+esac
+ALIVE_BUT_SILENT
+    chmod +x "$CLUSTER/node$n/bin/cassandra-opensearch"
+done
+
+RC=0
+OUT=$("$CONTROL" -d "$CLUSTER" destroy 2>&1) || RC=$?
+if [ "$RC" -eq 0 ]; then
+    fail "destroy deleted a cluster whose nodes are alive but not answering: $OUT"
+elif [ ! -d "$CLUSTER" ]; then
+    fail "destroy deleted $CLUSTER while its nodes were still running"
+elif ! echo "$OUT" | grep -q 'refusing to delete'; then
+    fail "destroy did not explain why it refused for a live node: $OUT"
+else
+    pass "destroy refuses a node that is alive but whose JMX port is silent"
+fi
+rm -rf "$CLUSTER"
+
 # --- an unknown option is still an error -------------------------------------------------------
 
 CLUSTER="$WORK/unknown-option"

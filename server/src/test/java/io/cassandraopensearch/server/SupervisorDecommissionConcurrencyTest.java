@@ -353,6 +353,72 @@ class SupervisorDecommissionConcurrencyTest {
                 .contains("opensearch.stop", "cassandra.stop");
     }
 
+    /**
+     * R4-2. The same interrupt, seen through the cancellation budget.
+     *
+     * <p>{@code awaitCompletion} caught {@code InterruptedException}, re-set the flag and returned
+     * {@code isFinished()} — and with the flag already set from the interrupted call before it,
+     * {@code latch.await} threw at once, so {@code false} came back after 0 ms. {@code
+     * cancelDecommission} reads {@code false} as "the coordinator burned the whole budget" and
+     * abandons every service it was driving: both services permanently un-stoppable, exit code 1,
+     * the operator told to SIGKILL, and a failure message asserting "1m after being cancelled" for
+     * a coordinator that unwound cleanly four milliseconds later.
+     *
+     * <p>This is the shutdown of {@code CassandraOpenSearchServer.run}, which interrupts itself
+     * before calling {@code stop()}, arriving in the middle of a decommission.
+     */
+    @Test
+    void anInterruptedShutdownDoesNotMistakeItselfForAnExpiredCancellationBudget() throws Exception {
+        Supervisor supervisor = supervisor();
+        // Long enough that "the budget expired" could only ever be true of a coordinator that
+        // really would not let go; this one lets go the moment it is cancelled.
+        supervisor.decommissionCancelBudget(Duration.ofSeconds(20));
+        supervisor.start();
+        CountDownLatch relocating = new CountDownLatch(1);
+        opensearch.relocationGate = relocating;
+
+        List<Throwable> outcome = Collections.synchronizedList(new ArrayList<>());
+        Thread decommissioning = new Thread(() -> {
+            try {
+                supervisor.decommission(null, false);
+            } catch (Throwable e) {
+                outcome.add(e);
+            }
+        }, "test-decommission");
+        decommissioning.start();
+        awaitCall("opensearch.awaitDecommissionReady");
+
+        Thread stopper = new Thread(() -> {
+            Thread.currentThread().interrupt();
+            supervisor.stop();
+        }, "test-interrupted-stopper");
+        stopper.start();
+        stopper.join(TimeUnit.SECONDS.toMillis(60));
+        decommissioning.join(TimeUnit.SECONDS.toMillis(60));
+
+        // Never opened: the coordinator has to get out through the cancellation, exactly as in
+        // aShutdownDuringADecommissionWaitsForTheCoordinatorToUnwind.
+        assertThat(relocating.getCount()).isEqualTo(1);
+        assertThat(outcome).hasSize(1);
+        assertThat(outcome.get(0))
+                .isInstanceOf(DecommissionException.class)
+                .hasMessageContaining("cancelled");
+        assertThat(calls)
+                .as("the coordinator unwound; both services are the shutdown's to stop and close")
+                .containsExactly(
+                        "cassandra.start", "opensearch.start",
+                        "opensearch.prepareDecommission", "cassandra.prepareDecommission",
+                        "opensearch.awaitDecommissionReady",
+                        "cassandra.abortDecommission", "opensearch.abortDecommission",
+                        "opensearch.stop", "opensearch.close",
+                        "cassandra.stop", "cassandra.close");
+        assertThat(supervisor.state()).isEqualTo(SupervisorState.STOPPED);
+        assertThat(supervisor.awaitShutdown()).isZero();
+        assertThat(supervisor.failureMessage())
+                .as("nothing was abandoned, so nothing may claim it was")
+                .isNull();
+    }
+
     private void awaitRefusals(List<String> refusals, int expected) throws InterruptedException {
         long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
         while (refusals.size() < expected) {

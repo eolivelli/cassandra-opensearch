@@ -548,6 +548,145 @@ class SupervisorLifecycleTest {
                 .hasValue(true);
     }
 
+    /**
+     * R4-1. The same rule for the thread that <i>runs</i> the shutdown, not the one waiting on it.
+     *
+     * <p>{@code TimeLimited.call} had two ways of returning while the call was still executing
+     * inside the service. The overrun was fixed to say so; the interrupt was not, and came back as
+     * a plain {@code SupervisorException} that {@code stopService} reads as "did not stop cleanly"
+     * — falling straight through to {@code close()} on the loader that live {@code stop()} is
+     * executing out of, and then to a final status and exit code 0. It cascaded too: the flag was
+     * re-set, so every later call in the walk failed at {@code FutureTask.get}'s entry check and
+     * the entire ordered shutdown collapsed in milliseconds.
+     *
+     * <p>This is {@code CassandraOpenSearchServer.run}'s own path: {@code
+     * Thread.currentThread().interrupt(); supervisor.stop();}.
+     */
+    @Test
+    void anInterruptedShutdownWaitsForTheDrainInsteadOfClosingUnderIt() throws Exception {
+        Supervisor supervisor = supervisor(WEDGEABLE);
+        supervisor.start();
+        CountDownLatch draining = new CountDownLatch(1);
+        opensearch.stopGate = draining;
+        // Ignores interrupts, like a real drain: nothing the supervisor does ends this call.
+        opensearch.stopIgnoresInterrupts = true;
+
+        AtomicReference<Boolean> interruptRestored = new AtomicReference<>();
+        Thread stopper = new Thread(() -> {
+            Thread.currentThread().interrupt();
+            supervisor.stop();
+            interruptRestored.set(Thread.currentThread().isInterrupted());
+        }, "test-interrupted-stopper");
+        stopper.start();
+        awaitCall("opensearch.stop");
+
+        Thread.sleep(500);
+        assertThat(stopper.isAlive())
+                .as("the shutdown returned while opensearch.stop() was still draining")
+                .isTrue();
+        assertThat(opensearch.stopReturned).isFalse();
+        assertThat(calls)
+                .as("close() here closes the URLClassLoader that thread is executing out of, and"
+                        + " cassandra must not be reached before opensearch is actually down")
+                .doesNotContain("opensearch.close", "cassandra.stop");
+
+        draining.countDown();
+        stopper.join(TimeUnit.SECONDS.toMillis(30));
+
+        assertThat(stopper.isAlive()).isFalse();
+        assertThat(calls).containsExactly(
+                "cassandra.start", "opensearch.start",
+                "opensearch.stop", "opensearch.close",
+                "cassandra.stop", "cassandra.close");
+        assertThat(supervisor.state())
+                .as("nothing failed here: a drain that was waited for is a clean shutdown")
+                .isEqualTo(SupervisorState.STOPPED);
+        assertThat(supervisor.awaitShutdown()).isZero();
+        assertThat(supervisor.failureMessage()).isNull();
+        assertThat(interruptRestored)
+                .as("the interrupt was not obeyed, but it still belongs to that thread")
+                .hasValue(true);
+    }
+
+    /**
+     * R4-4. "The latch is counted down on every path" held against throws and not against blocks.
+     *
+     * <p>The final {@code status()} the supervisor records for its own bookkeeping was the last
+     * unbounded call on the shutdown path, and {@code checkHealth}'s own comment says why that
+     * matters: {@code status()} on a wedged runtime does not return and is not interruptible. A
+     * call that never returns is not something the {@code try/catch/finally} around {@code
+     * runShutdown} ever sees — {@link Supervisor#terminated} stays closed, {@code main} never
+     * returns, and the shutdown budget's arithmetic, which counts only bounded calls, is wrong.
+     */
+    @Test
+    void aFinalStatusThatNeverReturnsDoesNotWedgeTheShutdown() throws Exception {
+        Supervisor supervisor = supervisor(IMPATIENT_SHUTDOWN);
+        supervisor.start();
+        // status() that has stopped answering and ignores interrupts. The final read the shutdown
+        // makes after close() lands in it; so does the health poll, which is also how a real one
+        // wedges.
+        CountDownLatch wedged = new CountDownLatch(1);
+        opensearch.statusGate = wedged;
+        assertThat(opensearch.statusWedged.await(30, TimeUnit.SECONDS))
+                .as("the premise: a status() call that will not come back")
+                .isTrue();
+
+        Thread stopper = new Thread(supervisor::stop, "test-stopper");
+        stopper.start();
+
+        try {
+            assertThat(assertTimeoutPreemptively(Duration.ofSeconds(20), supervisor::awaitShutdown))
+                    .as("the process has to be able to leave; the final status is bookkeeping")
+                    .isZero();
+            assertThat(calls)
+                    .as("and the service behind the wedged one still has to be stopped")
+                    .containsExactly(
+                            "cassandra.start", "opensearch.start",
+                            "opensearch.stop", "opensearch.close",
+                            "cassandra.stop", "cassandra.close");
+            assertThat(supervisor.state()).isEqualTo(SupervisorState.STOPPED);
+        } finally {
+            wedged.countDown();
+            opensearch.statusGate = null;
+            stopper.join(TimeUnit.SECONDS.toMillis(30));
+        }
+    }
+
+    /**
+     * R4-5. {@code removeShutdownHook()} swallows the {@code IllegalStateException} the JVM throws
+     * when it is already exiting, and nothing else. A {@code SecurityException} — a security
+     * manager refusing the {@code shutdownHooks} permission — escaped the {@code finally} and took
+     * {@code terminated.countDown()} with it, which is the one line in this class that no later
+     * caller can supply: the CAS is already taken, so nobody can retry the shutdown, and {@code
+     * main} and every caller of {@code stop()} block forever.
+     */
+    @Test
+    void aShutdownHookRemovalThatThrowsStillLetsTheProcessExit() throws Exception {
+        Supervisor supervisor = supervisor(BOTH);
+        supervisor.start();
+        Thread hook = supervisor.shutdownHook();
+        supervisor.hookRemoval(ignored -> {
+            throw new SecurityException("permission 'shutdownHooks' denied");
+        });
+
+        try {
+            assertTimeoutPreemptively(Duration.ofSeconds(10), supervisor::stop);
+
+            assertThat(assertTimeoutPreemptively(Duration.ofSeconds(5), supervisor::awaitShutdown))
+                    .as("a hook that will not come off is worth one wasted, idempotent run of the"
+                            + " shutdown; a latch that never opens is a process that cannot exit")
+                    .isZero();
+            assertThat(calls).containsExactly(
+                    "cassandra.start", "opensearch.start",
+                    "opensearch.stop", "opensearch.close",
+                    "cassandra.stop", "cassandra.close");
+            assertThat(supervisor.state()).isEqualTo(SupervisorState.STOPPED);
+        } finally {
+            // It really is still registered with this JVM; take it off by hand.
+            Runtime.getRuntime().removeShutdownHook(hook);
+        }
+    }
+
     @Test
     void startMayOnlyBeCalledOnce() throws Exception {
         Supervisor supervisor = supervisor(BOTH);

@@ -41,6 +41,11 @@ code 3 for it, which is the CLI's "nothing is running", and `destroy` treats tha
 destroying a cluster you have just stopped, or one you never started, needs no `-f`. Options may
 be written on either side of the command, so `destroy -f` and `-f destroy` are the same thing.
 
+Exit code 3 means the node's recorded process is gone as well as its JMX port being silent. A node
+whose JVM is alive but not yet answering — a `start -d` that timed out, one interrupted before the
+supervisor finished starting — exits 1 instead, and `destroy` refuses it: deleting the directory
+of a live node leaves it writing into files nothing can find.
+
 ### Port plan
 
 Node `i` binds `127.0.0.i`, with ports at `21000 + i*10 + offset`:

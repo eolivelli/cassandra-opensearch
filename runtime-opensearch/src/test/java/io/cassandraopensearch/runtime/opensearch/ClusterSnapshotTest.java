@@ -59,6 +59,26 @@ class ClusterSnapshotTest {
                 .isNotEqualTo(ClusterSnapshot.key(settled));
     }
 
+    /**
+     * {@code healthStatus} <i>is</i> derived from {@code blocks()} — {@code ClusterStateHealth}
+     * reports RED for any state whose blocks carry a global block with
+     * {@code RestStatus.SERVICE_UNAVAILABLE} — so "the key ignores blocks, and nothing here reads
+     * them" would be two mistakes rather than one. What makes the memoisation safe is narrower:
+     * the no-cluster-manager block is the only global block added without a version bump, and it
+     * is exactly the one the third component of the key catches. This is the test that would fail
+     * if a field were added that read a block arriving on some other state.
+     */
+    @Test
+    void theHealthStatusIsDerivedFromTheBlocksTheKeyHasToCover() {
+        ClusterState settled = settledState();
+        ClusterState lost = withoutClusterManager(settled);
+
+        assertThat(ClusterSnapshot.of(settled, LOCAL_ID).healthStatus()).isEqualTo("GREEN");
+        assertThat(ClusterSnapshot.of(lost, LOCAL_ID).healthStatus())
+                .as("the only thing that changed is a global block")
+                .isEqualTo("RED");
+    }
+
     @Test
     void thatSameStateAlwaysHasTheSameKey() {
         ClusterState settled = settledState();

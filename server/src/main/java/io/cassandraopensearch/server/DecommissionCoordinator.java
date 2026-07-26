@@ -21,7 +21,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
 
 /**
  * Retires this node from both clusters, in the one order that does not lose data.
@@ -166,16 +165,16 @@ public final class DecommissionCoordinator {
     /**
      * Waits for {@link #run} to return or throw.
      *
+     * <p>An interrupt does not end the wait — see {@link TimeLimited#await}. The caller answers a
+     * {@code false} here by abandoning both services, which is far too heavy a consequence to hang
+     * on an interrupt that arrived a millisecond in; only the budget genuinely expiring means what
+     * {@code false} is taken to mean.
+     *
      * @return false if it is still running when the budget expires, in which case the caller is
      *         sharing the two services with a coordinator that is still driving them
      */
     boolean awaitCompletion(Duration budget) {
-        try {
-            return finished.await(budget.toMillis(), TimeUnit.MILLISECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return isFinished();
-        }
+        return TimeLimited.await(finished, budget);
     }
 
     /**

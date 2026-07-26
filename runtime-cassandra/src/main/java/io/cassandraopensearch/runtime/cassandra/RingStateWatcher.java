@@ -58,13 +58,20 @@ final class RingStateWatcher {
      * being drained is still a ring member and still owns its data, and excluding its OpenSearch
      * half from shard allocation would relocate every shard away for nothing.
      *
-     * <p>{@code DECOMMISSION_FAILED} is absent for a different reason, and not because the node is
-     * still a member — it is not: every path that produces that mode runs after
-     * {@code unbootstrap()} has called {@code leaveRing()}. It is absent because it is unreachable
-     * as a <i>transition</i> this watcher could report. The fork sets LEAVING before it starts, so
-     * the departure has already been announced from here by the time anything can fail, and
-     * re-announcing it would be a second event for one departure. {@code CassandraService} reports
-     * the outcome of that failure as FAILED; see {@code statusAfterFailedDecommission}.
+     * <p>{@code DECOMMISSION_FAILED} is absent because the mode does not say whether the node
+     * left. The fork sets it from catch blocks that wrap the whole of
+     * {@code StorageService.decommission()}, most of which is <i>before</i> {@code unbootstrap()}
+     * calls {@code leaveRing()}: an unforced decommission refused for dropping a keyspace below
+     * its replication factor throws having changed nothing, and the node stays a full ring member
+     * with the mode string as the only trace. Reporting that as a departure would exclude a
+     * healthy node's OpenSearch half from shard allocation and relocate every shard off it for
+     * nothing — the same mistake this set avoids for MOVING and DRAINING.
+     *
+     * <p>Nothing is lost on the paths where the node really did leave. Those all run past
+     * {@code startLeaving()}, which sets LEAVING, so the departure has already been reported from
+     * here and a second event would only duplicate it. {@code CassandraService} decides what the
+     * service status becomes by asking {@code TokenMetadata} who is in the ring, which is the
+     * question the mode string cannot answer; see {@code statusAfterFailedDecommission}.
      */
     private static final Set<String> LEAVING_THE_RING = Set.of("LEAVING", "DECOMMISSIONED");
 

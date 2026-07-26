@@ -64,7 +64,9 @@ environment:
 exit codes: 0 ok, 1 failed, 2 bad usage, 3 nothing running, 4 the MBean has no such operation
   3 is the answer to \`stop\` on a node that is already down, and is not a failure. A script
   stopping several nodes has to treat it as one of the successful outcomes; see
-  examples/local-cluster/cluster-control.sh.
+  examples/local-cluster/cluster-control.sh. It means the recorded process is gone as well as
+  the port being silent: a node whose JVM is alive but whose JMX port is not answering yet exits
+  1, so that a caller cannot read "still starting" as "already stopped" and delete its data.
 EOF
 }
 
@@ -171,6 +173,27 @@ run_cli() {
         --jmx-host "$CO_JMX_HOST" --jmx-port "$CO_JMX_PORT" $CLI_ARGS
 }
 
+# The pid recorded in $PIDFILE, or nothing at all.
+#
+# Every caller goes on to hand this to `kill`, and a corrupt pid file can hold two things that kill
+# reads as something other than "one process": `kill -TERM -1` signals every process this user
+# owns, and `kill -TERM 0` signals this script's own process group. A file holding -1, 0, a log
+# line or half a write must therefore never reach it. Such a file names nothing worth protecting
+# either, so it is reported and ignored rather than treated as a running node - refusing to act on
+# an unparseable file would leave the operator with a node that can neither be started nor stopped.
+recorded_pid() {
+    [ -f "$PIDFILE" ] || return 0
+    _co_pidfile_contents=$(cat "$PIDFILE" 2> /dev/null || true)
+    case "$_co_pidfile_contents" in
+        '') return 0 ;;
+        0 | *[!0-9]*)
+            echo "cassandra-opensearch: ignoring $PIDFILE: '$_co_pidfile_contents' is not a pid." >&2
+            return 0
+            ;;
+    esac
+    printf '%s' "$_co_pidfile_contents"
+}
+
 # Refuses to start when this node is already up. Two independent checks, because each alone has a
 # blind spot that the other covers:
 #
@@ -187,13 +210,10 @@ refuse_if_running() {
   CASSANDRA_OPENSEARCH_JMX_HOST and CASSANDRA_OPENSEARCH_JMX_PORT at a different node."
     fi
 
-    [ -f "$PIDFILE" ] || return 0
-    _co_recorded=$(cat "$PIDFILE" 2> /dev/null || true)
-    case "$_co_recorded" in
-        # Empty or not a number: there is no process to protect, and refusing on a corrupt file
-        # would leave the operator with a node that cannot be started at all.
-        '' | *[!0-9]*) return 0 ;;
-    esac
+    # Empty when the file is missing, or holds something that is not a pid; there is then no
+    # process to protect. See recorded_pid.
+    _co_recorded=$(recorded_pid)
+    [ -n "$_co_recorded" ] || return 0
     # Our own pid, from a foreground start that exited without clearing the file: `docker restart`
     # arrives here as pid 1 both times, so the file would otherwise name us.
     [ "$_co_recorded" != "$$" ] || return 0
@@ -230,7 +250,11 @@ start() {
         # CMD. A node that will not start because it could not write a convenience file is a much
         # worse outcome than a node running without one, and everything the pid file buys back is
         # named in the warning.
-        if ! echo "$$" > "$PIDFILE" 2> /dev/null; then
+        # `2> /dev/null` FIRST: redirections are applied left to right, and the shell's own
+        # "cannot create ...: Permission denied" for the failing open is written to whatever
+        # stderr is at that moment. With the file redirection first, that message escapes and the
+        # careful explanation below arrives underneath a raw shell error.
+        if ! echo "$$" 2> /dev/null > "$PIDFILE"; then
             echo "cassandra-opensearch: cannot write $PIDFILE; starting anyway." >&2
             echo "  \`$(basename "$0") stop\` from another shell needs that file to find this" >&2
             echo "  process. Pass -p <pidfile> pointing somewhere writable, or stop the node" >&2
@@ -246,7 +270,8 @@ start() {
     # already running by the time this line executes. Dying here - which is what `set -e` did with
     # the bare redirection - leaves it orphaned, unrecorded and holding the ports, with nothing
     # left that knows its pid.
-    if ! echo "$_pid" > "$PIDFILE" 2> /dev/null; then
+    # Same left-to-right redirection order as the foreground path above.
+    if ! echo "$_pid" 2> /dev/null > "$PIDFILE"; then
         echo "cassandra-opensearch: cannot write $PIDFILE; the node is running as pid $_pid." >&2
         echo "  \`$(basename "$0") stop\` will not find it. Note the pid, or restart with" >&2
         echo "  -p <pidfile> pointing somewhere writable." >&2
@@ -283,10 +308,8 @@ start() {
 
 stop() {
     co_require_java_21
-    _pid=""
-    if [ -f "$PIDFILE" ]; then
-        _pid=$(cat "$PIDFILE" 2> /dev/null || true)
-    fi
+    # Validated, because the rc=4 branch below signals it. See recorded_pid.
+    _pid=$(recorded_pid)
 
     # Ask the supervisor's MBean first. Exit code 4 means it answered but has no stop operation,
     # which is the situation today: the supervisor owns the JVM's only shutdown hook, so SIGTERM
@@ -304,16 +327,30 @@ stop() {
         echo "sending SIGTERM to pid $_pid"
         kill -TERM "$_pid"
     elif [ "$_rc" -eq 3 ]; then
-        # Nothing is listening on the supervisor's JMX port. Before the foreground start began
-        # writing a pid file this could not leave anything behind; now it can, and this is the
-        # only command that ever looks at that file - `stop` returned 3 here without reaching the
-        # rm below, so a stale file survived every subsequent stop and eventually collided with a
-        # recycled pid, at which point refuse_if_running blocked every start.
+        # Nothing answered on the supervisor's JMX port. That is not the same question as "is this
+        # node running", and everything downstream depends on the difference: 3 is documented as
+        # "nothing running" and is not a failure, so examples/local-cluster/cluster-control.sh
+        # reads it as "was not running" and its `destroy` goes on to delete the node's directory.
+        # A node whose JVM is alive but whose JMX connector is not up yet - a `start -d` that timed
+        # out, one interrupted before the supervisor finished starting, one replaying a long commit
+        # log - would be deleted out from under itself and carry on writing sstables into unlinked
+        # inodes. The pid file knows better, and this is the one command that reads it.
         #
-        # Only when the recorded process really is gone. A node that is still starting up has no
-        # JMX port yet and is very much running; deleting its pid file would be the same defect
-        # from the other end.
-        if [ -n "$_pid" ] && ! co_process_is_alive "$_pid"; then
+        # So 3 means the recorded process is genuinely gone. Anything else is a failure with a
+        # message, and a caller that stops several nodes will not mistake it for a node that
+        # was already down.
+        if [ -n "$_pid" ] && co_process_is_alive "$_pid"; then
+            co_die "pid $_pid (from $PIDFILE) is alive, but nothing is answering on
+  $CO_JMX_HOST:$CO_JMX_PORT. This node is NOT stopped - it is most likely still starting up, and
+  its supervisor MBean is what stop needs. Wait for it and run stop again, or send SIGTERM to
+  pid $_pid yourself: the supervisor's shutdown hook does the ordered teardown."
+        fi
+        # Before the foreground start began writing a pid file this could not leave anything
+        # behind; now it can, and this is the only command that ever looks at that file - `stop`
+        # returned 3 without reaching the rm, so a stale file survived every subsequent stop and
+        # eventually collided with a recycled pid, at which point refuse_if_running blocked every
+        # start.
+        if [ -n "$_pid" ]; then
             rm -f "$PIDFILE"
             echo "not running; removed the stale $PIDFILE (it named pid $_pid)" >&2
         fi
@@ -346,10 +383,9 @@ stop() {
 # finds a live process there and refuses to start.
 decommission() {
     co_require_java_21
-    _pid=""
-    if [ -f "$PIDFILE" ]; then
-        _pid=$(cat "$PIDFILE" 2> /dev/null || true)
-    fi
+    # Same validation as stop: this pid is polled with kill -0 through co_process_is_alive, and a
+    # pid file holding -1 or 0 turns that into a question about every process this user owns.
+    _pid=$(recorded_pid)
 
     _rc=0
     # CLI_ARGS unquoted on purpose: it is a list of arguments, not one argument.

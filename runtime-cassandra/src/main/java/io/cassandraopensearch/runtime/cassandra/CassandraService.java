@@ -77,11 +77,6 @@ public final class CassandraService implements EmbeddedService {
 
     private static final String MODE_NORMAL = "NORMAL";
     private static final String MODE_DECOMMISSIONED = "DECOMMISSIONED";
-    /**
-     * The mode the fork leaves behind when {@code decommission()} threw <i>after</i>
-     * {@code unbootstrap()}; see {@link #statusAfterFailedDecommission}.
-     */
-    private static final String MODE_DECOMMISSION_FAILED = "DECOMMISSION_FAILED";
     private static final Duration SHUTDOWN_STEP_TIMEOUT = Duration.ofMinutes(1);
 
     private final AtomicBoolean stopped = new AtomicBoolean();
@@ -376,28 +371,27 @@ public final class CassandraService implements EmbeddedService {
         try {
             StorageService.instance.decommission(request.force());
         } catch (Throwable t) {
-            // Ask the node what actually happened rather than assuming it is still a ring member.
-            // A throw from decommission() does not mean it stopped early: this fork runs its
-            // decommission hooks after unbootstrap(), completes the whole sequence — leaveRing,
-            // shutdownClientServers, Gossiper.stop, MessagingService.shutdown, Stage.shutdownNow,
-            // setMode(DECOMMISSIONED) — and only then throws if a hook failed, deliberately, since
-            // by then there is nothing left to roll back to. Reporting RUNNING on that path tells
-            // the operator this node is still serving a ring it has already left.
+            // Ask the node whether it is still a ring member rather than reading that off the
+            // operation mode. A throw from decommission() does not mean it stopped early: this
+            // fork runs its decommission hooks after unbootstrap(), completes the whole sequence —
+            // leaveRing, shutdownClientServers, Gossiper.stop, MessagingService.shutdown,
+            // Stage.shutdownNow, setMode(DECOMMISSIONED) — and only then throws if a hook failed,
+            // deliberately, since by then there is nothing left to roll back to. Reporting RUNNING
+            // on that path tells the operator this node is still serving a ring it has already
+            // left. Nor does a throw mean it went that far; see membership().
             String mode = StorageService.instance.getOperationMode();
-            status = statusAfterFailedDecommission(mode);
-            throw new ServiceException(NAME,
-                    MODE_DECOMMISSIONED.equals(mode)
-                            ? "Decommission reported a failure after the node had already left the"
-                                    + " ring; operation mode is " + mode + ". The node is out of the"
-                                    + " cluster and cannot rejoin without bootstrapping."
-                            : "Decommission failed; operation mode is now " + mode, t);
+            Membership membership = membership();
+            status = statusAfterFailedDecommission(mode, membership);
+            throw new ServiceException(NAME, failedDecommissionMessage(mode, membership), t);
         }
 
         String mode = StorageService.instance.getOperationMode();
         if (!MODE_DECOMMISSIONED.equals(mode)) {
-            status = statusAfterFailedDecommission(mode);
+            Membership membership = membership();
+            status = statusAfterFailedDecommission(mode, membership);
             throw new ServiceException(NAME,
-                    "Decommission returned without leaving the ring; operation mode is " + mode);
+                    "Decommission returned without reaching DECOMMISSIONED. "
+                            + failedDecommissionMessage(mode, membership));
         }
         status = ServiceStatus.DECOMMISSIONED;
         request.reportProgress(100, "left the ring");
@@ -407,32 +401,97 @@ public final class CassandraService implements EmbeddedService {
         context.reportEvent("INFO", "cassandra.decommissioned", "this node has left the ring");
     }
 
+    /** Whether this endpoint is still in the ring, as {@link #membership()} was able to read it. */
+    private enum Membership {
+        /** Still in {@code TokenMetadata}: it owns its ranges and is serving them. */
+        STILL_A_MEMBER,
+        /** {@code leaveRing()} has run: out of {@code TokenMetadata}, NEEDS_BOOTSTRAP persisted. */
+        LEFT,
+        /** The token metadata could not be read; treated as {@link #STILL_A_MEMBER}. */
+        UNKNOWN
+    }
+
+    /**
+     * Whether this node is still a member of the ring, which is the only thing that says what a
+     * failed decommission actually did.
+     *
+     * <p>{@code leaveRing()} is what ends the membership — it persists NEEDS_BOOTSTRAP, removes
+     * this endpoint from {@code TokenMetadata} and gossips LEFT — and it is exactly what
+     * {@code StorageService.isJoined()} reads. This asks {@code TokenMetadata} directly rather than
+     * calling {@code isJoined()}, which also folds in {@code isSurveyMode} and would report a
+     * write-survey node as having left a ring it is still in.
+     *
+     * @return {@link Membership#UNKNOWN} rather than a guess when the read throws. A node being
+     *         torn down can throw from anywhere in {@code StorageService}, and the callers treat
+     *         unknown as "still a member": that keeps the service RUNNING, which is retryable and
+     *         which the supervisor's health monitor does not act on, whereas announcing a
+     *         departure that may not have happened cannot be taken back.
+     */
+    private static Membership membership() {
+        try {
+            return StorageService.instance.getTokenMetadata()
+                    .isMember(FBUtilities.getBroadcastAddressAndPort())
+                    ? Membership.STILL_A_MEMBER : Membership.LEFT;
+        } catch (Throwable t) {
+            return Membership.UNKNOWN;
+        }
+    }
+
     /**
      * What to report once a decommission has ended in something other than success.
      *
-     * <p>Three answers, and the middle one is the reason this is a method rather than a ternary:
+     * <p>Derived from ring membership, and deliberately not from the operation mode. The tempting
+     * rule — {@code DECOMMISSION_FAILED} means the node is broken — is wrong, and wrong in the
+     * routine case. The fork sets that mode from the catch blocks around the <i>whole</i> body of
+     * {@code StorageService.decommission()}, and the body begins long before {@code unbootstrap()}:
+     * an unforced decommission that would drop a keyspace below its replication factor throws
+     * {@code UnsupportedOperationException} from inside that try, having touched nothing at all,
+     * and the node is left NORMAL in every respect except the mode string. So does "data is
+     * currently moving to this node", and so does an interrupt during the {@code RING_DELAY} sleep
+     * after {@code startLeaving()}. {@code leaveRing()} is the last line of {@code unbootstrap()},
+     * so even a streaming failure lands there with every range still owned.
+     *
+     * <p>Calling any of those FAILED would be fatal in the literal sense: {@code FAILED} is what
+     * the supervisor's health monitor turns into {@code onFatalError}, and an ordinary refused
+     * decommission would take a healthy node's process down with exit 1. It would also block the
+     * retry that the fork explicitly allows — {@code decommission()} re-admits a node whose mode is
+     * {@code DECOMMISSION_FAILED} — because {@link #requireRunning} refuses anything but RUNNING.
      *
      * <ul>
-     *   <li>{@code DECOMMISSIONED} — it worked; only a hook or a shutdown step complained.</li>
-     *   <li>{@code DECOMMISSION_FAILED} — <b>not</b> RUNNING. The fork sets this mode from the
-     *       catch blocks at the very bottom of {@code StorageService.decommission()}, every one of
-     *       which sits <i>after</i> {@code unbootstrap()} has already called {@code leaveRing()}:
-     *       the endpoint is out of {@code TokenMetadata}, LEFT has been gossiped and the bootstrap
-     *       state is persisted. A bare {@code InterruptedException}, or a throw from
-     *       {@code shutdownClientServers()}, {@code Gossiper.stop()} or {@code Stage.shutdownNow()},
-     *       all land here. The node holds no ranges and is serving nothing; calling that RUNNING is
-     *       the same lie about the same code path that the {@code DECOMMISSIONED} branch above
-     *       exists to prevent. FAILED also survives {@link #markStopped()}, so the post-mortem
-     *       reaches the operator after the supervisor's final stop.</li>
-     *   <li>anything else — NORMAL, LEAVING, MOVING: the ring is intact and the node really is
-     *       still serving, so RUNNING is the truth.</li>
+     *   <li>still a member (or unreadable) — RUNNING. The ring is intact, the node is serving, and
+     *       the failure is reported by the exception this status accompanies.</li>
+     *   <li>no longer a member — DECOMMISSIONED. The data has been handed off and the node cannot
+     *       rejoin without bootstrapping, whether the mode says {@code DECOMMISSIONED} or
+     *       {@code DECOMMISSION_FAILED}; reporting RUNNING would tell the operator this node is
+     *       still serving a ring it has left. DECOMMISSIONED also survives {@link #markStopped()},
+     *       so it still reaches the operator after the supervisor's final stop. It is not FAILED,
+     *       because a node that has left is not a reason to kill the process the operator is
+     *       reading the failure from.</li>
      * </ul>
      */
-    private static ServiceStatus statusAfterFailedDecommission(String mode) {
-        if (MODE_DECOMMISSIONED.equals(mode)) {
+    private static ServiceStatus statusAfterFailedDecommission(String mode, Membership membership) {
+        if (membership == Membership.LEFT || MODE_DECOMMISSIONED.equals(mode)) {
             return ServiceStatus.DECOMMISSIONED;
         }
-        return MODE_DECOMMISSION_FAILED.equals(mode) ? ServiceStatus.FAILED : ServiceStatus.RUNNING;
+        return ServiceStatus.RUNNING;
+    }
+
+    /** The half of the report that says what the node is now, in the operator's terms. */
+    private static String failedDecommissionMessage(String mode, Membership membership) {
+        if (membership == Membership.LEFT || MODE_DECOMMISSIONED.equals(mode)) {
+            return "The decommission failed, but this node had already left the ring by then"
+                    + " (operation mode " + mode + "). It holds no ranges, it is serving nothing,"
+                    + " and it cannot rejoin without bootstrapping. Stop the process.";
+        }
+        if (membership == Membership.UNKNOWN) {
+            return "Decommission failed, and this node's token metadata could not be read to find"
+                    + " out whether it got as far as leaving the ring (operation mode " + mode
+                    + "). It is being reported as still serving, because that is the answer that"
+                    + " can be retried; confirm with `nodetool status` from another node.";
+        }
+        return "Decommission failed and this node is still a member of the ring, holding every"
+                + " range it held before and still serving them (operation mode " + mode + ")."
+                + " Fix what the failure below reports and run the decommission again.";
     }
 
     /**
