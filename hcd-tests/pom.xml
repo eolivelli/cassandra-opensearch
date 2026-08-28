@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>io.cassandraopensearch</groupId>
+    <artifactId>cassandra-opensearch-parent</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+  </parent>
+  <artifactId>cassandra-opensearch-hcd-tests</artifactId>
+  <name>Cassandra + OpenSearch :: HCD Integration Tests</name>
+
+  <description>
+    Integration tests that target a running HCD + OpenSearch stack (e.g. docker-compose-full.yaml).
+    Unlike the integration-tests module, these tests do NOT unpack the tarball — they connect to
+    an already-running external stack over the native CQL protocol and the OpenSearch REST API.
+
+    These tests are skipped by default. Run them with:
+      mvn verify -pl hcd-tests -Phcd-tests
+    or with the stack already up:
+      mvn test -pl hcd-tests -Phcd-tests
+  </description>
+
+  <properties>
+    <!-- Override these on the command line to point at a non-default stack. -->
+    <hcd.host>localhost</hcd.host>
+    <hcd.cql.port>9042</hcd.cql.port>
+    <hcd.datacenter>datacenter1</hcd.datacenter>
+    <opensearch.host>localhost</opensearch.host>
+    <opensearch.port>9200</opensearch.port>
+
+    <!-- Tests in this module are skipped unless -Phcd-tests is active. -->
+    <skipHcdTests>true</skipHcdTests>
+  </properties>
+
+  <dependencies>
+    <!-- CQL driver — talks to HCD over the native protocol -->
+    <dependency>
+      <groupId>org.apache.cassandra</groupId>
+      <artifactId>java-driver-core</artifactId>
+      <scope>test</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-simple</artifactId>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <configuration>
+          <skipTests>${skipHcdTests}</skipTests>
+          <trimStackTrace>false</trimStackTrace>
+          <!-- Print test output directly — failures against a live stack need the server's
+               response in the build log immediately, not in a sidecar file. -->
+          <redirectTestOutputToFile>false</redirectTestOutputToFile>
+          <systemPropertyVariables>
+            <hcd.host>${hcd.host}</hcd.host>
+            <hcd.cql.port>${hcd.cql.port}</hcd.cql.port>
+            <hcd.datacenter>${hcd.datacenter}</hcd.datacenter>
+            <opensearch.host>${opensearch.host}</opensearch.host>
+            <opensearch.port>${opensearch.port}</opensearch.port>
+          </systemPropertyVariables>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+
+  <profiles>
+    <profile>
+      <id>hcd-tests</id>
+      <properties>
+        <skipHcdTests>false</skipHcdTests>
+      </properties>
+    </profile>
+  </profiles>
+
+</project>
