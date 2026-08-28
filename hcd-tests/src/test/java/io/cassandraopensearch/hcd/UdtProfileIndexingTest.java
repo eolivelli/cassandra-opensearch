@@ -21,6 +21,8 @@ import org.junit.jupiter.api.TestMethodOrder;
 import java.net.InetSocketAddress;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -45,6 +47,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  *   <li>Replicated — documents appear in OpenSearch without any direct OS write</li>
  *   <li>Search — characters are findable by house, city, email, and phone number</li>
  * </ol>
+ *
+ * <p><strong>Test ordering is mandatory.</strong> Tests 2–9 depend on the schema, index, and
+ * data created by tests 1–2. Do not move, skip, or remove any {@code @Order} annotation.
+ * {@code @BeforeAll}/{@code @AfterAll} execute in their normal lifecycle positions regardless
+ * of {@code @Order} — that annotation governs {@code @Test} methods only.
  *
  * <p>Requires the HCD + OpenSearch stack from {@code docker-compose-full.yaml} to be running.
  * Run with:
@@ -79,6 +86,10 @@ class UdtProfileIndexingTest {
     private static final String DRACO_ID   = "550e8400-e29b-41d4-a716-446655440003";
     private static final String DRACO_NAME = "Draco Malfoy";
 
+    // Matches the integer value of hits.total.value in an OpenSearch _search response.
+    // Uses a word-boundary-equivalent pattern (\D) to avoid "value":1 matching "value":10.
+    private static final Pattern DOC_COUNT = Pattern.compile("\"value\":(\\d+)");
+
     private CqlSession session;
     private final OpenSearchClient os = new OpenSearchClient();
 
@@ -89,6 +100,9 @@ class UdtProfileIndexingTest {
         session = CqlSession.builder()
                 .addContactPoint(new InetSocketAddress(CQL_HOST, CQL_PORT))
                 .withLocalDatacenter(DATACENTER)
+                // Fail fast when the stack is not running; the default driver timeout is 5 s
+                // per contact point with no diagnostic message about which host was tried.
+                .withTimeout(Duration.ofSeconds(5))
                 .build();
     }
 
@@ -101,10 +115,12 @@ class UdtProfileIndexingTest {
                 session.execute("DROP KEYSPACE IF EXISTS " + KEYSPACE);
             }
         } finally {
-            try {
-                os.delete("/" + INDEX_NAME);
-            } catch (Exception ignored) {
-                // index may not exist if the test failed before it was created
+            // A 404 is expected if the test failed before the index was created.
+            // Any other non-200 status is unexpected and logged as a warning.
+            OpenSearchClient.Response del = os.delete("/" + INDEX_NAME);
+            if (del.status() != 200 && del.status() != 404) {
+                System.err.println("WARN: cleanup DELETE /" + INDEX_NAME
+                        + " returned " + del.status() + ": " + del.body());
             }
             if (session != null) {
                 session.close();
@@ -181,6 +197,10 @@ class UdtProfileIndexingTest {
     @Order(2)
     void insertStudentProfilesViaCql() {
         // Harry Potter — 4 Privet Drive / Hogwarts, Gryffindor
+        // NOTE: Unquoted UDT field names in inline literals (street, city, …) are accepted by
+        // HCD 2.0.8-SNAPSHOT's CQL parser. If this INSERT fails with a parse error on a
+        // different HCD version, switch to SimpleStatement with named bindings or a prepared
+        // statement, which are immune to parser grammar differences.
         session.execute(
                 "INSERT INTO " + KEYSPACE + "." + TABLE
                 + " (user_id, full_name, house, addresses, emails, phones) VALUES ("
@@ -282,6 +302,12 @@ class UdtProfileIndexingTest {
      *
      * <p>HCD maps {@code list<frozen<address>>} to an object array in OpenSearch.
      * The field path uses dot notation: {@code addresses.city}.
+     *
+     * <p>Uses a plain {@code match} query rather than {@code match_phrase} because "Little
+     * Whinging" is a two-token value and neither token appears in any other student's city
+     * in this data set ("London", "Wiltshire", "Hogwarts"). If new students were added with
+     * a city containing "Little" or "Whinging", this assertion would need to become
+     * {@code match_phrase}.
      */
     @Test
     @Order(5)
@@ -392,8 +418,11 @@ class UdtProfileIndexingTest {
             OpenSearchClient.Response r = os.post("/" + INDEX_NAME + "/_search",
                     "{\"query\":{\"match_all\":{}},\"size\":0}");
             lastBody = r.body();
-            if (r.status() == 200 && lastBody.contains("\"value\":" + expected)) {
-                return;
+            if (r.status() == 200) {
+                Matcher m = DOC_COUNT.matcher(lastBody);
+                if (m.find() && Integer.parseInt(m.group(1)) == expected) {
+                    return;
+                }
             }
             sleep(interval);
         }

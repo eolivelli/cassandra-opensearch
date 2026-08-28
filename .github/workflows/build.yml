@@ -29,8 +29,10 @@ jobs:
       # the CLI, and the whole OpenSearch runtime including the tests that start a real node.
       #
       # Not covered here, and covered only by a local `mvn verify`: runtime-cassandra,
-      # dist (the tarball and Docker image) and the integration tests. That gap is real and is
-      # recorded in docs/REMAINING-WORK.md rather than papered over with a green badge.
+      # dist (the tarball and Docker image), integration-tests, and hcd-tests.
+      # hcd-tests is additionally excluded because it requires a running HCD + OpenSearch stack
+      # that is not available in GitHub Actions. That gap is real and is recorded in
+      # docs/REMAINING-WORK.md rather than papered over with a green badge.
       - name: Build and test the modules that do not need the Cassandra fork
         run: >
           mvn -B -ntp

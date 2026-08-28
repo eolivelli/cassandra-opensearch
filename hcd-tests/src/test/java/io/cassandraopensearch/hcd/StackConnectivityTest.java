@@ -13,6 +13,7 @@ import com.datastax.oss.driver.api.core.cql.Row;
 import org.junit.jupiter.api.Test;
 
 import java.net.InetSocketAddress;
+import java.time.Duration;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -51,6 +52,9 @@ class StackConnectivityTest {
         try (CqlSession session = CqlSession.builder()
                 .addContactPoint(new InetSocketAddress(CQL_HOST, CQL_PORT))
                 .withLocalDatacenter(DATACENTER)
+                // Fail fast when the stack is not up; without this the driver spends 5 s
+                // per contact point before throwing, with no message naming the host:port.
+                .withTimeout(Duration.ofSeconds(5))
                 .build()) {
 
             Row row = session.execute("SELECT release_version FROM system.local").one();
