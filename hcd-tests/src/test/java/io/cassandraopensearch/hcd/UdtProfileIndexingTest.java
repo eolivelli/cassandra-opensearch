@@ -9,6 +9,7 @@ package io.cassandraopensearch.hcd;
 
 import com.datastax.oss.driver.api.core.CqlSession;
 import com.datastax.oss.driver.api.core.cql.Row;
+import com.datastax.oss.driver.api.core.data.UdtValue;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -399,6 +400,61 @@ class UdtProfileIndexingTest {
                 .contains(HARRY_NAME)
                 .doesNotContain(HERMIONE_NAME)
                 .doesNotContain(DRACO_NAME);
+    }
+
+    /**
+     * Fetches Harry Potter's record from both Cassandra (CQL) and OpenSearch (REST) and
+     * asserts the field values agree — proving the HCD interceptor replicates faithfully
+     * without mutating the data.
+     *
+     * <p>Three fields are compared across both protocols:
+     * <ul>
+     *   <li>{@code full_name} / {@code full_name} — top-level text, has a {@code .keyword} sub-field</li>
+     *   <li>{@code house}     / {@code house}      — top-level text</li>
+     *   <li>first element of {@code addresses.city} — UDT list sub-field, plain {@code text}</li>
+     * </ul>
+     *
+     * <p>The OpenSearch document {@code _id} is the Cassandra {@code user_id} UUID (set by the HCD
+     * interceptor at replication time), so {@code GET /<index>/_doc/<uuid>} is the direct read.
+     */
+    @Test
+    @Order(10)
+    void dualReadComparesOneStudentAcrossBothProtocols() {
+        // ── Read from Cassandra over CQL ──────────────────────────────────────
+        Row cqlRow = session.execute(
+                "SELECT full_name, house, addresses FROM " + KEYSPACE + "." + TABLE
+                + " WHERE user_id = " + HARRY_ID).one();
+
+        assertThat(cqlRow).as("Harry's CQL row must exist").isNotNull();
+
+        String cqlName  = cqlRow.getString("full_name");
+        String cqlHouse = cqlRow.getString("house");
+        // addresses is list<frozen<address>>; get the first element's city field.
+        UdtValue firstAddress = cqlRow.getList("addresses", UdtValue.class).get(0);
+        String cqlCity = firstAddress.getString("city");
+
+        // ── Read from OpenSearch by document id (= Cassandra user_id) ─────────
+        // The HCD interceptor sets the document _id to the row's partition key UUID.
+        OpenSearchClient.Response osGet = os.get("/" + INDEX_NAME + "/_doc/" + HARRY_ID);
+        assertThat(osGet.status())
+                .as("GET by user_id '%s' must return 200 — document must exist in OpenSearch", HARRY_ID)
+                .isEqualTo(200);
+        assertThat(osGet.body())
+                .as("OpenSearch document must be found")
+                .contains("\"found\":true");
+
+        // ── Cross-protocol field comparison ───────────────────────────────────
+        // Assert that the three CQL values appear verbatim in the OpenSearch _source.
+        // Uses simple substring matching to avoid a JSON parser dependency in this module.
+        assertThat(osGet.body())
+                .as("OpenSearch full_name must match CQL full_name = \"%s\"", cqlName)
+                .contains("\"full_name\":\"" + cqlName + "\"");
+        assertThat(osGet.body())
+                .as("OpenSearch house must match CQL house = \"%s\"", cqlHouse)
+                .contains("\"house\":\"" + cqlHouse + "\"");
+        assertThat(osGet.body())
+                .as("OpenSearch addresses[0].city must match CQL addresses[0].city = \"%s\"", cqlCity)
+                .contains("\"city\":\"" + cqlCity + "\"");
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────
