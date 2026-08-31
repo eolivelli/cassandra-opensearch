@@ -457,6 +457,72 @@ class UdtProfileIndexingTest {
                 .contains("\"city\":\"" + cqlCity + "\"");
     }
 
+    /**
+     * ⚠️ BUG REPORT — intentionally failing test.
+     *
+     * <p>Demonstrates that {@code term} queries on UDT string sub-fields silently return zero
+     * hits because HCD does <em>not</em> emit {@code .keyword} sub-fields for UDT columns.
+     *
+     * <p><strong>Root cause:</strong> When {@code applyDefaultSchema: true}, the interceptor
+     * correctly emits static {@code properties} with {@code .keyword} sub-fields for top-level
+     * columns (e.g. {@code full_name}). However, UDT columns ({@code emails}, {@code phones},
+     * {@code addresses}) are mapped as {@code {"type":"object","dynamic":"true"}} at
+     * {@code CREATE INDEX} time. Their sub-fields are therefore only materialised at first
+     * document insertion, at which point they match the {@code strings_as_text} dynamic
+     * template — which maps all strings to plain {@code text} with <em>no</em> {@code .keyword}
+     * sub-field.
+     *
+     * <p><strong>Consequence:</strong> A {@code term} query on {@code emails.address.keyword}
+     * returns HTTP 200 with {@code hits.total.value = 0} — no error, no warning, silent failure.
+     * Applications relying on exact-match or aggregation behaviour on UDT sub-fields will silently
+     * return wrong results.
+     *
+     * <p><strong>Workaround (used in this test suite):</strong> use {@code match_phrase} instead
+     * of {@code term} for UDT string sub-fields.
+     *
+     * <p><strong>Correct fix:</strong> when {@code applyDefaultSchema: true}, the interceptor
+     * should walk the UDT schema recursively at {@code CREATE INDEX} time and emit static
+     * {@code properties} entries for every UDT sub-field, giving them the same {@code .keyword}
+     * treatment that top-level columns already receive today.
+     *
+     * <p>This test will begin passing once the interceptor is fixed. Remove this comment block
+     * and rename the method (drop the {@code _BUG} suffix) when that happens.
+     */
+    @Test
+    @Order(11)
+    void termQueryOnUdtKeywordSubfieldSilentlyReturnsZeroHits_BUG() {
+        // A term query on emails.address.keyword for Hermione's exact school address.
+        // If the .keyword sub-field existed this would return exactly 1 hit.
+        // BUG: HCD maps UDT sub-fields via dynamic template (plain text, no .keyword),
+        //      so emails.address.keyword does not exist and OpenSearch returns 0 hits silently.
+        OpenSearchClient.Response response = os.post("/" + INDEX_NAME + "/_search",
+                "{\"query\":{\"term\":{\"emails.address.keyword\":\"hgranger@hogwarts.ac.uk\"}}}");
+
+        assertThat(response.status()).isEqualTo(200);
+        assertThat(response.body())
+                .as("\n\n"
+                  + "========================================================\n"
+                  + "BUG: HCD does not emit .keyword sub-fields for UDT string sub-fields.\n"
+                  + "\n"
+                  + "  Query : term on emails.address.keyword\n"
+                  + "  Value : hgranger@hogwarts.ac.uk\n"
+                  + "  Expected hits.total.value = 1  (Hermione Granger)\n"
+                  + "  Actual  hits.total.value = 0  (silent empty result)\n"
+                  + "\n"
+                  + "Root cause:\n"
+                  + "  UDT columns are mapped as {\"type\":\"object\",\"dynamic\":\"true\"} at\n"
+                  + "  CREATE INDEX time. Sub-fields land on the strings_as_text dynamic\n"
+                  + "  template on first insert → plain text, no .keyword sub-field.\n"
+                  + "  Top-level columns (full_name, house) are NOT affected.\n"
+                  + "\n"
+                  + "Fix required in: OpenSearchMutatorInterceptor (or schema mapping logic)\n"
+                  + "  When applyDefaultSchema=true, walk UDT schemas recursively at\n"
+                  + "  CREATE INDEX time and emit static properties with .keyword sub-fields\n"
+                  + "  for every UDT string sub-field, matching top-level column behaviour.\n"
+                  + "========================================================\n")
+                .contains("\"value\":1");
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
 
     /**

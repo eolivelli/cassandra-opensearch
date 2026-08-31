@@ -97,6 +97,11 @@ mvn test -pl hcd-tests -Phcd-tests --no-transfer-progress
   to plain `text` — **no `.keyword` sub-field**.
 - **Consequence:** `term` on `emails.address.keyword` returns 0 hits silently.
   Use `match_phrase` for UDT string sub-fields.
+- **Bug-report test added:** `termQueryOnUdtKeywordSubfieldSilentlyReturnsZeroHits_BUG`
+  (`@Order(11)`) — runs without `@Disabled`, asserts `"value":1`, **intentionally fails**.
+  The assertion message is a structured bug report naming the root cause and the required fix.
+  Expected suite result: `Tests run: 12, Failures: 1, Errors: 0`.
+  When the interceptor is fixed: re-enable the assertion, drop the `_BUG` suffix.
 
 ### Dual-read pattern added to all three test locations
 
@@ -126,3 +131,15 @@ same data from both CQL and OpenSearch in one test:
 
 `rajeev/hcd-udt-indexing-tests` — PR in progress, do not push.
 Owner: Rajeev Dave. AI-assisted commits carry the notice in `.pr-body.md`.
+
+---
+
+## Demo repo
+
+The parent workspace (`/Users/rajeevdave/Documents/software`) is a **separate git repo**
+for the demo harness. It is fully isolated from this fork:
+- `sources/` is in the demo repo's `.gitignore` — files here never leak into it
+- The demo repo has its own remote:
+  `origin → git@github.ibm.com:rajeev-dave/demo_docker_h20_opensearch.git`
+- SSH config for `github.ibm.com` uses `~/.ssh/github-ibm-rajeevdave`
+- Push to the demo remote is done manually by the user from `/Users/rajeevdave/Documents/software`
