@@ -50,6 +50,7 @@ class OpenSearchRestApiTest {
                 .isEqualTo(201);
         assertThat(rest.post("/books/_refresh", null).status()).isEqualTo(200);
 
+        // ── Read path 1: search ───────────────────────────────────────────────
         Rest.Response search = rest.post("/books/_search", """
                 {"query":{"match":{"title":"embedded"}}}""");
 
@@ -58,6 +59,20 @@ class OpenSearchRestApiTest {
                 .contains("\"_id\":\"1\"")
                 .contains("the embedded node")
                 .doesNotContain("\"hits\":{\"total\":{\"value\":0");
+
+        // ── Read path 2: direct GET by document id ────────────────────────────
+        // Fetches the stored _source directly, independent of the search path.
+        // Both reads must agree on the indexed field values — this proves the
+        // embedded node's stored source is not corrupted by the ClassLoader isolation.
+        Rest.Response get = rest.get("/books/_doc/1");
+        assertThat(get.status())
+                .as("GET /books/_doc/1 must return 200, not 404")
+                .isEqualTo(200);
+        assertThat(get.body())
+                .as("stored _source must contain the indexed title")
+                .contains("the embedded node")
+                .contains("\"pages\":42")
+                .contains("\"found\":true");
 
         // The shard the search just answered from has to show up in details(), which derives it
         // from the applied cluster state rather than asking the cluster.

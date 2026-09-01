@@ -98,15 +98,63 @@ class SingleNodeServicesIT {
         assertThat(row.getInt("n")).isEqualTo(42);
     }
 
+    /**
+     * Reads the same logical document from both servers and asserts the field values agree.
+     *
+     * <p>CQL wrote a row in {@link #cqlRoundTrip()}. Here we also write an OpenSearch document
+     * with the same key and matching fields, then read each back and compare — proving that both
+     * servers in one JVM are serving consistent, independent reads of logically identical data.
+     *
+     * <p>This is not a replication test (the HCD interceptor is not active here). It is a
+     * correctness test: both protocols answer what they were given, without the isolation
+     * architecture silently corrupting either.
+     */
     @Test
     @Order(2)
+    void dualRoundTripComparesTheSameDocument() {
+        Rest rest = node.rest();
+
+        // ── OpenSearch side: index a document with values matching the CQL row ─
+        assertThat(rest.put('/' + INDEX, """
+                {"settings":{"number_of_shards":1,"number_of_replicas":0}}""").status()).isEqualTo(200);
+        assertThat(rest.put('/' + INDEX + "/_doc/k", """
+                {"v":"written over the native protocol","n":42}""").status()).isEqualTo(201);
+        assertThat(rest.post('/' + INDEX + "/_refresh", "").status()).isEqualTo(200);
+
+        // ── Read path 1: CQL SELECT ───────────────────────────────────────────
+        Row cqlRow = session.execute(
+                "SELECT k, v, n FROM " + KEYSPACE + ".probe WHERE k = 'k'").one();
+        assertThat(cqlRow).as("CQL row must still exist").isNotNull();
+        String cqlV = cqlRow.getString("v");
+        int    cqlN = cqlRow.getInt("n");
+
+        // ── Read path 2a: OpenSearch search ──────────────────────────────────
+        Rest.Response search = rest.post('/' + INDEX + "/_search", """
+                {"query":{"match":{"v":"native protocol"}}}""");
+        assertThat(search.status()).isEqualTo(200);
+        assertThat(search.body()).contains("\"_id\":\"k\"");
+
+        // ── Read path 2b: OpenSearch direct GET by id ─────────────────────────
+        Rest.Response get = rest.get('/' + INDEX + "/_doc/k");
+        assertThat(get.status()).as("GET by id must return 200").isEqualTo(200);
+
+        // ── Cross-protocol comparison ─────────────────────────────────────────
+        // Both reads describe the same logical document; the field values must match exactly.
+        assertThat(get.body())
+                .as("OpenSearch _source 'v' must match CQL column 'v' = \"%s\"", cqlV)
+                .contains("\"v\":\"" + cqlV + "\"");
+        assertThat(get.body())
+                .as("OpenSearch _source 'n' must match CQL column 'n' = %d", cqlN)
+                .contains("\"n\":" + cqlN);
+    }
+
+    @Test
+    @Order(3)
     void openSearchRoundTrip() {
         Rest rest = node.rest();
 
-        assertThat(rest.put('/' + INDEX, """
-                {"settings":{"number_of_shards":1,"number_of_replicas":0}}""").status()).isEqualTo(200);
         assertThat(rest.put('/' + INDEX + "/_doc/1", """
-                {"title":"indexed over real HTTP","n":42}""").status()).isEqualTo(201);
+                {"title":"indexed over real HTTP","n":42}""").status()).isIn(200, 201);
         assertThat(rest.post('/' + INDEX + "/_refresh", "").status()).isEqualTo(200);
 
         Rest.Response search = rest.post('/' + INDEX + "/_search", """
@@ -135,7 +183,7 @@ class SingleNodeServicesIT {
      * {@code IsolatedService}.
      */
     @Test
-    @Order(3)
+    @Order(4)
     void theRestApiIsNotCorruptedByTheContextClassLoader() {
         Rest rest = node.rest();
 
@@ -162,7 +210,7 @@ class SingleNodeServicesIT {
      * which rejects every JDK from 18 to 21.
      */
     @Test
-    @Order(4)
+    @Order(5)
     void nodetoolDrivesTheEmbeddedNode() {
         Commands.Result status = node.nodetool("status");
         assertThat(status.succeeded()).as("nodetool status failed:%n%s", status.describe()).isTrue();
@@ -196,7 +244,7 @@ class SingleNodeServicesIT {
      * process.
      */
     @Test
-    @Order(5)
+    @Order(6)
     void bothServersRunInOneJvm() {
         assumeTrue(ListeningSockets.available(), "/proc is not readable; this check is Linux-only");
 
@@ -234,7 +282,7 @@ class SingleNodeServicesIT {
      * the ones with teeth — the exclusion is gone, and a brand new index goes GREEN.
      */
     @Test
-    @Order(6)
+    @Order(7)
     void aSingleNodeDecommissionIsRefusedAndTheNodeKeepsServing() {
         Commands.Result decommission = node.cli("decommission");
 

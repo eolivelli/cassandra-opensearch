@@ -10,3 +10,9 @@ target/
 
 # The README's quick start unpacks the tarball into the repository root.
 /cassandra-opensearch-*/
+
+# Bob AI assistant context — local tooling only, not for upstream.
+.bob/
+
+# PR description draft — contents go into the GitHub PR body, not committed upstream.
+.pr-body.md

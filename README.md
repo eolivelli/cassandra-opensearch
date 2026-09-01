@@ -466,6 +466,32 @@ a **two-node coupled decommission** with real shard relocation and real ring str
 
 They use ports 21100–21310 and never the stock ones.
 
+### HCD end-to-end tests (`hcd-tests`)
+
+A separate module targets a running HCD + OpenSearch stack directly, without unpacking a tarball.
+It proves the full **CQL write → OpenSearch replication** path through the `OpenSearchMutatorInterceptor`.
+
+```bash
+# Start the stack first (takes ~2 min on first pull):
+HCD_VERSION=2.0.8-SNAPSHOT MAX_HEAP_SIZE=4G \
+  podman-compose -f docker-compose-full.yaml up -d
+
+# Run the HCD tests (skipped by default; -Phcd-tests activates them):
+mvn test -pl hcd-tests -Phcd-tests --no-transfer-progress
+```
+
+Expected result: `Tests run: 12, Failures: 1, Errors: 0`
+
+The one intentional failure — `termQueryOnUdtKeywordSubfieldSilentlyReturnsZeroHits_BUG` —
+is a **bug report in test form**. It demonstrates that `applyDefaultSchema: true` does not emit
+`.keyword` sub-fields for UDT string columns, only for top-level columns. A `term` query on
+`emails.address.keyword` returns HTTP 200 with zero hits — no error, silent wrong result.
+The test will begin passing once the interceptor walks UDT schemas recursively at `CREATE INDEX`
+time. See the test's Javadoc for the full root cause and the required fix.
+
+Connection coordinates default to `localhost:9042` (CQL) and `localhost:9200` (OpenSearch);
+override with `-Dhcd.host=`, `-Dhcd.cql.port=`, `-Dopensearch.host=`, `-Dopensearch.port=`.
+
 ---
 
 ## Project layout
@@ -480,6 +506,7 @@ They use ports 21100–21310 and never the stock ones.
 | `cli` | parent | `bin/*` wrappers. |
 | `dist` | — | Tarball and Docker image (an aggregator; see below). |
 | `integration-tests` | — | Failsafe ITs driving the assembled tarball. |
+| `hcd-tests` | — | End-to-end tests against a running HCD + OpenSearch stack (skipped by default). |
 | `examples` | — | Multi-node scripts and worked examples. |
 
 `dist` is an aggregator of three modules rather than one because a single POM **cannot** produce
